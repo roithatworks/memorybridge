@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "memorybridge": {
+      "command": "python3",
+      "args": [
+        "/Users/YOUR_USERNAME/memorybridge/server.py"
+      ]
+    }
+  }
+}
