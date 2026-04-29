@@ -1,2 +1,2 @@
 fastmcp>=0.1.0
-streamlit>=1.30.0
+tiktoken>=0.7.0
