@@ -15,11 +15,24 @@ Run with: fastmcp run server.py
 import json
 import uuid
 import re
+import fcntl
 import atexit
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
 from fastmcp import FastMCP
+
+try:
+    import tiktoken
+    _enc = tiktoken.get_encoding("cl100k_base")
+    def _count_tokens_impl(text: str) -> int:
+        return len(_enc.encode(text))
+except ImportError:
+    # Fallback to regex estimate if tiktoken isn't installed yet
+    def _count_tokens_impl(text: str) -> int:
+        words = len(re.findall(r'\b\w+\b', text))
+        punctuation = len(re.findall(r'[^\w\s]', text))
+        return int(words * 1.3 + punctuation * 0.5) or 1
 
 # Initialize MCP server
 mcp = FastMCP("MemoryBridge")
@@ -142,9 +155,7 @@ def log_to_analytics(
 def count_tokens(text: str) -> int:
     if not text:
         return 0
-    words = len(re.findall(r'\b\w+\b', text))
-    punctuation = len(re.findall(r'[^\w\s]', text))
-    return int(words * 1.3 + punctuation * 0.5) or 1
+    return _count_tokens_impl(text) or 1
 
 
 def count_memory_tokens(mem: dict) -> int:
@@ -224,6 +235,33 @@ def auto_prune(memory: dict, profile: str) -> list:
 # =============================================================================
 # CORE UTILITIES
 # =============================================================================
+
+# Lock file used to serialise concurrent readers/writers (e.g. Claude Desktop
+# running alongside Claude Code).  We use a dedicated .lock file so that the
+# lock fd stays open for the full read-modify-write cycle regardless of whether
+# memory.json itself exists yet.
+LOCK_FILE = MEMORY_FILE.parent / "memory.lock"
+
+
+from contextlib import contextmanager
+
+@contextmanager
+def _memory_lock():
+    """Exclusive POSIX file lock over the full read-modify-write cycle.
+
+    Both processes must acquire this lock before touching memory.json, so a
+    concurrent pair of Claude instances can't interleave their reads and writes
+    and silently drop each other's data.
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lf = open(LOCK_FILE, "a")      # 'a' creates the file if absent, never truncates
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)   # blocks until we own the lock
+        yield
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
+
 
 def load_memory() -> dict:
     if not MEMORY_FILE.exists():
@@ -362,92 +400,94 @@ def get_memory(
     Returns:
         JSON with memories, token stats, and budget info
     """
-    memory = load_memory()
-    if profile not in memory.get("profiles", {}):
-        return json.dumps({"error": f"Profile '{profile}' not found"})
+    with _memory_lock():
+        memory = load_memory()
+        if profile not in memory.get("profiles", {}):
+            return json.dumps({"error": f"Profile '{profile}' not found"})
 
-    profile_data = memory["profiles"][profile]
-    decay_config = memory.get("schema", {}).get("decay_config", {})
-    memories = profile_data.get("memories", [])
-    memories = apply_decay([m.copy() for m in memories], decay_config)
+        profile_data = memory["profiles"][profile]
+        decay_config = memory.get("schema", {}).get("decay_config", {})
+        memories = profile_data.get("memories", [])
+        memories = apply_decay([m.copy() for m in memories], decay_config)
 
-    for mem in memories:
-        if "token_count" not in mem:
-            mem["token_count"] = count_memory_tokens(mem)
+        for mem in memories:
+            if "token_count" not in mem:
+                mem["token_count"] = count_memory_tokens(mem)
 
-    if category:
-        if category not in VALID_CATEGORIES:
-            return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
-        memories = [m for m in memories if m.get("category") == category]
+        if category:
+            if category not in VALID_CATEGORIES:
+                return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
+            memories = [m for m in memories if m.get("category") == category]
 
-    if context_hint:
-        hint_lower = context_hint.lower()
-        memories = [
-            m for m in memories
-            if hint_lower in m.get("content", "").lower()
-            or hint_lower in str(m.get("tags", [])).lower()
-            or hint_lower in str(m.get("project_id", "")).lower()
-        ]
+        if context_hint:
+            hint_lower = context_hint.lower()
+            memories = [
+                m for m in memories
+                if hint_lower in m.get("content", "").lower()
+                or hint_lower in str(m.get("tags", [])).lower()
+                or hint_lower in str(m.get("project_id", "")).lower()
+            ]
 
-    memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
+        memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
 
-    # FIX 2: Measure overhead of ALL non-memory fields first, then budget memories
-    # into whatever remains. Previously only identity was measured; projects and
-    # model_preferences were added to the response without any token accounting.
-    identity = profile_data.get("identity", {})
-    projects = profile_data.get("projects", [])
-    model_preferences = profile_data.get("model_preferences", {})
+        # FIX 2: Measure overhead of ALL non-memory fields first, then budget memories
+        # into whatever remains. Previously only identity was measured; projects and
+        # model_preferences were added to the response without any token accounting.
+        identity = profile_data.get("identity", {})
+        projects = profile_data.get("projects", [])
+        model_preferences = profile_data.get("model_preferences", {})
 
-    overhead_tokens = (
-        count_tokens(json.dumps(identity)) +
-        count_tokens(json.dumps(projects)) +
-        count_tokens(json.dumps(model_preferences)) +
-        200  # structural JSON overhead
-    )
-    available_for_memories = max(max_tokens - overhead_tokens, 0)
+        overhead_tokens = (
+            count_tokens(json.dumps(identity)) +
+            count_tokens(json.dumps(projects)) +
+            count_tokens(json.dumps(model_preferences)) +
+            200  # structural JSON overhead
+        )
+        available_for_memories = max(max_tokens - overhead_tokens, 0)
 
-    selected_memories = []
-    tokens_used = 0
-    for mem in memories:
-        mem_tokens = mem.get("token_count", count_memory_tokens(mem))
-        if tokens_used + mem_tokens <= available_for_memories:
-            selected_memories.append(mem)
-            tokens_used += mem_tokens
-        elif compress and tokens_used < available_for_memories:
-            remaining = available_for_memories - tokens_used
-            compressed = compress_memory(mem, target_tokens=remaining - 20)
-            if compressed.get("token_count", mem_tokens) <= remaining:
-                selected_memories.append(compressed)
-                tokens_used += compressed.get("token_count", 0)
+        selected_memories = []
+        tokens_used = 0
+        for mem in memories:
+            mem_tokens = mem.get("token_count", count_memory_tokens(mem))
+            if tokens_used + mem_tokens <= available_for_memories:
+                selected_memories.append(mem)
+                tokens_used += mem_tokens
+            elif compress and tokens_used < available_for_memories:
+                remaining = available_for_memories - tokens_used
+                compressed = compress_memory(mem, target_tokens=remaining - 20)
+                if compressed.get("token_count", mem_tokens) <= remaining:
+                    selected_memories.append(compressed)
+                    tokens_used += compressed.get("token_count", 0)
+                    break
+            else:
                 break
-        else:
-            break
 
-    total_tokens_served = tokens_used + overhead_tokens
+        total_tokens_served = tokens_used + overhead_tokens
 
-    response = {
-        "profile": profile,
-        "identity": identity,
-        "memories": selected_memories,
-        "projects": projects,
-        "model_preferences": model_preferences,
-        "token_stats": {
-            "budget": max_tokens,
-            "served": total_tokens_served,
-            "remaining": max(max_tokens - total_tokens_served, 0),
-            "memories_returned": len(selected_memories),
-            "memories_available": len(memories),
-            "compressed_count": sum(1 for m in selected_memories if m.get("compressed")),
-            "overhead_tokens": overhead_tokens
+        response = {
+            "profile": profile,
+            "identity": identity,
+            "memories": selected_memories,
+            "projects": projects,
+            "model_preferences": model_preferences,
+            "token_stats": {
+                "budget": max_tokens,
+                "served": total_tokens_served,
+                "remaining": max(max_tokens - total_tokens_served, 0),
+                "memories_returned": len(selected_memories),
+                "memories_available": len(memories),
+                "compressed_count": sum(1 for m in selected_memories if m.get("compressed")),
+                "overhead_tokens": overhead_tokens
+            }
         }
-    }
 
-    log_access(
-        memory, "get_memory", profile,
-        f"hint={context_hint}, cat={category}, budget={max_tokens}",
-        tokens_served=total_tokens_served
-    )
-    save_memory(memory)
+        log_access(
+            memory, "get_memory", profile,
+            f"hint={context_hint}, cat={category}, budget={max_tokens}",
+            tokens_served=total_tokens_served
+        )
+        save_memory(memory)
+
     log_to_analytics(
         tokens_served=total_tokens_served,
         memories_returned=len(selected_memories),
@@ -486,44 +526,45 @@ def add_memory(
     if importance not in IMPORTANCE_LEVELS:
         return json.dumps({"error": f"Invalid importance. Valid: {IMPORTANCE_LEVELS}"})
 
-    memory = load_memory()
-    if profile not in memory.get("profiles", {}):
-        memory["profiles"][profile] = {
-            "identity": {},
-            "memories": [],
-            "projects": [],
-            "model_preferences": {}
+    with _memory_lock():
+        memory = load_memory()
+        if profile not in memory.get("profiles", {}):
+            memory["profiles"][profile] = {
+                "identity": {},
+                "memories": [],
+                "projects": [],
+                "model_preferences": {}
+            }
+
+        profile_data = memory["profiles"][profile]
+        if "memories" not in profile_data:
+            profile_data["memories"] = []
+
+        now = datetime.now().strftime("%Y-%m-%d")
+        mem_id = generate_memory_id()
+        token_count = count_tokens(content) + count_tokens(" ".join(tags or [])) + 20
+
+        new_memory = {
+            "id": mem_id,
+            "content": content,
+            "category": category,
+            "relevance_score": 1.0,
+            "importance": importance,
+            "created_at": now,
+            "last_accessed": now,
+            "access_count": 0,
+            "tags": tags or [],
+            "project_id": project_id,
+            "token_count": token_count
         }
+        profile_data["memories"].append(new_memory)
 
-    profile_data = memory["profiles"][profile]
-    if "memories" not in profile_data:
-        profile_data["memories"] = []
+        pruned = []
+        if should_prune(memory, profile):
+            pruned = auto_prune(memory, profile)
 
-    now = datetime.now().strftime("%Y-%m-%d")
-    mem_id = generate_memory_id()
-    token_count = count_tokens(content) + count_tokens(" ".join(tags or [])) + 20
-
-    new_memory = {
-        "id": mem_id,
-        "content": content,
-        "category": category,
-        "relevance_score": 1.0,
-        "importance": importance,
-        "created_at": now,
-        "last_accessed": now,
-        "access_count": 0,
-        "tags": tags or [],
-        "project_id": project_id,
-        "token_count": token_count
-    }
-    profile_data["memories"].append(new_memory)
-
-    pruned = []
-    if should_prune(memory, profile):
-        pruned = auto_prune(memory, profile)
-
-    log_access(memory, "add_memory", profile, f"id={mem_id}, tokens={token_count}")
-    save_memory(memory)
+        log_access(memory, "add_memory", profile, f"id={mem_id}, tokens={token_count}")
+        save_memory(memory)
 
     result = {
         "status": "added",
@@ -571,57 +612,58 @@ def update_memory(
     if not facts:
         return json.dumps({"error": "facts list is empty"})
 
-    # Single load
-    memory = load_memory()
-    if profile not in memory.get("profiles", {}):
-        memory["profiles"][profile] = {
-            "identity": {},
-            "memories": [],
-            "projects": [],
-            "model_preferences": {}
-        }
+    with _memory_lock():
+        # Single load
+        memory = load_memory()
+        if profile not in memory.get("profiles", {}):
+            memory["profiles"][profile] = {
+                "identity": {},
+                "memories": [],
+                "projects": [],
+                "model_preferences": {}
+            }
 
-    profile_data = memory["profiles"][profile]
-    if "memories" not in profile_data:
-        profile_data["memories"] = []
+        profile_data = memory["profiles"][profile]
+        if "memories" not in profile_data:
+            profile_data["memories"] = []
 
-    now = datetime.now().strftime("%Y-%m-%d")
-    changes = []
-    total_tokens = 0
+        now = datetime.now().strftime("%Y-%m-%d")
+        changes = []
+        total_tokens = 0
 
-    # Append all facts in memory — no disk I/O per fact
-    for fact in facts:
-        mem_id = generate_memory_id()
-        token_count = count_tokens(fact) + 20
-        profile_data["memories"].append({
-            "id": mem_id,
-            "content": fact,
-            "category": category,
-            "relevance_score": 1.0,
-            "importance": importance,
-            "created_at": now,
-            "last_accessed": now,
-            "access_count": 0,
-            "tags": [],
-            "project_id": project,
-            "token_count": token_count
-        })
-        total_tokens += token_count
-        changes.append({
-            "memory_id": mem_id,
-            "tokens": token_count,
-            "preview": fact[:60] + ("…" if len(fact) > 60 else "")
-        })
+        # Append all facts in memory — no disk I/O per fact
+        for fact in facts:
+            mem_id = generate_memory_id()
+            token_count = count_tokens(fact) + 20
+            profile_data["memories"].append({
+                "id": mem_id,
+                "content": fact,
+                "category": category,
+                "relevance_score": 1.0,
+                "importance": importance,
+                "created_at": now,
+                "last_accessed": now,
+                "access_count": 0,
+                "tags": [],
+                "project_id": project,
+                "token_count": token_count
+            })
+            total_tokens += token_count
+            changes.append({
+                "memory_id": mem_id,
+                "tokens": token_count,
+                "preview": fact[:60] + ("…" if len(fact) > 60 else "")
+            })
 
-    # Check prune once after all facts are added
-    pruned = []
-    if should_prune(memory, profile):
-        pruned = auto_prune(memory, profile)
+        # Check prune once after all facts are added
+        pruned = []
+        if should_prune(memory, profile):
+            pruned = auto_prune(memory, profile)
 
-    log_access(memory, "update_memory", profile, f"added {len(changes)} memories, {total_tokens} tokens")
+        log_access(memory, "update_memory", profile, f"added {len(changes)} memories, {total_tokens} tokens")
 
-    # Single save
-    save_memory(memory)
+        # Single save
+        save_memory(memory)
 
     return json.dumps({
         "status": "updated",
@@ -645,58 +687,60 @@ def search_memory(
     """
     Search memories with optional token budget.
     """
-    memory = load_memory()
-    if profile not in memory.get("profiles", {}):
-        return json.dumps({"error": f"Profile '{profile}' not found"})
+    with _memory_lock():
+        memory = load_memory()
+        if profile not in memory.get("profiles", {}):
+            return json.dumps({"error": f"Profile '{profile}' not found"})
 
-    profile_data = memory["profiles"][profile]
-    decay_config = memory.get("schema", {}).get("decay_config", {})
-    memories = profile_data.get("memories", [])
-    memories = apply_decay([m.copy() for m in memories], decay_config)
+        profile_data = memory["profiles"][profile]
+        decay_config = memory.get("schema", {}).get("decay_config", {})
+        memories = profile_data.get("memories", [])
+        memories = apply_decay([m.copy() for m in memories], decay_config)
 
-    if category:
-        if category not in VALID_CATEGORIES:
-            return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
-        memories = [m for m in memories if m.get("category") == category]
+        if category:
+            if category not in VALID_CATEGORIES:
+                return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
+            memories = [m for m in memories if m.get("category") == category]
 
-    query_lower = query.lower()
-    query_terms = query_lower.split()
-    results = []
-    for mem in memories:
-        content_lower = mem.get("content", "").lower()
-        tags_str = " ".join(mem.get("tags", [])).lower()
-        project_id = str(mem.get("project_id", "")).lower()
-        searchable = f"{content_lower} {tags_str} {project_id}"
-        match_count = sum(1 for term in query_terms if term in searchable)
-        if match_count > 0:
-            mem["match_score"] = match_count / len(query_terms)
-            mem["combined_score"] = mem["match_score"] * mem.get("effective_score", 1.0)
-            if "token_count" not in mem:
-                mem["token_count"] = count_memory_tokens(mem)
-            results.append(mem)
+        query_lower = query.lower()
+        query_terms = query_lower.split()
+        results = []
+        for mem in memories:
+            content_lower = mem.get("content", "").lower()
+            tags_str = " ".join(mem.get("tags", [])).lower()
+            project_id = str(mem.get("project_id", "")).lower()
+            searchable = f"{content_lower} {tags_str} {project_id}"
+            match_count = sum(1 for term in query_terms if term in searchable)
+            if match_count > 0:
+                mem["match_score"] = match_count / len(query_terms)
+                mem["combined_score"] = mem["match_score"] * mem.get("effective_score", 1.0)
+                if "token_count" not in mem:
+                    mem["token_count"] = count_memory_tokens(mem)
+                results.append(mem)
 
-    results.sort(key=lambda m: m.get("combined_score", 0), reverse=True)
+        results.sort(key=lambda m: m.get("combined_score", 0), reverse=True)
 
-    if max_tokens:
-        budget_results = []
-        tokens_used = 0
+        if max_tokens:
+            budget_results = []
+            tokens_used = 0
+            for mem in results:
+                mem_tokens = mem.get("token_count", 0)
+                if tokens_used + mem_tokens <= max_tokens:
+                    budget_results.append(mem)
+                    tokens_used += mem_tokens
+                if len(budget_results) >= limit:
+                    break
+            results = budget_results
+        else:
+            results = results[:limit]
+
         for mem in results:
-            mem_tokens = mem.get("token_count", 0)
-            if tokens_used + mem_tokens <= max_tokens:
-                budget_results.append(mem)
-                tokens_used += mem_tokens
-            if len(budget_results) >= limit:
-                break
-        results = budget_results
-    else:
-        results = results[:limit]
+            boost_on_access(memory, mem["id"], profile)
 
-    for mem in results:
-        boost_on_access(memory, mem["id"], profile)
+        tokens_served = sum(m.get("token_count", 0) for m in results)
+        log_access(memory, "search_memory", profile, f"query='{query}', results={len(results)}", tokens_served)
+        save_memory(memory)
 
-    tokens_served = sum(m.get("token_count", 0) for m in results)
-    log_access(memory, "search_memory", profile, f"query='{query}', results={len(results)}", tokens_served)
-    save_memory(memory)
     log_to_analytics(
         tokens_served=tokens_served,
         memories_returned=len(results),
@@ -719,25 +763,27 @@ def delete_memory(
     profile: str = DEFAULT_PROFILE
 ) -> str:
     """Delete a specific memory by ID."""
-    memory = load_memory()
-    if profile not in memory.get("profiles", {}):
-        return json.dumps({"error": f"Profile '{profile}' not found"})
+    with _memory_lock():
+        memory = load_memory()
+        if profile not in memory.get("profiles", {}):
+            return json.dumps({"error": f"Profile '{profile}' not found"})
 
-    profile_data = memory["profiles"][profile]
-    memories = profile_data.get("memories", [])
-    deleted_mem = None
-    for m in memories:
-        if m.get("id") == memory_id:
-            deleted_mem = m
-            break
+        profile_data = memory["profiles"][profile]
+        memories = profile_data.get("memories", [])
+        deleted_mem = None
+        for m in memories:
+            if m.get("id") == memory_id:
+                deleted_mem = m
+                break
 
-    if not deleted_mem:
-        return json.dumps({"error": f"Memory '{memory_id}' not found"})
+        if not deleted_mem:
+            return json.dumps({"error": f"Memory '{memory_id}' not found"})
 
-    tokens_freed = deleted_mem.get("token_count", count_memory_tokens(deleted_mem))
-    profile_data["memories"] = [m for m in memories if m.get("id") != memory_id]
-    log_access(memory, "delete_memory", profile, f"id={memory_id}, freed={tokens_freed} tokens")
-    save_memory(memory)
+        tokens_freed = deleted_mem.get("token_count", count_memory_tokens(deleted_mem))
+        profile_data["memories"] = [m for m in memories if m.get("id") != memory_id]
+        log_access(memory, "delete_memory", profile, f"id={memory_id}, freed={tokens_freed} tokens")
+        save_memory(memory)
+
     return json.dumps({
         "status": "deleted",
         "memory_id": memory_id,
@@ -818,29 +864,31 @@ def prune_memories(
     Returns:
         List of pruned/would-prune memories
     """
-    memory = load_memory()
-    if profile not in memory.get("profiles", {}):
-        return json.dumps({"error": f"Profile '{profile}' not found"})
+    with _memory_lock():
+        memory = load_memory()
+        if profile not in memory.get("profiles", {}):
+            return json.dumps({"error": f"Profile '{profile}' not found"})
 
-    profile_data = memory["profiles"][profile]
-    memories = profile_data.get("memories", [])
-    decay_config = memory.get("schema", {}).get("decay_config", {})
-    threshold = threshold or ARCHIVE_SCORE_THRESHOLD
-    memories = apply_decay([m.copy() for m in memories], decay_config)
-    to_prune = [m for m in memories if m.get("effective_score", 1.0) < threshold]
-    tokens_to_free = sum(m.get("token_count", count_memory_tokens(m)) for m in to_prune)
+        profile_data = memory["profiles"][profile]
+        memories = profile_data.get("memories", [])
+        decay_config = memory.get("schema", {}).get("decay_config", {})
+        threshold = threshold or ARCHIVE_SCORE_THRESHOLD
+        memories = apply_decay([m.copy() for m in memories], decay_config)
+        to_prune = [m for m in memories if m.get("effective_score", 1.0) < threshold]
+        tokens_to_free = sum(m.get("token_count", count_memory_tokens(m)) for m in to_prune)
 
-    if dry_run:
-        return json.dumps({
-            "dry_run": True,
-            "would_prune": len(to_prune),
-            "tokens_would_free": tokens_to_free,
-            "memories": [{"id": m["id"], "score": m.get("effective_score"), "content": m["content"][:50]} for m in to_prune]
-        }, indent=2)
+        if dry_run:
+            return json.dumps({
+                "dry_run": True,
+                "would_prune": len(to_prune),
+                "tokens_would_free": tokens_to_free,
+                "memories": [{"id": m["id"], "score": m.get("effective_score"), "content": m["content"][:50]} for m in to_prune]
+            }, indent=2)
 
-    pruned_ids = auto_prune(memory, profile)
-    log_access(memory, "prune_memories", profile, f"pruned {len(pruned_ids)}, freed ~{tokens_to_free} tokens")
-    save_memory(memory)
+        pruned_ids = auto_prune(memory, profile)
+        log_access(memory, "prune_memories", profile, f"pruned {len(pruned_ids)}, freed ~{tokens_to_free} tokens")
+        save_memory(memory)
+
     return json.dumps({
         "status": "pruned",
         "pruned_count": len(pruned_ids),
@@ -853,18 +901,20 @@ def prune_memories(
 @mcp.tool()
 def switch_profile(profile_name: str) -> str:
     """Switch active persona context."""
-    memory = load_memory()
-    if profile_name not in memory.get("profiles", {}):
-        available = list(memory.get("profiles", {}).keys())
-        return json.dumps({
-            "error": f"Profile '{profile_name}' not found",
-            "available_profiles": available
-        })
+    with _memory_lock():
+        memory = load_memory()
+        if profile_name not in memory.get("profiles", {}):
+            available = list(memory.get("profiles", {}).keys())
+            return json.dumps({
+                "error": f"Profile '{profile_name}' not found",
+                "available_profiles": available
+            })
 
-    profile_data = memory["profiles"][profile_name]
-    stats = get_profile_token_stats(profile_data)
-    log_access(memory, "switch_profile", profile_name, "")
-    save_memory(memory)
+        profile_data = memory["profiles"][profile_name]
+        stats = get_profile_token_stats(profile_data)
+        log_access(memory, "switch_profile", profile_name, "")
+        save_memory(memory)
+
     return json.dumps({
         "status": "switched",
         "profile": profile_name,
@@ -878,23 +928,25 @@ def switch_profile(profile_name: str) -> str:
 @mcp.tool()
 def list_projects(profile: str = DEFAULT_PROFILE) -> str:
     """List all projects with status."""
-    memory = load_memory()
-    if profile not in memory.get("profiles", {}):
-        return json.dumps({"error": f"Profile '{profile}' not found"})
+    with _memory_lock():
+        memory = load_memory()
+        if profile not in memory.get("profiles", {}):
+            return json.dumps({"error": f"Profile '{profile}' not found"})
 
-    projects = memory["profiles"][profile].get("projects", [])
-    summary = [
-        {
-            "id": p.get("id"),
-            "name": p.get("name"),
-            "status": p.get("status"),
-            "phase": p.get("phase"),
-            "last_updated": p.get("last_updated")
-        }
-        for p in projects
-    ]
-    log_access(memory, "list_projects", profile, "")
-    save_memory(memory)
+        projects = memory["profiles"][profile].get("projects", [])
+        summary = [
+            {
+                "id": p.get("id"),
+                "name": p.get("name"),
+                "status": p.get("status"),
+                "phase": p.get("phase"),
+                "last_updated": p.get("last_updated")
+            }
+            for p in projects
+        ]
+        log_access(memory, "list_projects", profile, "")
+        save_memory(memory)
+
     return json.dumps({
         "profile": profile,
         "projects": summary,
@@ -944,121 +996,123 @@ def export_for_model(
         depth: Export depth (full, summary, minimal)
         max_tokens: Token budget for export (default 2000)
     """
-    memory = load_memory()
-    if profile not in memory.get("profiles", {}):
-        return json.dumps({"error": f"Profile '{profile}' not found"})
+    with _memory_lock():
+        memory = load_memory()
+        if profile not in memory.get("profiles", {}):
+            return json.dumps({"error": f"Profile '{profile}' not found"})
 
-    profile_data = memory["profiles"][profile]
-    identity = profile_data.get("identity", {})
-    memories = profile_data.get("memories", [])
-    projects = profile_data.get("projects", [])
-    prefs = profile_data.get("model_preferences", {}).get(model, {})
-    decay_config = memory.get("schema", {}).get("decay_config", {})
-    memories = apply_decay([m.copy() for m in memories], decay_config)
-    memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
+        profile_data = memory["profiles"][profile]
+        identity = profile_data.get("identity", {})
+        memories = profile_data.get("memories", [])
+        projects = profile_data.get("projects", [])
+        prefs = profile_data.get("model_preferences", {}).get(model, {})
+        decay_config = memory.get("schema", {}).get("decay_config", {})
+        memories = apply_decay([m.copy() for m in memories], decay_config)
+        memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
 
-    budgets = {
-        "full": max_tokens,
-        "summary": max_tokens // 2,
-        "minimal": max_tokens // 4
-    }
-    budget = budgets.get(depth, max_tokens)
-    tokens_used = 0
+        budgets = {
+            "full": max_tokens,
+            "summary": max_tokens // 2,
+            "minimal": max_tokens // 4
+        }
+        budget = budgets.get(depth, max_tokens)
+        tokens_used = 0
 
-    if model == "chatgpt":
-        lines = [
-            "# Memory Chip",
-            f"*Exported: {datetime.now().strftime('%Y-%m-%d %H:%M')}*",
-            "",
-            "## Identity",
-            f"**Name:** {identity.get('name', 'Unknown')}",
-            f"**Role:** {identity.get('role', 'Unknown')}",
-            ""
-        ]
-        tokens_used = count_tokens("\n".join(lines))
-
-        if identity.get("communication_style") and tokens_used < budget - 100:
-            style = identity["communication_style"]
-            style_lines = [
-                "## Communication Style",
-                f"**Tone:** {style.get('tone', '')}",
+        if model == "chatgpt":
+            lines = [
+                "# Memory Chip",
+                f"*Exported: {datetime.now().strftime('%Y-%m-%d %H:%M')}*",
+                "",
+                "## Identity",
+                f"**Name:** {identity.get('name', 'Unknown')}",
+                f"**Role:** {identity.get('role', 'Unknown')}",
+                ""
             ]
-            if style.get("preferences"):
-                for pref in style["preferences"][:3]:
-                    style_lines.append(f"- {pref}")
-            style_lines.append("")
-            style_text = "\n".join(style_lines)
-            if tokens_used + count_tokens(style_text) < budget:
-                lines.extend(style_lines)
-                tokens_used += count_tokens(style_text)
+            tokens_used = count_tokens("\n".join(lines))
 
-        if memories and depth in ("full", "summary") and tokens_used < budget - 100:
-            lines.append("## Key Memories")
-            for m in memories:
-                if tokens_used >= budget - 50:
-                    break
-                content = m.get("content", "")
-                mem_tokens = count_tokens(content)
-                if tokens_used + mem_tokens > budget - 50:
-                    remaining = budget - tokens_used - 50
-                    content = content[:remaining * 3] + "…"
-                lines.append(f"- {content}")
-                tokens_used += count_tokens(content) + 2
-            lines.append("")
+            if identity.get("communication_style") and tokens_used < budget - 100:
+                style = identity["communication_style"]
+                style_lines = [
+                    "## Communication Style",
+                    f"**Tone:** {style.get('tone', '')}",
+                ]
+                if style.get("preferences"):
+                    for pref in style["preferences"][:3]:
+                        style_lines.append(f"- {pref}")
+                style_lines.append("")
+                style_text = "\n".join(style_lines)
+                if tokens_used + count_tokens(style_text) < budget:
+                    lines.extend(style_lines)
+                    tokens_used += count_tokens(style_text)
 
-        if projects and depth == "full" and tokens_used < budget - 100:
-            lines.append("## Active Projects")
-            for p in projects:
-                if p.get("status") == "active" and tokens_used < budget - 50:
-                    proj_line = f"- **{p.get('name', p.get('id'))}**: {p.get('description', '')[:50]}"
-                    lines.append(proj_line)
-                    tokens_used += count_tokens(proj_line)
-            lines.append("")
+            if memories and depth in ("full", "summary") and tokens_used < budget - 100:
+                lines.append("## Key Memories")
+                for m in memories:
+                    if tokens_used >= budget - 50:
+                        break
+                    content = m.get("content", "")
+                    mem_tokens = count_tokens(content)
+                    if tokens_used + mem_tokens > budget - 50:
+                        remaining = budget - tokens_used - 50
+                        content = content[:remaining * 3] + "…"
+                    lines.append(f"- {content}")
+                    tokens_used += count_tokens(content) + 2
+                lines.append("")
 
-        export_text = "\n".join(lines)
+            if projects and depth == "full" and tokens_used < budget - 100:
+                lines.append("## Active Projects")
+                for p in projects:
+                    if p.get("status") == "active" and tokens_used < budget - 50:
+                        proj_line = f"- **{p.get('name', p.get('id'))}**: {p.get('description', '')[:50]}"
+                        lines.append(proj_line)
+                        tokens_used += count_tokens(proj_line)
+                lines.append("")
 
-    elif model == "gemini":
-        parts = [f"User: {identity.get('name', 'Unknown')} - {identity.get('role', 'Unknown')}"]
-        tokens_used = count_tokens(parts[0])
+            export_text = "\n".join(lines)
 
-        if identity.get("communication_style", {}).get("tone"):
-            tone_part = f"Style: {identity['communication_style']['tone'][:50]}"
-            if tokens_used + count_tokens(tone_part) < budget:
-                parts.append(tone_part)
-                tokens_used += count_tokens(tone_part)
+        elif model == "gemini":
+            parts = [f"User: {identity.get('name', 'Unknown')} - {identity.get('role', 'Unknown')}"]
+            tokens_used = count_tokens(parts[0])
 
-        if memories and depth in ("full", "summary"):
-            prefs_mems = [m for m in memories if m.get("category") == "preference"][:3]
-            if prefs_mems:
-                pref_text = "; ".join(m["content"][:30] for m in prefs_mems)
-                if tokens_used + count_tokens(pref_text) < budget:
-                    parts.append(f"Prefs: {pref_text}")
-                    tokens_used += count_tokens(pref_text)
+            if identity.get("communication_style", {}).get("tone"):
+                tone_part = f"Style: {identity['communication_style']['tone'][:50]}"
+                if tokens_used + count_tokens(tone_part) < budget:
+                    parts.append(tone_part)
+                    tokens_used += count_tokens(tone_part)
 
-        export_text = " | ".join(parts)
+            if memories and depth in ("full", "summary"):
+                prefs_mems = [m for m in memories if m.get("category") == "preference"][:3]
+                if prefs_mems:
+                    pref_text = "; ".join(m["content"][:30] for m in prefs_mems)
+                    if tokens_used + count_tokens(pref_text) < budget:
+                        parts.append(f"Prefs: {pref_text}")
+                        tokens_used += count_tokens(pref_text)
 
-    elif model == "ollama":
-        parts = [
-            f"User={identity.get('name', 'Unknown')}",
-            f"Role={identity.get('role', 'Unknown')[:30]}"
-        ]
-        tokens_used = sum(count_tokens(p) for p in parts)
+            export_text = " | ".join(parts)
 
-        if depth in ("full", "summary"):
-            active = [p["id"] for p in projects if p.get("status") == "active"][:3]
-            if active:
-                proj_part = f"Projects={','.join(active)}"
-                if tokens_used + count_tokens(proj_part) < budget:
-                    parts.append(proj_part)
+        elif model == "ollama":
+            parts = [
+                f"User={identity.get('name', 'Unknown')}",
+                f"Role={identity.get('role', 'Unknown')[:30]}"
+            ]
+            tokens_used = sum(count_tokens(p) for p in parts)
 
-        export_text = ";".join(parts)
+            if depth in ("full", "summary"):
+                active = [p["id"] for p in projects if p.get("status") == "active"][:3]
+                if active:
+                    proj_part = f"Projects={','.join(active)}"
+                    if tokens_used + count_tokens(proj_part) < budget:
+                        parts.append(proj_part)
 
-    else:
-        return json.dumps({"error": f"Unknown model: {model}. Supported: chatgpt, gemini, ollama"})
+            export_text = ";".join(parts)
 
-    final_tokens = count_tokens(export_text)
-    log_access(memory, "export_for_model", profile, f"model={model}, tokens={final_tokens}", final_tokens)
-    save_memory(memory)
+        else:
+            return json.dumps({"error": f"Unknown model: {model}. Supported: chatgpt, gemini, ollama"})
+
+        final_tokens = count_tokens(export_text)
+        log_access(memory, "export_for_model", profile, f"model={model}, tokens={final_tokens}", final_tokens)
+        save_memory(memory)
+
     log_to_analytics(
         tokens_served=final_tokens,
         memories_returned=len([m for m in memories if m.get("effective_score", 0) > 0.3]),

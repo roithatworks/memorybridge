@@ -36,12 +36,12 @@ Your folder should look like this:
 Open Terminal and run:
 
 ```bash
-pip3 install fastmcp streamlit
+pip3 install -r ~/memorybridge/requirements.txt
 ```
 
 If you get a permissions error, try:
 ```bash
-pip3 install --user fastmcp streamlit
+pip3 install --user fastmcp tiktoken
 ```
 
 To verify it worked:

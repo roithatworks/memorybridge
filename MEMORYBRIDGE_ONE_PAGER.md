@@ -61,7 +61,7 @@ Your memories are stored in `~/memorybridge/memory.json` — a plain text file y
 - Mac, Windows, or Linux
 - Python 3.10+
 - Claude desktop app
-- Two Python packages: `fastmcp` and `streamlit`
+- Two Python packages: `fastmcp` and `tiktoken`
 
 ---
 
