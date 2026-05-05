@@ -163,4 +163,59 @@ Memories that fall below a relevance threshold (default `0.15`) are automaticall
 
 ---
 
+---
+
+## Phase 2 — Ingestion Engine
+
+Import your conversation history from Claude, ChatGPT, or Gemini. DeepSeek R1 extracts durable facts; Claude resolves conflicts; everything writes through the same MCP server tools.
+
+### Setup
+
+Add API keys to `~/memorybridge/.env`:
+
+```
+DEEPSEEK_API_KEY=your_key_here
+ANTHROPIC_API_KEY=your_key_here
+```
+
+Install new dependencies:
+
+```bash
+pip3 install -r requirements.txt
+```
+
+### Usage
+
+```bash
+# Import last 30 days of Claude conversations
+python ingestion/run.py --source claude --file ~/Downloads/conversations.json --days 30
+
+# Import all ChatGPT history into a specific profile
+python ingestion/run.py --source chatgpt --file ~/Downloads/conversations.json --profile work
+
+# Dry run — see what would be extracted without writing anything
+python ingestion/run.py --source claude --file ~/Downloads/conversations.json --preview
+
+# Import Gemini activity
+python ingestion/run.py --source gemini --file ~/Downloads/MyActivity.json
+```
+
+### How it works
+
+```
+Export file → parse → DeepSeek R1 extraction → confidence routing → Claude conflict resolution → memory write
+```
+
+- **Facts with confidence >= 0.85** are written automatically
+- **Facts with confidence 0.60-0.84** go to `~/memorybridge/flagged_queue.json` for manual review (Phase 3 UI)
+- **Conflicts, relationship facts, and project status changes** are escalated to Claude for a verdict: accept / reject / merge
+- **Duplicates** are detected via keyword overlap before writing — no double entries
+
+### Output files
+
+| File | Purpose |
+|---|---|
+| `~/memorybridge/logs/ingest_YYYY-MM-DD_HH-MM.json` | Full diff report per run |
+| `~/memorybridge/flagged_queue.json` | Facts pending manual review |
+
 *Local-first. No telemetry. No cloud. Shared freely.*
