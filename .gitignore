@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.DS_Store
+logs/
+flagged_queue.json
