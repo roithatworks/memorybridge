@@ -1527,3 +1527,44 @@ memorybridge/
     └── plans/
         └── 2026-05-05-memorybridge-roadmap.md
 ```
+
+---
+
+## Dogfooding Protocol
+
+**Rule:** MemoryBridge builds MemoryBridge. Every phase must make the next phase cheaper to execute. If it doesn't, the phase didn't ship right.
+
+### After every phase ships
+
+1. Run ingestion against the Claude conversations where that phase was built
+2. Check `analytics.json` — tokens served per session should trend down
+3. Start the next phase session with `get_memory` — relevant decisions should surface without prompting
+
+### Metrics to track phase-over-phase
+
+| Phase | Metric | Baseline | Target |
+|---|---|---|---|
+| 2.5 | `search_memory` avg tokens/call | ~1,740 | ~800 |
+| 3 | Write time per operation | JSON rewrite (~50ms) | SQLite WAL (<5ms) |
+| 4 | Search recall on paraphrased queries | keyword miss | semantic hit |
+| 5 | Time to clear flagged queue | manual JSON edit | <2 min in UI |
+| 6 | Session startup token cost | re-explain context | cold-start from passport |
+
+### How to measure
+
+```bash
+# Token cost per search_memory call (run after each phase)
+python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / 'memorybridge/analytics.json').read_text())
+search = data.get('by_operation', {}).get('search_memory', {})
+calls = search.get('count', 1)
+tokens = search.get('tokens', 0)
+print(f'search_memory: {calls} calls, {tokens:,} tokens, {tokens//calls:,} avg/call')
+"
+```
+
+### The signal that dogfooding is working
+
+Each new Claude Code session on MemoryBridge should need fewer tokens to get to productive work. If you find yourself re-explaining something Claude should already know — that's a memory gap. Run ingestion, fill it, move on.
