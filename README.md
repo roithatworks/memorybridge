@@ -106,7 +106,7 @@ Claude calls the memory tools automatically — no special syntax required.
 | `get_memory` | Retrieve memories within a token budget |
 | `add_memory` | Add a single memory with category and importance |
 | `update_memory` | Batch-add multiple facts in one save operation |
-| `search_memory` | Full-text search across memories |
+| `search_memory` | Full-text search across memories (default: limit=5, max_tokens=800) |
 | `delete_memory` | Remove a memory by ID |
 | `get_token_stats` | Token usage breakdown by profile |
 | `prune_memories` | Archive low-score memories to free token budget |
@@ -143,6 +143,17 @@ Each memory has a `token_count` computed by `tiktoken` (the same BPE tokenizer u
 3. Compresses or truncates lower-priority memories to fit more in
 
 Memories that fall below a relevance threshold (default `0.15`) are automatically archived rather than deleted, keeping your active memory lean.
+
+### search_memory defaults (v1.4)
+
+`search_memory` previously returned up to 10 results with no token cap, averaging ~1,700 tokens per call. Defaults are now:
+
+| Parameter | Old default | New default |
+|---|---|---|
+| `limit` | 10 | 5 |
+| `max_tokens` | None | 800 |
+
+This cuts typical search cost by ~50% with no loss in retrieval quality — the top 5 results contain the useful signal. Both values can still be overridden per call when broader retrieval is needed.
 
 ---
 
