@@ -17,6 +17,7 @@ import uuid
 import re
 import fcntl
 import atexit
+import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
@@ -47,6 +48,7 @@ SEARCH_MAX_TOKENS_DEFAULT = 800  # token cap per search_memory call
 MAX_TOTAL_TOKENS = 50000  # Threshold for auto-pruning
 ARCHIVE_SCORE_THRESHOLD = 0.15  # Auto-archive below this
 ANALYTICS_FLUSH_EVERY = 10  # Write analytics to disk every N events
+ACCESS_LOG_FLUSH_EVERY = 10  # Write access log to disk every N events
 
 # Valid categories
 VALID_CATEGORIES = [
@@ -62,6 +64,9 @@ IMPORTANCE_LEVELS = ["low", "medium", "high", "critical"]
 # =============================================================================
 _analytics_buffer: list = []
 _analytics_flush_count: int = 0
+
+_access_log_buffer: list = []
+_access_log_flush_count: int = 0
 
 
 def _flush_analytics() -> None:
@@ -125,6 +130,38 @@ def _flush_analytics() -> None:
 
 # Flush on clean shutdown so we don't lose buffered events
 atexit.register(_flush_analytics)
+
+
+def _flush_access_log() -> None:
+    """Write buffered access log entries and token usage updates to disk."""
+    global _access_log_buffer, _access_log_flush_count
+    if not _access_log_buffer:
+        return
+    try:
+        with _memory_lock():
+            memory = load_memory()
+            if "access_log" not in memory:
+                memory["access_log"] = []
+            for entry in _access_log_buffer:
+                memory["access_log"].append(entry["log"])
+                if entry.get("tokens_served", 0) > 0:
+                    if "token_usage" not in memory:
+                        memory["token_usage"] = {"total_served": 0, "by_profile": {}}
+                    memory["token_usage"]["total_served"] += entry["tokens_served"]
+                    profile_usage = memory["token_usage"].get("by_profile", {})
+                    profile_usage[entry["profile"]] = \
+                        profile_usage.get(entry["profile"], 0) + entry["tokens_served"]
+                    memory["token_usage"]["by_profile"] = profile_usage
+            if len(memory["access_log"]) > 1000:
+                memory["access_log"] = memory["access_log"][-1000:]
+            save_memory(memory)
+        _access_log_buffer = []
+        _access_log_flush_count = 0
+    except Exception:
+        pass
+
+
+atexit.register(_flush_access_log)
 
 
 def log_to_analytics(
@@ -307,30 +344,27 @@ def save_memory(data: dict) -> None:
     # Atomic write: write to temp file then rename to avoid corruption
     tmp = MEMORY_FILE.with_suffix(".tmp")
     with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f)  # compact — no indent
     tmp.replace(MEMORY_FILE)
 
 
 def log_access(memory: dict, action: str, profile: str, details: str = "", tokens_served: int = 0) -> None:
-    if "access_log" not in memory:
-        memory["access_log"] = []
-    log_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "action": action,
+    """Buffer access log entry. Flushes every ACCESS_LOG_FLUSH_EVERY calls."""
+    global _access_log_flush_count
+    _access_log_buffer.append({
+        "log": {
+            "timestamp": datetime.now().isoformat(),
+            "action": action,
+            "profile": profile,
+            "details": details,
+            "tokens_served": tokens_served,
+        },
+        "tokens_served": tokens_served,
         "profile": profile,
-        "details": details,
-        "tokens_served": tokens_served
-    }
-    memory["access_log"].append(log_entry)
-    if tokens_served > 0:
-        if "token_usage" not in memory:
-            memory["token_usage"] = {"total_served": 0, "by_profile": {}}
-        memory["token_usage"]["total_served"] += tokens_served
-        profile_usage = memory["token_usage"].get("by_profile", {})
-        profile_usage[profile] = profile_usage.get(profile, 0) + tokens_served
-        memory["token_usage"]["by_profile"] = profile_usage
-    if len(memory["access_log"]) > 1000:
-        memory["access_log"] = memory["access_log"][-1000:]
+    })
+    _access_log_flush_count += 1
+    if _access_log_flush_count >= ACCESS_LOG_FLUSH_EVERY:
+        _flush_access_log()
 
 
 def apply_decay(memories: list, decay_config: dict) -> list:
@@ -372,6 +406,20 @@ def boost_on_access(memory: dict, mem_id: str, profile: str) -> None:
 
 def generate_memory_id() -> str:
     return f"mem_{uuid.uuid4().hex[:8]}"
+
+
+def _content_hash(content: str) -> str:
+    """SHA256 of normalized content for deduplication."""
+    return hashlib.sha256(content.strip().lower().encode()).hexdigest()
+
+
+_RESULT_FIELDS = {"id", "content", "category", "importance",
+                  "project_id", "tags", "token_count", "created_at"}
+
+
+def _clean_result(mem: dict) -> dict:
+    """Return only fields Claude needs — strip internal scoring metadata."""
+    return {k: v for k, v in mem.items() if k in _RESULT_FIELDS}
 
 
 # =============================================================================
@@ -488,7 +536,6 @@ def get_memory(
             f"hint={context_hint}, cat={category}, budget={max_tokens}",
             tokens_served=total_tokens_served
         )
-        save_memory(memory)
 
     log_to_analytics(
         tokens_served=total_tokens_served,
@@ -541,6 +588,12 @@ def add_memory(
         profile_data = memory["profiles"][profile]
         if "memories" not in profile_data:
             profile_data["memories"] = []
+
+        # Dedup: reject exact duplicate content
+        h = _content_hash(content)
+        existing_hashes = {_content_hash(m.get("content", "")) for m in profile_data["memories"]}
+        if h in existing_hashes:
+            return json.dumps({"status": "duplicate", "reason": "identical content already exists"})
 
         now = datetime.now().strftime("%Y-%m-%d")
         mem_id = generate_memory_id()
@@ -741,7 +794,6 @@ def search_memory(
 
         tokens_served = sum(m.get("token_count", 0) for m in results)
         log_access(memory, "search_memory", profile, f"query='{query}', results={len(results)}", tokens_served)
-        save_memory(memory)
 
     log_to_analytics(
         tokens_served=tokens_served,
@@ -753,7 +805,7 @@ def search_memory(
     return json.dumps({
         "query": query,
         "profile": profile,
-        "results": results,
+        "results": [_clean_result(m) for m in results],
         "total_matches": len(results),
         "tokens_served": tokens_served
     }, indent=2)
