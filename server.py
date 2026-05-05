@@ -42,6 +42,8 @@ MEMORY_FILE = Path.home() / "memorybridge" / "memory.json"
 ANALYTICS_FILE = Path.home() / "memorybridge" / "analytics.json"
 DEFAULT_PROFILE = "default"
 MAX_TOKENS_DEFAULT = 4000
+SEARCH_LIMIT_DEFAULT = 5       # max results returned by search_memory
+SEARCH_MAX_TOKENS_DEFAULT = 800  # token cap per search_memory call
 MAX_TOTAL_TOKENS = 50000  # Threshold for auto-pruning
 ARCHIVE_SCORE_THRESHOLD = 0.15  # Auto-archive below this
 ANALYTICS_FLUSH_EVERY = 10  # Write analytics to disk every N events
@@ -680,8 +682,8 @@ def update_memory(
 def search_memory(
     query: str,
     category: Optional[str] = None,
-    limit: int = 10,
-    max_tokens: Optional[int] = None,
+    limit: int = SEARCH_LIMIT_DEFAULT,
+    max_tokens: int = SEARCH_MAX_TOKENS_DEFAULT,
     profile: str = DEFAULT_PROFILE
 ) -> str:
     """
