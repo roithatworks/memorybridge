@@ -1568,3 +1568,40 @@ print(f'search_memory: {calls} calls, {tokens:,} tokens, {tokens//calls:,} avg/c
 ### The signal that dogfooding is working
 
 Each new Claude Code session on MemoryBridge should need fewer tokens to get to productive work. If you find yourself re-explaining something Claude should already know — that's a memory gap. Run ingestion, fill it, move on.
+
+---
+
+## Backlog
+
+Items deferred from active phases. Address in order when phases complete.
+
+### Ingestion — Cross-Model Verification (before Phase 3)
+
+The Claude parser is verified against real data. ChatGPT and Gemini parsers are built but untested against real exports.
+
+**To do:**
+1. Request ChatGPT export (Settings → Data Controls → Export Data) — run `parse_chatgpt.py` against real file, verify facts land correctly
+2. Request Gemini export (Google Takeout → Gemini Apps Activity) — run `parse_gemini.py`, verify both Format A and Format B handle real output
+3. Fix any parser issues found
+
+### Ingestion — Inbox Watcher (Phase 3 or 4 window)
+
+Manual CLI ingestion creates friction. Replace with a watched folder + launchd path watcher.
+
+**Design:**
+- Drop any export file into `~/memorybridge/inbox/`
+- launchd detects new file, auto-detects source format, runs ingestion
+- Processed files move to `~/memorybridge/inbox/processed/`
+- Zero CLI required
+
+**Files to build:**
+- `ingestion/watcher.py` — file watcher + format detector
+- `launchd/com.memorybridge.inbox.plist` — path watcher config
+- `tests/unit/test_watcher.py`
+
+### Ingestion — Perplexity Support (backlog, no timeline)
+
+Perplexity export format is unclear. Revisit when they ship a bulk export option.
+- Check Settings → Account → Export
+- Write `parse_perplexity.py` using same normalized format
+- Add to watcher format detector
