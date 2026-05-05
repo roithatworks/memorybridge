@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"python3 - <<'EOF'\\n\\\"\\\"\\\"End-to-end preview run with fully mocked external calls.\\\"\\\"\\\"\\nimport json, sys, unittest.mock as mock, tempfile, os\\nsys.path.insert(0, \\\"ingestion\\\")\\n\\n# Build...",
-  "error": "Exit code 1\nTraceback (most recent call last):\n  File \"<stdin>\", line 34, in <module>\n  File \"/Library/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py\", line 1487, in __enter__\n    self.target = self.getter()\n                  ~~~~~~~~~~~^^\n  File \"/Library/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pkgutil.py\", line 463, in resolve_name\n    mod = importlib.import_module(s)\n  File \"/Library/Frameworks/Python.framework/Versions/3.14/lib/python3.14/importlib...",
-  "timestamp": "2026-05-04T20:31:37.162Z",
+  "tool_input_preview": "{\"command\":\"which python3 && which pytest || rtk pytest --version\",\"description\":\"Check Python and pytest availability\"}",
+  "error": "Exit code 1\n/usr/local/bin/python3\nrtk: Failed to run pytest: Failed to spawn process: No such file or directory (os error 2)",
+  "timestamp": "2026-05-05T18:56:18.647Z",
   "retry_count": 1
 }
