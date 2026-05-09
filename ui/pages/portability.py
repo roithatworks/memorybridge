@@ -37,12 +37,13 @@ def run_ingestion(source: str, file_path: Path, profile: str,
 
 def render():
     import streamlit as st
-    from server import export_for_model as _export_tool
+    from server import export_for_model as _export_tool, export_passport as _passport_tool
     export_for_model = _export_tool.fn
+    export_passport = _passport_tool.fn
 
     st.header("🔄 Portability")
 
-    tab_import, tab_export = st.tabs(["⬆ Import", "⬇ Export"])
+    tab_import, tab_export, tab_passport = st.tabs(["⬆ Import", "⬇ Export", "🛂 Passport"])
 
     # =========================================================================
     # IMPORT TAB
@@ -133,3 +134,39 @@ def render():
                     )
                 except Exception as e:
                     st.error(f"Export failed: {e}")
+
+    # =========================================================================
+    # PASSPORT TAB
+    # =========================================================================
+    with tab_passport:
+        st.subheader("Memory Passport")
+        st.caption(
+            "A plain-text snapshot of your memory — paste into any AI's system prompt. "
+            "No JSON, no code fences. Works with Claude, ChatGPT, Gemini, Ollama, anything."
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            passport_profile = st.text_input("Profile", value="default", key="pp_profile")
+        with col2:
+            passport_tokens = st.slider("Token budget", 500, 4000, 2000, step=100,
+                                        key="pp_tokens")
+
+        if st.button("Generate Passport", type="primary", key="pp_generate"):
+            with st.spinner("Building passport…"):
+                try:
+                    text = export_passport(
+                        profile=passport_profile,
+                        max_tokens=passport_tokens,
+                    )
+                    st.success("Passport ready.")
+                    st.text_area("Passport text", value=text, height=400, key="pp_text")
+                    st.download_button(
+                        label="⬇ Download passport",
+                        data=text,
+                        file_name=f"memorybridge_passport_{passport_profile}.txt",
+                        mime="text/plain",
+                        key="pp_download",
+                    )
+                except Exception as e:
+                    st.error(f"Passport generation failed: {e}")
