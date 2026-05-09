@@ -63,6 +63,7 @@ def parse(file_path: str, days: int = None) -> dict:
             for turn in turns:
                 human_text = ""
                 model_text = ""
+                # Schema variant A: {"human_turn": ..., "model_turn": ...}
                 if isinstance(turn.get("human_turn"), dict):
                     human_text = turn["human_turn"].get("text", "").strip()
                 elif isinstance(turn.get("human_turn"), str):
@@ -71,6 +72,14 @@ def parse(file_path: str, days: int = None) -> dict:
                     model_text = turn["model_turn"].get("text", "").strip()
                 elif isinstance(turn.get("model_turn"), str):
                     model_text = turn["model_turn"].strip()
+                # Schema variant B: {"role": "user"/"model"/"assistant", "text": "..."}
+                if not human_text and not model_text:
+                    role = turn.get("role", "")
+                    text = turn.get("text", "").strip()
+                    if role == "user" and text:
+                        human_text = text
+                    elif role in ("model", "assistant") and text:
+                        model_text = text
                 if human_text:
                     messages.append({"role": "user", "content": human_text})
                 if model_text:
@@ -100,7 +109,12 @@ def parse(file_path: str, days: int = None) -> dict:
     for item in raw:
         # Only include Gemini App entries
         products = item.get("products", [])
-        header = item.get("header", "")
+        header_raw = item.get("header", "")
+        # header may be a plain string or a dict {"title": "Gemini Apps Activity"}
+        if isinstance(header_raw, dict):
+            header = header_raw.get("title", "")
+        else:
+            header = str(header_raw)
         if products and not any("Gemini" in p or "Bard" in p for p in products):
             continue
         if header and "Gemini" not in header and "Bard" not in header:
