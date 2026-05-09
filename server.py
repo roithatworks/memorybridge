@@ -872,5 +872,53 @@ def export_for_model(
     return export_text
 
 
+@mcp.tool()
+def export_passport(
+    profile: str = DEFAULT_PROFILE,
+    max_tokens: int = 2000,
+) -> str:
+    """
+    Export memory as a portable plain-text Memory Passport.
+
+    The passport is model-agnostic — suitable for pasting into any AI's system
+    prompt or context window.  Format: plain text, category sections, no JSON,
+    no code fences.
+
+    Args:
+        profile:    Memory profile to export (default: "default")
+        max_tokens: Token ceiling for the passport (default: 2000)
+    Returns:
+        Plain-text Memory Passport string.
+    """
+    from ingestion.passport import build_passport
+
+    _store.ensure_profile(profile)
+    profile_data = _store.get_profile(profile)
+    if profile_data is None:
+        return f"# Memory Passport\nProfile: {profile}\nGenerated: {__import__('datetime').datetime.now().strftime('%Y-%m-%d')}\n\nError: profile not found."
+
+    memories = _store.get_memories(profile)
+    identity = profile_data.get("identity", {})
+
+    passport = build_passport(
+        memories=memories,
+        identity=identity,
+        profile=profile,
+        max_tokens=max_tokens,
+    )
+
+    final_tokens = count_tokens(passport)
+    _store.log_access("export_passport", profile,
+                      f"tokens={final_tokens}", final_tokens)
+    log_to_analytics(
+        tokens_served=final_tokens,
+        memories_returned=len(memories),
+        model="passport",
+        profile=profile,
+        operation="export_passport",
+    )
+    return passport
+
+
 if __name__ == "__main__":
     mcp.run()
