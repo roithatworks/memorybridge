@@ -55,6 +55,9 @@ class MemoryStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL.read_text())
         self._conn.commit()
+        # Phase 4: lazy-loaded FastEmbed model (cached per-process)
+        self._embed_model = None
+        self._embed_lock = None
 
     # -------------------------------------------------------------------------
     # Profiles
@@ -330,6 +333,153 @@ class MemoryStore:
             "avg_tokens_per_memory": int(row["avg"] or 0),
             "by_category": by_cat,
         }
+
+    # -------------------------------------------------------------------------
+    # Phase 4: Embeddings + hybrid search
+    # -------------------------------------------------------------------------
+
+    def _get_embed_model(self):
+        """Lazy-load FastEmbed model once per process (thread-safe)."""
+        if self._embed_model is None:
+            import threading
+            if self._embed_lock is None:
+                self._embed_lock = threading.Lock()
+            with self._embed_lock:
+                if self._embed_model is None:
+                    from fastembed import TextEmbedding
+                    self._embed_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+        return self._embed_model
+
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Return list of 384-dim float vectors."""
+        model = self._get_embed_model()
+        return [v.tolist() for v in model.embed(texts)]
+
+    def build_embeddings(self, profile: str) -> int:
+        """
+        Compute and persist embeddings for all active memories in a profile.
+        Returns count of embeddings written.
+        Idempotent — re-running updates existing rows.
+        """
+        rows = self._conn.execute(
+            "SELECT id, content FROM memories WHERE profile=? AND archived=0",
+            (profile,)
+        ).fetchall()
+        if not rows:
+            return 0
+
+        ids = [r["id"] for r in rows]
+        texts = [r["content"] for r in rows]
+        vectors = self._embed_texts(texts)
+
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO memory_embeddings(id, profile, vector) VALUES(?,?,?)",
+            [(mid, profile, json.dumps(vec)) for mid, vec in zip(ids, vectors)]
+        )
+        self._conn.commit()
+        return len(ids)
+
+    def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
+        """Fast cosine similarity using numpy."""
+        import numpy as np
+        va, vb = np.array(a, dtype=np.float32), np.array(b, dtype=np.float32)
+        denom = np.linalg.norm(va) * np.linalg.norm(vb)
+        return float(np.dot(va, vb) / denom) if denom > 0 else 0.0
+
+    def search_semantic(self, profile: str, query: str,
+                        limit: int = 5, max_tokens: int = 800) -> list[dict]:
+        """
+        Vector cosine-similarity search against stored embeddings.
+        Falls back to FTS5 if no embeddings have been built for this profile.
+        """
+        # Check embeddings exist for this profile
+        count = self._conn.execute(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE profile=?", (profile,)
+        ).fetchone()[0]
+        if count == 0:
+            return self.search(profile, query, limit=limit, max_tokens=max_tokens)
+
+        # Embed query
+        q_vec = self._embed_texts([query])[0]
+
+        # Fetch all embedding rows for profile
+        rows = self._conn.execute(
+            "SELECT e.id, e.vector FROM memory_embeddings e WHERE e.profile=?",
+            (profile,)
+        ).fetchall()
+
+        # Score by cosine similarity
+        scored = []
+        for row in rows:
+            vec = json.loads(row["vector"])
+            sim = self._cosine_similarity(q_vec, vec)
+            scored.append((row["id"], sim))
+
+        # Sort descending by similarity
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_ids = [mid for mid, _ in scored[:limit * 2]]
+
+        if not top_ids:
+            return []
+
+        # Fetch full memory rows for top IDs (excluding archived)
+        placeholders = ",".join("?" * len(top_ids))
+        mem_rows = self._conn.execute(
+            f"SELECT * FROM memories WHERE id IN ({placeholders}) AND archived=0",
+            top_ids
+        ).fetchall()
+
+        # Re-rank in similarity order
+        mem_by_id = {r["id"]: self._row_to_dict(r) for r in mem_rows}
+        results, tokens_used = [], 0
+        for mid, _ in scored:
+            if mid not in mem_by_id:
+                continue
+            m = mem_by_id[mid]
+            if tokens_used + m["token_count"] <= max_tokens:
+                results.append(m)
+                tokens_used += m["token_count"]
+            if len(results) >= limit:
+                break
+        return results
+
+    def search_hybrid(self, profile: str, query: str,
+                      category: str = None,
+                      limit: int = 5, max_tokens: int = 800) -> list[dict]:
+        """
+        Reciprocal Rank Fusion of FTS5 BM25 + semantic cosine results.
+        RRF score = sum(1 / (60 + rank)) across both lists.
+        Falls back to FTS5-only if no embeddings built.
+        """
+        keyword_results = self.search(profile, query, category=category,
+                                      limit=limit * 2, max_tokens=max_tokens * 2)
+        semantic_results = self.search_semantic(profile, query, limit=limit * 2,
+                                                max_tokens=max_tokens * 2)
+
+        scores: dict[str, float] = {}
+        all_mems: dict[str, dict] = {}
+
+        for rank, mem in enumerate(keyword_results):
+            mid = mem["id"]
+            scores[mid] = scores.get(mid, 0.0) + 1.0 / (60 + rank)
+            all_mems[mid] = mem
+
+        for rank, mem in enumerate(semantic_results):
+            mid = mem["id"]
+            scores[mid] = scores.get(mid, 0.0) + 1.0 / (60 + rank)
+            all_mems[mid] = mem
+
+        ranked = sorted(scores, key=lambda k: scores[k], reverse=True)
+
+        results, tokens_used = [], 0
+        for mid in ranked:
+            mem = all_mems[mid]
+            if tokens_used + mem["token_count"] <= max_tokens:
+                results.append(mem)
+                tokens_used += mem["token_count"]
+            if len(results) >= limit:
+                break
+        return results
 
     # -------------------------------------------------------------------------
     # Internal helpers
