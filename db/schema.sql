@@ -57,4 +57,12 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO meta VALUES ('schema_version', '3.0');
+INSERT OR IGNORE INTO meta VALUES ('schema_version', '4.0');
+
+-- Phase 4: embedding vectors stored as JSON float arrays (no native extension needed)
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    id      TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+    profile TEXT NOT NULL,
+    vector  TEXT NOT NULL   -- JSON array of 384 floats (BAAI/bge-small-en-v1.5)
+);
+CREATE INDEX IF NOT EXISTS idx_embed_profile ON memory_embeddings(profile);

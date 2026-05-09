@@ -486,8 +486,9 @@ def search_memory(
     if category and category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
 
-    results = _store.search(profile, query, category=category,
-                            limit=limit, max_tokens=max_tokens)
+    # Phase 4: hybrid BM25 + semantic search (falls back to FTS5 if no embeddings built)
+    results = _store.search_hybrid(profile, query, category=category,
+                                   limit=limit, max_tokens=max_tokens)
 
     # Boost relevance score for accessed memories
     for mem in results:
