@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memorybridge.inbox</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/python3</string>
+        <string>/Users/cale/Documents/GitHub/memorybridge/ingestion/watcher.py</string>
+        <string>--profile</string>
+        <string>default</string>
+    </array>
+
+    <!-- Fire whenever ~/memorybridge/inbox changes (file added or removed) -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/Users/cale/memorybridge/inbox</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/cale/memorybridge/logs/watcher.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/cale/memorybridge/logs/watcher_err.log</string>
+
+    <!-- Do not run at login — only on file change events -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Throttle: at most one run per 10 seconds if files land in bursts -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
