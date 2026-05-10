@@ -1,22 +1,24 @@
 # MemoryBridge
 
-Persistent, local memory for Claude — across every conversation.
+Persistent, local-first memory for Claude — and every other AI you use.
 
-Every Claude session starts from zero. MemoryBridge fixes that. It runs a lightweight local server that gives Claude a set of memory tools via the Model Context Protocol (MCP). Tell Claude something once, and it remembers — across sessions, profiles, and even other AI models.
+Every Claude session starts from zero. MemoryBridge fixes that. It runs a lightweight local MCP server that gives Claude a set of memory tools via the Model Context Protocol. Tell it something once, and it remembers — across sessions, profiles, and AI models.
 
-Everything is stored in a plain JSON file on your machine. Nothing goes to the cloud.
+Everything lives in a SQLite database on your machine. Nothing goes to the cloud.
 
 ---
 
-## Features
+## What it does
 
-- **Persistent memory** across conversations — Claude knows your name, preferences, and projects without you re-explaining
-- **Local & private** — stored in `~/memorybridge/memory.json`, no telemetry, no cloud sync
-- **Token-budget aware** — smart retrieval that fits memories into Claude's context window; older or low-relevance memories are compressed or archived automatically
-- **Decay scoring** — memories fade naturally over time unless they're accessed frequently or marked important
+- **Persistent memory** across conversations — Claude knows your name, preferences, and projects without re-explaining
+- **Hybrid search** — BM25 full-text + semantic embeddings + Reciprocal Rank Fusion find the right memories even on paraphrased queries
+- **Token-budget aware** — smart retrieval fills Claude's context window without going over; older memories are compressed or archived automatically
+- **Decay scoring** — memories fade naturally over time unless accessed frequently or marked important
 - **Multiple profiles** — separate memory contexts for work, personal, research, etc.
-- **Cross-model export** — export memories formatted for ChatGPT, Gemini, or Ollama
-- **Concurrent-safe** — file locking ensures Claude Desktop and Claude Code can run simultaneously without dropping data
+- **Ingestion pipeline** — import conversation history from Claude, ChatGPT, or Gemini; DeepSeek R1 extracts facts, Claude resolves conflicts
+- **Inbox watcher** — drop an export file into `~/memorybridge/inbox/` and launchd ingests it automatically; zero CLI required
+- **Cross-model export** — Memory Passport (plain text, any AI) or model-specific formats (ChatGPT, Gemini, Ollama)
+- **Streamlit UI** — review flagged memories, browse/delete, see analytics, run imports and exports
 
 ---
 
@@ -24,96 +26,157 @@ Everything is stored in a plain JSON file on your machine. Nothing goes to the c
 
 - Python 3.10+
 - Claude desktop app
-- macOS, Linux, or Windows (WSL)
+- macOS (launchd inbox watcher is macOS-only; everything else works on Linux/WSL)
+- API keys: `DEEPSEEK_API_KEY` (extraction) and `ANTHROPIC_API_KEY` (conflict resolution)
 
 ---
 
 ## Installation
 
-**1. Put the files in place**
+**1. Clone and install dependencies**
 
 ```bash
-mkdir ~/memorybridge
-cp server.py ~/memorybridge/
-cp requirements.txt ~/memorybridge/
+git clone https://github.com/your-username/memorybridge.git
+cd memorybridge
+pip3 install -r requirements.txt
 ```
 
-**2. Install dependencies**
+**2. Add API keys**
 
-```bash
-pip3 install -r ~/memorybridge/requirements.txt
+Create `~/memorybridge/.env`:
+
 ```
-
-Dependencies: `fastmcp` and `tiktoken`. If you get a permissions error, add `--user` or `--break-system-packages`.
+DEEPSEEK_API_KEY=your_key_here
+ANTHROPIC_API_KEY=your_key_here
+```
 
 **3. Register with Claude desktop**
 
-Open `~/Library/Application Support/Claude/claude_desktop_config.json` (create it if it doesn't exist) and add:
+Open `~/Library/Application Support/Claude/claude_desktop_config.json` (create it if missing) and add:
 
 ```json
 {
   "mcpServers": {
     "memorybridge": {
       "command": "python3",
-      "args": ["/Users/YOUR_USERNAME/memorybridge/server.py"]
+      "args": ["/path/to/memorybridge/server.py"]
     }
   }
 }
 ```
 
-Replace `YOUR_USERNAME` with your actual username (`whoami` in Terminal). If you already have other MCP servers configured, add the `memorybridge` block alongside them.
+Use the absolute path to `server.py` in your clone. Run `pwd` inside the repo to get it.
 
 **4. Restart Claude**
 
-Fully quit the Claude desktop app (⌘Q) and relaunch it.
+Fully quit Claude (⌘Q) and relaunch. Ask it: *"Can you check if MemoryBridge is connected?"*
 
-**5. Verify**
-
-Start a new conversation and ask:
-
-> "Can you check if MemoryBridge is connected?"
-
-Or try adding your first memory:
-
-> "Add a memory: I prefer bullet-point answers."
-
-Full setup walkthrough in [SETUP_GUIDE.md](SETUP_GUIDE.md).
-
----
-
-## Usage
-
-Once connected, just talk to Claude naturally:
-
-```
-"Remember that my manager is Sarah and she values concise updates."
-"What do you know about my projects?"
-"Search my memories for anything about marketing."
-"Add a memory: I'm working on a project called Phoenix."
-"Export my memories for ChatGPT."
-"Show me my memory stats."
-"Delete the memory about X."
-```
-
-Claude calls the memory tools automatically — no special syntax required.
+Full walkthrough in [SETUP_GUIDE.md](SETUP_GUIDE.md).
 
 ---
 
 ## MCP Tools
 
+Claude calls these automatically — no special syntax required.
+
 | Tool | Description |
 |---|---|
-| `get_memory` | Retrieve memories within a token budget |
+| `get_memory` | Retrieve memories within a token budget, ranked by decay-adjusted relevance |
 | `add_memory` | Add a single memory with category and importance |
-| `update_memory` | Batch-add multiple facts in one save operation |
-| `search_memory` | Full-text search across memories (default: limit=5, max_tokens=800) |
+| `update_memory` | Batch-add multiple facts in one call |
+| `search_memory` | Hybrid BM25 + semantic search (default: limit=5, max_tokens=800) |
 | `delete_memory` | Remove a memory by ID |
 | `get_token_stats` | Token usage breakdown by profile |
-| `prune_memories` | Archive low-score memories to free token budget |
+| `prune_memories` | Archive low-score memories to free budget |
 | `switch_profile` | Change active memory profile |
 | `list_projects` | List projects in a profile |
 | `get_access_log` | Recent read/write history with token stats |
-| `export_for_model` | Export memories formatted for ChatGPT, Gemini, or Ollama |
+| `export_for_model` | Export formatted for ChatGPT, Gemini, or Ollama |
+| `export_passport` | Export a plain-text Memory Passport (works with any AI) |
+
+---
+
+## Ingestion — import your conversation history
+
+Export your history from any AI provider, then run:
+
+```bash
+# Claude — import last 30 days
+python ingestion/run.py --source claude --file ~/Downloads/conversations.json --days 30
+
+# ChatGPT — import all history into the "work" profile
+python ingestion/run.py --source chatgpt --file ~/Downloads/conversations.json --profile work
+
+# Gemini — dry run first to see what would be extracted
+python ingestion/run.py --source gemini --file ~/Downloads/MyActivity.json --preview
+```
+
+The pipeline:
+
+```
+Export file → parse → DeepSeek R1 extraction → confidence routing → conflict resolution → memory write
+```
+
+- **≥ 0.85 confidence** — written automatically
+- **0.60-0.84 confidence** — queued in `~/memorybridge/flagged_queue.json` for review in the UI
+- **Conflicts / relationship facts / project status** — escalated to Claude for a verdict
+- **Duplicates** — caught by content hash before writing
+
+### Inbox watcher (zero-CLI ingestion)
+
+Drop any export file into `~/memorybridge/inbox/` and launchd detects it, auto-identifies the source (Claude/ChatGPT/Gemini), and runs ingestion automatically. Processed files move to `inbox/processed/`, failed ones to `inbox/failed/`.
+
+Install the launchd agent once:
+
+```bash
+cp launchd/com.memorybridge.inbox.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.memorybridge.inbox.plist
+```
+
+---
+
+## Streamlit UI
+
+```bash
+streamlit run ui/app.py
+```
+
+Four pages:
+
+| Page | Purpose |
+|---|---|
+| Flagged Queue | Review extractions with 60-84% confidence — accept or reject |
+| Memory Browser | Filter, search, sort, and delete memories |
+| Analytics | Token usage trends, operation breakdown, baseline comparison |
+| Portability | Import exports, generate model-specific exports, download Memory Passport |
+
+---
+
+## Memory Passport
+
+A portable plain-text snapshot of your memory — paste it into any AI's system prompt.
+
+```
+# Memory Passport
+Profile: default
+Generated: 2026-05-10
+
+## Constraints
+! Cannot scrape LinkedIn via automated tools
+
+## Preferences
+! No em dashes in writing
+! Tone: direct, sardonic, Gen X peer-to-peer
+- Prefers dark mode in all apps
+- Prefers bullet-point answers
+
+## Skills
+! PMP certified
+! Has $126M in documented program impact
+...
+```
+
+Generate via Claude: *"Export my memory passport"* — or use the Portability tab in the UI.
 
 ---
 
@@ -121,112 +184,74 @@ Claude calls the memory tools automatically — no special syntax required.
 
 All data is local:
 
-- `~/memorybridge/memory.json` — your memories, profiles, and access log
-- `~/memorybridge/analytics.json` — token usage stats (buffered writes, flushed every 10 operations)
-
-Both files are plain JSON — human-readable and easy to back up.
-
----
-
-## Profiles
-
-Profiles let you maintain separate memory contexts. Examples: `work`, `personal`, `research`. Claude can switch between them mid-conversation. Memories, projects, identity, and model preferences are all scoped per profile.
+| Path | Contents |
+|---|---|
+| `~/memorybridge/memory.db` | SQLite database — memories, profiles, FTS index, embeddings |
+| `~/memorybridge/analytics.json` | Token usage stats |
+| `~/memorybridge/flagged_queue.json` | Pending manual review queue |
+| `~/memorybridge/logs/` | Per-run ingestion reports, watcher log |
+| `~/memorybridge/inbox/` | Drop exports here for auto-ingestion |
 
 ---
 
-## How Token Budgeting Works
+## Architecture
 
-Each memory has a `token_count` computed by `tiktoken` (the same BPE tokenizer used by Claude and GPT models). When `get_memory` is called with a `max_tokens` budget, it:
+```
+server.py              — FastMCP server, 12 MCP tools
+db/store.py            — SQLite persistence, FTS5, embeddings, WAL mode
+db/schema.sql          — Schema with content-hash dedup index
+ingestion/
+  run.py               — CLI ingestion pipeline
+  watcher.py           — Inbox scanner (called by launchd)
+  parse_claude.py      — Claude export parser
+  parse_chatgpt.py     — ChatGPT export parser
+  parse_gemini.py      — Gemini export parser (Format A + B)
+  extractor.py         — DeepSeek R1 fact extraction
+  router.py            — Confidence routing (accept/flag/escalate)
+  resolver.py          — Claude conflict resolution
+  merger.py            — Writes accepted facts via MCP tools
+  passport.py          — Memory Passport builder
+ui/
+  app.py               — Streamlit entry point
+  pages/               — flagged_queue, memory_browser, analytics, portability
+launchd/
+  com.memorybridge.inbox.plist  — WatchPaths agent
+tests/
+  integration/         — MCP tool integration tests
+  unit/                — Store, search quality, parsers, passport, watcher
+  ui/                  — Flagged queue business logic
+```
 
-1. Measures the overhead of identity, projects, and model preferences
-2. Fills the remaining budget with memories ranked by decay-adjusted relevance score
-3. Compresses or truncates lower-priority memories to fit more in
+**Search stack:** FTS5 BM25 + FastEmbed `BAAI/bge-small-en-v1.5` semantic embeddings (numpy cosine similarity) + Reciprocal Rank Fusion. Embeddings stored as JSON in SQLite — no native extension required.
 
-Memories that fall below a relevance threshold (default `0.15`) are automatically archived rather than deleted, keeping your active memory lean.
+---
 
-### search_memory defaults (v1.4)
+## Tests
 
-`search_memory` previously returned up to 10 results with no token cap, averaging ~1,700 tokens per call. Defaults are now:
+```bash
+python -m pytest tests/ -v
+```
 
-| Parameter | Old default | New default |
-|---|---|---|
-| `limit` | 10 | 5 |
-| `max_tokens` | None | 800 |
-
-This cuts typical search cost by ~50% with no loss in retrieval quality — the top 5 results contain the useful signal. Both values can still be overridden per call when broader retrieval is needed.
+86 tests, 0 failures.
 
 ---
 
 ## Troubleshooting
 
 **Claude doesn't see memory tools**
-- Fully quit and relaunch Claude (close the window isn't enough — use ⌘Q)
-- Check that the path in `claude_desktop_config.json` is correct (`whoami` gives your username)
-- Run `python3 ~/memorybridge/server.py` in Terminal — fix any errors that appear
+- Fully quit and relaunch Claude (⌘Q — closing the window isn't enough)
+- Verify the path in `claude_desktop_config.json` is the absolute path to `server.py`
+- Run `python3 server.py` in Terminal directly — fix any errors before restarting Claude
 
 **"Module not found" error**
-- Run `pip3 install fastmcp tiktoken` and retry
-- If you have multiple Python versions, use the full path to the right interpreter: `which python3`
+- Run `pip3 install -r requirements.txt` from the repo root
+- If you have multiple Python versions, confirm which one Claude's config points to: `which python3`
 
-**Config file not found**
-- Default location: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- If missing, create it using the template in `claude_desktop_config_snippet.json`
+**Inbox watcher isn't firing**
+- Check `launchctl list | grep memorybridge` — `com.memorybridge.inbox` should appear
+- Inspect `~/memorybridge/logs/watcher_err.log` for errors
+- Verify the plist paths match your actual username: `plutil -lint ~/Library/LaunchAgents/com.memorybridge.inbox.plist`
 
 ---
 
----
-
-## Phase 2 — Ingestion Engine
-
-Import your conversation history from Claude, ChatGPT, or Gemini. DeepSeek R1 extracts durable facts; Claude resolves conflicts; everything writes through the same MCP server tools.
-
-### Setup
-
-Add API keys to `~/memorybridge/.env`:
-
-```
-DEEPSEEK_API_KEY=your_key_here
-ANTHROPIC_API_KEY=your_key_here
-```
-
-Install new dependencies:
-
-```bash
-pip3 install -r requirements.txt
-```
-
-### Usage
-
-```bash
-# Import last 30 days of Claude conversations
-python ingestion/run.py --source claude --file ~/Downloads/conversations.json --days 30
-
-# Import all ChatGPT history into a specific profile
-python ingestion/run.py --source chatgpt --file ~/Downloads/conversations.json --profile work
-
-# Dry run — see what would be extracted without writing anything
-python ingestion/run.py --source claude --file ~/Downloads/conversations.json --preview
-
-# Import Gemini activity
-python ingestion/run.py --source gemini --file ~/Downloads/MyActivity.json
-```
-
-### How it works
-
-```
-Export file → parse → DeepSeek R1 extraction → confidence routing → Claude conflict resolution → memory write
-```
-
-- **Facts with confidence >= 0.85** are written automatically
-- **Facts with confidence 0.60-0.84** go to `~/memorybridge/flagged_queue.json` for manual review (Phase 3 UI)
-- **Conflicts, relationship facts, and project status changes** are escalated to Claude for a verdict: accept / reject / merge
-- **Duplicates** are detected via keyword overlap before writing — no double entries
-
-### Output files
-
-| File | Purpose |
-|---|---|
-| `~/memorybridge/logs/ingest_YYYY-MM-DD_HH-MM.json` | Full diff report per run |
-| `~/memorybridge/flagged_queue.json` | Facts pending manual review |
-
-*Local-first. No telemetry. No cloud. Shared freely.*
+*Local-first. No telemetry. No cloud.*
