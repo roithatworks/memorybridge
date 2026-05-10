@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memorybridge.notion-context</string>
+
+    <!-- Run every 6 hours: 0:00, 6:00, 12:00, 18:00 -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/python3</string>
+        <string>/Users/cale/memorybridge/ingestion/notion_context.py</string>
+        <string>--profile</string>
+        <string>default</string>
+    </array>
+
+    <!-- Load .env from production directory -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/cale</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/cale/memorybridge</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/cale/memorybridge/logs/notion-context.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/cale/memorybridge/logs/notion-context.error.log</string>
+
+    <!-- Retry after failure -->
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
