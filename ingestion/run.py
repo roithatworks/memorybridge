@@ -10,6 +10,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 import uuid
@@ -174,6 +175,24 @@ def main():
         _write_flagged(flagged, args.source)
         log_path = _write_log(report, len(flagged), len(escalated))
         print(f"  Log written to {log_path}")
+
+        # Write to Notion if configured (opt-in via env vars)
+        notion_db_id = os.environ.get("NOTION_FLAGGED_DB_ID", "")
+        if notion_db_id and flagged:
+            try:
+                from notion_queue import build_notion_client, write_flagged_to_notion
+                notion_client = build_notion_client()
+                if notion_client:
+                    written = write_flagged_to_notion(
+                        flagged=flagged,
+                        source=args.source,
+                        profile=args.profile,
+                        client=notion_client,
+                        database_id=notion_db_id,
+                    )
+                    print(f"  Notion: {written} flagged items added to database")
+            except Exception as e:
+                print(f"  Notion write skipped: {e}", file=sys.stderr)
 
     elapsed = time.time() - start
     _print_summary(report, conv_count, len(flagged), elapsed)
