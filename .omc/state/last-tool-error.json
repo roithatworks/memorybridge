@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"which python3 && which pytest || rtk pytest --version\",\"description\":\"Check Python and pytest availability\"}",
-  "error": "Exit code 1\n/usr/local/bin/python3\nrtk: Failed to run pytest: Failed to spawn process: No such file or directory (os error 2)",
-  "timestamp": "2026-05-05T18:56:18.647Z",
+  "tool_input_preview": "{\"command\":\"gh label create \\\"backlog\\\" --color \\\"0075ca\\\" --description \\\"Queued for future work\\\" && gh label create \\\"enhancement\\\" --color \\\"a2eeef\\\" --description \\\"New feature or improvement\\\" &...",
+  "error": "Exit code 1\nlabel with name \"enhancement\" already exists; use `--force` to update its color and description",
+  "timestamp": "2026-05-10T23:05:15.844Z",
   "retry_count": 1
 }
