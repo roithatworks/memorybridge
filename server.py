@@ -20,6 +20,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from fastmcp import FastMCP
+from db.pruner import run_auto_prune, record_outcome, get_pruner_report
 
 try:
     import tiktoken
@@ -376,11 +377,14 @@ def add_memory(
 
     token_count = count_tokens(content) + count_tokens(" ".join(tags or [])) + 20
 
-    # Auto-prune if over budget
+    # Budget-based prune (existing behaviour)
     stats = _store.token_stats(profile)
-    pruned = []
+    budget_pruned = []
     if stats["total_tokens"] > MAX_TOTAL_TOKENS:
-        pruned = _store.auto_prune(profile, threshold=ARCHIVE_SCORE_THRESHOLD)
+        budget_pruned = _store.auto_prune(profile, threshold=ARCHIVE_SCORE_THRESHOLD)
+
+    # Adaptive dedup/staleness prune
+    prune_result = run_auto_prune(_store._conn, profile, _store.delete_memory)
 
     _store.log_access("add_memory", profile, f"id={mid}, tokens={token_count}")
 
@@ -392,9 +396,13 @@ def add_memory(
         "token_count": token_count,
         "profile": profile
     }
-    if pruned:
-        result["auto_pruned"] = pruned
+    if budget_pruned:
+        result["budget_pruned"] = budget_pruned
         result["prune_reason"] = f"Total tokens exceeded {MAX_TOTAL_TOKENS}"
+    if prune_result["auto_executed"]:
+        result["auto_pruned"] = prune_result["auto_executed"]
+    if prune_result["queued"]:
+        result["prune_queued"] = prune_result["queued"]
     return json.dumps(result, indent=2)
 
 
@@ -732,6 +740,73 @@ def get_access_log(limit: int = 50, include_tokens: bool = True) -> str:
             "total_served": total_served,
             "by_profile": served_by_profile
         }
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_prune_queue(
+    profile: str = DEFAULT_PROFILE,
+    include_report: bool = True
+) -> str:
+    """
+    Return pending prune queue items awaiting human review, plus pruner health report.
+
+    Args:
+        profile: Memory profile
+        include_report: Include full pruner activity report (default True)
+    Returns:
+        JSON with pending queue items and optional pruner report
+    """
+    _store.ensure_profile(profile)
+    from db.pruner import get_pruner_report
+    report = get_pruner_report(_store._conn, since_days=7) if include_report else {}
+
+    return json.dumps({
+        "profile": profile,
+        "pending_count": report.get("pending_queue_count", 0),
+        "pending_queue": report.get("pending_queue", []),
+        "pruner_report": report if include_report else None,
+    }, indent=2)
+
+
+@mcp.tool()
+def resolve_prune_queue(
+    queue_id: str,
+    approved: bool,
+    profile: str = DEFAULT_PROFILE
+) -> str:
+    """
+    Approve or reject a queued prune candidate.
+    Approval deletes the memory. Either outcome updates rule confidence.
+
+    Args:
+        queue_id: The prune_queue item ID (starts with 'pq_')
+        approved: True to delete the memory, False to keep it
+        profile: Memory profile
+    Returns:
+        Outcome with tokens freed and updated confidence info
+    """
+    _store.ensure_profile(profile)
+    result = record_outcome(_store._conn, queue_id, approved, _store.delete_memory)
+
+    if "error" in result:
+        return json.dumps(result)
+
+    # Return updated rule confidence after recalibration
+    from db.pruner import recalibrate_thresholds, AUTO_EXECUTE_THRESHOLD
+    rule_row = _store._conn.execute(
+        """SELECT rule_name, confidence FROM pruner_rules
+           JOIN prune_queue ON pruner_rules.rule_name = prune_queue.rule_name
+           WHERE prune_queue.id = ?""",
+        (queue_id,)
+    ).fetchone()
+
+    result["rule_confidence_after"] = round(rule_row["confidence"], 3) if rule_row else None
+    result["auto_executes_now"] = (
+        rule_row["confidence"] >= AUTO_EXECUTE_THRESHOLD if rule_row else None
+    )
+    _store.log_access("resolve_prune_queue", profile,
+                      f"queue_id={queue_id}, approved={approved}")
     return json.dumps(result, indent=2)
 
 
