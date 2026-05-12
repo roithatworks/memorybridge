@@ -54,6 +54,10 @@ class MemoryStore:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL.read_text())
+        # Pruner tables (idempotent CREATE IF NOT EXISTS)
+        from db.pruner import PRUNER_SCHEMA, bootstrap_rules
+        self._conn.executescript(PRUNER_SCHEMA)
+        bootstrap_rules(self._conn)
         self._conn.commit()
         # Phase 4: lazy-loaded FastEmbed model (cached per-process)
         self._embed_model = None
