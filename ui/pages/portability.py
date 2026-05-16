@@ -2,6 +2,7 @@
 Portability page — import conversation exports, export memory for other models.
 """
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,16 +13,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 INGESTION_SCRIPT = Path(__file__).parent.parent.parent / "ingestion" / "run.py"
 
 
+_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _validate_profile_name(profile: str) -> str:
+    profile = profile.strip()
+    if not _PROFILE_RE.fullmatch(profile):
+        raise ValueError(
+            "Invalid profile name. Use 1-64 characters: letters, numbers, underscore, hyphen, or dot."
+        )
+    return profile
+
+
 def run_ingestion(source: str, file_path: Path, profile: str,
                   preview: bool = True) -> dict:
     """
     Run the ingestion pipeline. Returns parsed JSON from run.py output.
     """
+    safe_profile = _validate_profile_name(profile)
     cmd = [
         sys.executable, str(INGESTION_SCRIPT),
         "--source", source,
         "--file", str(file_path),
-        "--profile", profile,
+        "--profile", safe_profile,
     ]
     if preview:
         cmd.append("--preview")
@@ -77,27 +91,35 @@ def render():
 
             with col_preview:
                 if st.button("🔍 Preview extraction", use_container_width=True):
-                    with st.spinner("Running extraction preview…"):
-                        result = run_ingestion(source, tmp_path, profile, preview=True)
-                    if result["returncode"] == 0:
-                        st.success("Preview complete")
-                        if result["stdout"]:
-                            st.code(result["stdout"], language="text")
+                    try:
+                        with st.spinner("Running extraction preview…"):
+                            result = run_ingestion(source, tmp_path, profile, preview=True)
+                    except ValueError as e:
+                        st.error(str(e))
                     else:
-                        st.error("Preview failed")
-                        st.code(result["stderr"], language="text")
+                        if result["returncode"] == 0:
+                            st.success("Preview complete")
+                            if result["stdout"]:
+                                st.code(result["stdout"], language="text")
+                        else:
+                            st.error("Preview failed")
+                            st.code(result["stderr"], language="text")
 
             with col_run:
                 if st.button("✓ Run ingestion", type="primary", use_container_width=True):
-                    with st.spinner("Ingesting memories…"):
-                        result = run_ingestion(source, tmp_path, profile, preview=False)
-                    if result["returncode"] == 0:
-                        st.success("Ingestion complete!")
-                        if result["stdout"]:
-                            st.code(result["stdout"], language="text")
+                    try:
+                        with st.spinner("Ingesting memories…"):
+                            result = run_ingestion(source, tmp_path, profile, preview=False)
+                    except ValueError as e:
+                        st.error(str(e))
                     else:
-                        st.error("Ingestion failed")
-                        st.code(result["stderr"], language="text")
+                        if result["returncode"] == 0:
+                            st.success("Ingestion complete!")
+                            if result["stdout"]:
+                                st.code(result["stdout"], language="text")
+                        else:
+                            st.error("Ingestion failed")
+                            st.code(result["stderr"], language="text")
 
     # =========================================================================
     # EXPORT TAB
