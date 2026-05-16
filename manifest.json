@@ -1,0 +1,43 @@
+{
+  "dxt_version": "0.1",
+  "name": "memorybridge",
+  "display_name": "MemoryBridge",
+  "version": "3.0.0",
+  "description": "Persistent, local, token-budget-aware memory for AI assistants. Stores memories in SQLite on your machine — nothing goes to the cloud.",
+  "long_description": "MemoryBridge gives AI assistants a persistent memory that lives on your computer. Memories are stored locally in SQLite with FTS5 search, decay scoring, and automatic pruning to stay within token budgets. Supports multiple profiles, cross-model export (ChatGPT, Gemini, Ollama), and a portable Memory Passport format for pasting into any AI context window.",
+  "author": {
+    "name": "Cale Corbett"
+  },
+  "license": "MIT",
+  "keywords": ["memory", "persistent", "local", "token-budget", "mcp"],
+  "server": {
+    "type": "python",
+    "entry_point": "server.py",
+    "mcp_config": {
+      "command": "python3",
+      "args": ["${__dirname}/server.py"]
+    }
+  },
+  "tools": [
+    { "name": "get_memory",       "description": "Retrieve relevant memories within a token budget" },
+    { "name": "add_memory",       "description": "Add a new memory with automatic token counting and dedup" },
+    { "name": "update_memory",    "description": "Batch-add multiple facts in one operation" },
+    { "name": "search_memory",    "description": "Search memories using FTS5 BM25 full-text search" },
+    { "name": "delete_memory",    "description": "Delete a specific memory by ID" },
+    { "name": "get_token_stats",  "description": "Get token usage statistics across profiles" },
+    { "name": "prune_memories",   "description": "Prune low-score memories to free token budget" },
+    { "name": "export_passport",  "description": "Export memory as a portable plain-text Memory Passport" },
+    { "name": "export_for_model", "description": "Export memory formatted for ChatGPT, Gemini, or Ollama" },
+    { "name": "list_projects",    "description": "List all projects with status" },
+    { "name": "switch_profile",   "description": "Switch active memory profile" },
+    { "name": "get_access_log",   "description": "Retrieve access log with token usage history" },
+    { "name": "get_prune_queue",  "description": "Get pending prune candidates awaiting review" },
+    { "name": "resolve_prune_queue", "description": "Approve or reject a queued prune candidate" }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  }
+}
