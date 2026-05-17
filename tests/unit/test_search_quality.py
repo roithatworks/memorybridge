@@ -55,7 +55,7 @@ def test_hybrid_outperforms_keyword_on_paraphrase(db):
 
     # Keyword must NOT find it (zero token overlap — confirms test is meaningful)
     assert not any("126M" in c for c in keyword_contents), (
-        f"Keyword unexpectedly found '$126M' — choose a better zero-overlap query"
+        "Keyword unexpectedly found '$126M' — choose a better zero-overlap query"
     )
     # Hybrid (via semantic leg) should surface the $126M memory
     assert any("126M" in c for c in hybrid_contents), (

@@ -3,7 +3,6 @@ Phase 6 passport tests — export_passport MCP tool and ingestion/passport.py.
 
 Run: python -m pytest tests/unit/test_passport.py -v
 """
-import json
 import sys
 from pathlib import Path
 

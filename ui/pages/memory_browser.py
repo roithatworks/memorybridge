@@ -1,7 +1,6 @@
 """
 Memory Browser page — filter, sort, search, and delete memories across profiles.
 """
-import json
 import sys
 from pathlib import Path
 

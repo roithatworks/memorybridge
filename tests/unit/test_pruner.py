@@ -13,15 +13,10 @@ Tests cover:
 import sqlite3
 import pytest
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from db.pruner import (
     PRUNER_SCHEMA,
-    AUTO_EXECUTE_THRESHOLD,
     INITIAL_CONFIDENCE,
-    CONFIDENCE_NUDGE,
-    CONFIDENCE_NUDGE_DOWN,
-    NEVER_AUTO_DELETE_IMPORTANCE,
     bootstrap_rules,
     find_subset_candidates,
     find_stale_project_status,
