@@ -18,7 +18,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/python3</string>
-        <string>/Users/cale/memorybridge/ingestion/notion_context.py</string>
+        <string>{{HOME}}/memorybridge/ingestion/notion_context.py</string>
         <string>--profile</string>
         <string>default</string>
     </array>
@@ -27,19 +27,19 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>/Users/cale</string>
+        <string>{{HOME}}</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>/Users/cale/memorybridge</string>
+    <string>{{HOME}}/memorybridge</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/cale/memorybridge/logs/notion-context.log</string>
+    <string>{{HOME}}/memorybridge/logs/notion-context.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/cale/memorybridge/logs/notion-context.error.log</string>
+    <string>{{HOME}}/memorybridge/logs/notion-context.error.log</string>
 
     <!-- Retry after failure -->
     <key>ThrottleInterval</key>

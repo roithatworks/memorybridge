@@ -2,18 +2,14 @@
 MemoryBridge — Notion AI Context page refresher.
 
 Reads memories from the local MemoryBridge DB, builds a Memory Passport,
-and updates the "About Cale — AI Context" Notion page with the latest content.
+and updates the configured Notion page with the latest content.
 
 Usage:
     python ingestion/notion_context.py [--profile default] [--dry-run]
 
 Environment:
     NOTION_API_TOKEN        — required; Notion integration token
-    NOTION_CONTEXT_PAGE_ID  — optional; override the default page ID
-
-The default target page is the "About Cale — AI Context" page created under
-the MemoryBridge hub:
-    https://www.notion.so/35c9e1173e5c81a28b62e10338eef2ef
+    NOTION_CONTEXT_PAGE_ID  — required; target Notion page ID
 """
 
 import argparse
@@ -31,8 +27,8 @@ load_dotenv(Path.home() / "memorybridge" / ".env", override=False)
 
 logger = logging.getLogger("notion_context")
 
-# Default page ID — overridable via NOTION_CONTEXT_PAGE_ID env var
-DEFAULT_PAGE_ID = "35c9e117-3e5c-81a2-8b62-e10338eef2ef"
+# Page ID must be set via NOTION_CONTEXT_PAGE_ID env var
+DEFAULT_PAGE_ID = ""  # set NOTION_CONTEXT_PAGE_ID in .env
 DEFAULT_DB_PATH = Path.home() / "memorybridge" / "memory.db"
 
 # Notion API max chars per rich_text block; stay under the 2000-char hard limit
@@ -54,6 +50,23 @@ def _load_memories(profile: str, db_path: Path) -> list:
             (profile,),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _load_identity(profile: str, db_path: Path) -> dict:
+    """Load identity fields from the profiles table. Returns {} if not found."""
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM profiles WHERE name = ? LIMIT 1", (profile,)
+        ).fetchone()
+        if row is None:
+            return {}
+        return {k: row[k] for k in row.keys() if row[k] is not None}
+    except Exception:
+        return {}
     finally:
         conn.close()
 
@@ -176,6 +189,12 @@ def refresh_context_page(
     if not token:
         raise RuntimeError("NOTION_API_TOKEN not set — cannot update Notion page")
 
+    if not page_id:
+        raise RuntimeError(
+            "NOTION_CONTEXT_PAGE_ID not set — run notion_context.py --page-id <id> "
+            "or set NOTION_CONTEXT_PAGE_ID in your .env"
+        )
+
     if not db_path.exists():
         raise FileNotFoundError(f"MemoryBridge DB not found: {db_path}")
 
@@ -187,10 +206,7 @@ def refresh_context_page(
     sys.path.insert(0, str(Path(__file__).parent))
     from passport import build_passport  # local import — passport.py lives alongside this file
 
-    identity = {
-        "name": "Cale",
-        "role": "Director-level BizOps/PMO professional",
-    }
+    identity = _load_identity(profile, db_path)
     passport_text = build_passport(
         memories, identity=identity, profile=profile, max_tokens=max_tokens
     )
