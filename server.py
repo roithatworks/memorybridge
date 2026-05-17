@@ -758,7 +758,6 @@ def get_prune_queue(
         JSON with pending queue items and optional pruner report
     """
     _store.ensure_profile(profile)
-    from db.pruner import get_pruner_report
     report = get_pruner_report(_store._conn, since_days=7) if include_report else {}
 
     return json.dumps({
@@ -793,7 +792,7 @@ def resolve_prune_queue(
         return json.dumps(result)
 
     # Return updated rule confidence after recalibration
-    from db.pruner import recalibrate_thresholds, AUTO_EXECUTE_THRESHOLD
+    from db.pruner import AUTO_EXECUTE_THRESHOLD
     rule_row = _store._conn.execute(
         """SELECT rule_name, confidence FROM pruner_rules
            JOIN prune_queue ON pruner_rules.rule_name = prune_queue.rule_name

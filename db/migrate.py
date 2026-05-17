@@ -9,7 +9,6 @@ Safe to re-run — duplicates are skipped via content_hash uniqueness.
 import hashlib
 import json
 import sqlite3
-import sys
 from pathlib import Path
 
 MEMORY_JSON = Path.home() / "memorybridge" / "memory.json"
@@ -108,7 +107,7 @@ def migrate():
     else:
         print(f"Backup already exists at {backup} — keeping memory.json in place")
 
-    print(f"Migration complete.")
+    print("Migration complete.")
     print(f"  Active memories in DB : {active_count}")
     print(f"  Inserted              : {total_written}")
     print(f"  Skipped (duplicate)   : {total_skipped}")

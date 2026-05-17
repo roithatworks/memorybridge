@@ -7,7 +7,7 @@ Run: python -m pytest tests/unit/test_notion_context.py -v
 """
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "ingestion"))
 
