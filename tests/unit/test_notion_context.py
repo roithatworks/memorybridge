@@ -241,7 +241,7 @@ class TestRefreshContextPage:
         missing = tmp_path / "no_such.db"
         with patch.dict("os.environ", {"NOTION_API_TOKEN": "tok"}):
             with pytest.raises(FileNotFoundError):
-                refresh_context_page(db_path=missing)
+                refresh_context_page(db_path=missing, page_id="dummy-page-id")
 
     def test_live_run_calls_clear_and_append(self, tmp_path):
         from notion_context import refresh_context_page
