@@ -17,11 +17,13 @@ _ALLOWED_SOURCES = {"claude", "chatgpt", "gemini"}
 
 
 def _validate_profile_name(profile: str) -> str:
-    profile = profile.strip()
+    profile = profile.strip().lower()
     if not _PROFILE_RE.fullmatch(profile):
         raise ValueError(
             "Invalid profile name. Use 1-64 characters: letters, numbers, underscore, hyphen, or dot."
         )
+    if profile.startswith((".", "-")):
+        raise ValueError("Invalid profile name. Must not start with '.' or '-'.")
     return profile
 
 
