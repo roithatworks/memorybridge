@@ -13,6 +13,7 @@ INGESTION_SCRIPT = Path(__file__).parent.parent.parent / "ingestion" / "run.py"
 
 
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_ALLOWED_SOURCES = {"claude", "chatgpt", "gemini"}
 
 
 def _validate_profile_name(profile: str) -> str:
@@ -24,16 +25,33 @@ def _validate_profile_name(profile: str) -> str:
     return profile
 
 
+def _validate_source(source: str) -> str:
+    if source not in _ALLOWED_SOURCES:
+        raise ValueError("Invalid source. Must be one of: claude, chatgpt, gemini.")
+    return source
+
+
+def _validate_input_file_path(file_path: Path) -> Path:
+    candidate = Path(file_path)
+    if not candidate.exists() or not candidate.is_file():
+        raise ValueError("Invalid input file path.")
+    if candidate.suffix.lower() != ".json":
+        raise ValueError("Invalid input file type. Expected a .json file.")
+    return candidate
+
+
 def run_ingestion(source: str, file_path: Path, profile: str,
                   preview: bool = True) -> dict:
     """
     Run the ingestion pipeline. Returns parsed JSON from run.py output.
     """
+    safe_source = _validate_source(source)
+    safe_file_path = _validate_input_file_path(file_path)
     safe_profile = _validate_profile_name(profile)
     cmd = [
         sys.executable, str(INGESTION_SCRIPT),
-        "--source", source,
-        "--file", str(file_path),
+        "--source", safe_source,
+        "--file", str(safe_file_path),
         "--profile", safe_profile,
     ]
     if preview:
