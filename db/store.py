@@ -53,11 +53,24 @@ class MemoryStore:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # FK enforcement is OFF by default in SQLite and is per-connection —
+        # without this, ON DELETE CASCADE (memory_embeddings) never fires.
+        # Issue #4: 103/128 embeddings were orphaned because of this.
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA_SQL.read_text())
+        # executescript commits and can reset pragmas — re-assert.
+        self._conn.execute("PRAGMA foreign_keys=ON")
         # Pruner tables (idempotent CREATE IF NOT EXISTS)
         from db.pruner import PRUNER_SCHEMA, bootstrap_rules
         self._conn.executescript(PRUNER_SCHEMA)
         bootstrap_rules(self._conn)
+        self._conn.commit()
+        # One-time hygiene (issue #4): purge embedding rows orphaned while FK
+        # enforcement was off. Idempotent and cheap on every startup.
+        self._conn.execute(
+            "DELETE FROM memory_embeddings "
+            "WHERE id NOT IN (SELECT id FROM memories)"
+        )
         self._conn.commit()
         # Phase 4: lazy-loaded FastEmbed model (cached per-process)
         self._embed_model = None
@@ -166,6 +179,12 @@ class MemoryStore:
         rowid = row["rowid"]
         tc = row["token_count"]
         self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+        # Belt-and-suspenders for issue #4: FK CASCADE handles this when
+        # foreign_keys=ON, but delete explicitly so a future connection
+        # missing the pragma can't re-orphan embeddings.
+        self._conn.execute(
+            "DELETE FROM memory_embeddings WHERE id=?", (memory_id,)
+        )
         # Remove from FTS (content-less table delete)
         self._conn.execute(
             "INSERT INTO memories_fts(memories_fts,rowid,content) VALUES('delete',?,?)",
