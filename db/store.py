@@ -7,6 +7,7 @@ Tool signatures are unchanged — this is a drop-in persistence swap.
 import hashlib
 import json
 import sqlite3
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,50 @@ VALID_CATEGORIES = [
     "project_status", "relationship", "skill", "constraint"
 ]
 IMPORTANCE_LEVELS = ["low", "medium", "high", "critical"]
+
+
+class _LockedConnection:
+    """Serialize all access to a shared sqlite3.Connection (issue #6).
+
+    The store uses one connection with check_same_thread=False; FastMCP may
+    dispatch tool calls on different threads. Without serialization,
+    interleaved execute/commit across threads can commit another handler's
+    half-finished transaction. Guarding at the connection level (rather than
+    per store method) also covers direct ``store._conn`` access from
+    server.py (issue #15) and pruner.py.
+
+    An RLock (re-entrant) is used so a locked method may call another locked
+    method on the same thread. ``transaction()`` lets multi-statement
+    sequences hold the lock across statements.
+    """
+
+    _PASSTHROUGH = ("execute", "executemany", "executescript", "commit",
+                    "rollback", "close")
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._raw = conn
+        self._lock = threading.RLock()
+
+    def __getattr__(self, name):
+        attr = getattr(self._raw, name)
+        if name in self._PASSTHROUGH:
+            def locked(*args, **kwargs):
+                with self._lock:
+                    return attr(*args, **kwargs)
+            return locked
+        return attr
+
+    @property
+    def row_factory(self):
+        return self._raw.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._raw.row_factory = value
+
+    def transaction(self):
+        """Hold the lock across a multi-statement read-modify-write block."""
+        return self._lock
 
 
 def _mem_id() -> str:
@@ -51,7 +96,11 @@ class MemoryStore:
     def __init__(self, db_path: Path):
         self._path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        # check_same_thread=False is safe only because _LockedConnection
+        # serializes every statement (issue #6).
+        self._conn = _LockedConnection(
+            sqlite3.connect(str(db_path), check_same_thread=False)
+        )
         self._conn.row_factory = sqlite3.Row
         # FK enforcement is OFF by default in SQLite and is per-connection —
         # without this, ON DELETE CASCADE (memory_embeddings) never fires.
@@ -139,22 +188,26 @@ class MemoryStore:
         now = datetime.now().strftime("%Y-%m-%d")
         tc = _count_tokens(content)
         try:
-            self._conn.execute(
-                """INSERT INTO memories
-                   (id,profile,content,content_hash,category,importance,
-                    created_at,last_accessed,tags,project_id,token_count)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (mid, profile, content, h, category, importance,
-                 now, now, json.dumps(tags or []), project_id, tc)
-            )
-            # Update FTS index
-            self._conn.execute(
-                "INSERT INTO memories_fts(rowid,content) "
-                "SELECT rowid,content FROM memories WHERE id=?", (mid,)
-            )
-            self._conn.commit()
+            # Hold the lock across INSERT + FTS sync + commit so another
+            # thread's commit can't land mid-sequence (issue #6).
+            with self._conn.transaction():
+                self._conn.execute(
+                    """INSERT INTO memories
+                       (id,profile,content,content_hash,category,importance,
+                        created_at,last_accessed,tags,project_id,token_count)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (mid, profile, content, h, category, importance,
+                     now, now, json.dumps(tags or []), project_id, tc)
+                )
+                # Update FTS index
+                self._conn.execute(
+                    "INSERT INTO memories_fts(rowid,content) "
+                    "SELECT rowid,content FROM memories WHERE id=?", (mid,)
+                )
+                self._conn.commit()
             return mid
         except sqlite3.IntegrityError:
+            self._conn.rollback()
             return None  # duplicate content_hash
 
     def add_memories(self, profile: str, facts: list[str], *,
@@ -170,27 +223,31 @@ class MemoryStore:
 
     def delete_memory(self, profile: str, memory_id: str) -> int:
         """Delete memory. Returns token_count freed, or 0 if not found."""
-        row = self._conn.execute(
-            "SELECT rowid, token_count FROM memories WHERE id=? AND profile=?",
-            (memory_id, profile)
-        ).fetchone()
-        if not row:
-            return 0
-        rowid = row["rowid"]
-        tc = row["token_count"]
-        self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-        # Belt-and-suspenders for issue #4: FK CASCADE handles this when
-        # foreign_keys=ON, but delete explicitly so a future connection
-        # missing the pragma can't re-orphan embeddings.
-        self._conn.execute(
-            "DELETE FROM memory_embeddings WHERE id=?", (memory_id,)
-        )
-        # Remove from FTS (content-less table delete)
-        self._conn.execute(
-            "INSERT INTO memories_fts(memories_fts,rowid,content) VALUES('delete',?,?)",
-            (rowid, "")
-        )
-        self._conn.commit()
+        # SELECT + deletes + commit must be atomic vs. other threads
+        # (issue #6): a concurrent delete of the same id would otherwise
+        # double-issue the FTS delete command against a stale rowid.
+        with self._conn.transaction():
+            row = self._conn.execute(
+                "SELECT rowid, token_count FROM memories WHERE id=? AND profile=?",
+                (memory_id, profile)
+            ).fetchone()
+            if not row:
+                return 0
+            rowid = row["rowid"]
+            tc = row["token_count"]
+            self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+            # Belt-and-suspenders for issue #4: FK CASCADE handles this when
+            # foreign_keys=ON, but delete explicitly so a future connection
+            # missing the pragma can't re-orphan embeddings.
+            self._conn.execute(
+                "DELETE FROM memory_embeddings WHERE id=?", (memory_id,)
+            )
+            # Remove from FTS (content-less table delete)
+            self._conn.execute(
+                "INSERT INTO memories_fts(memories_fts,rowid,content) VALUES('delete',?,?)",
+                (rowid, "")
+            )
+            self._conn.commit()
         return tc
 
     # -------------------------------------------------------------------------
@@ -307,12 +364,13 @@ class MemoryStore:
 
         if to_archive:
             now_str = now.strftime("%Y-%m-%d")
-            self._conn.executemany(
-                "UPDATE memories SET archived=1, archived_at=?, "
-                "archive_reason='auto_prune_low_score' WHERE id=?",
-                [(now_str, mid) for mid in to_archive]
-            )
-            self._conn.commit()
+            with self._conn.transaction():
+                self._conn.executemany(
+                    "UPDATE memories SET archived=1, archived_at=?, "
+                    "archive_reason='auto_prune_low_score' WHERE id=?",
+                    [(now_str, mid) for mid in to_archive]
+                )
+                self._conn.commit()
         return to_archive
 
     # -------------------------------------------------------------------------
