@@ -42,8 +42,21 @@ mcp = FastMCP("MemoryBridge")
 # =============================================================================
 # CONFIG
 # =============================================================================
-MEMORY_DB              = Path.home() / "memorybridge" / "memory.db"
-ANALYTICS_FILE         = Path.home() / "memorybridge" / "analytics.json"
+# Code/data split: code lives in the git repo (this file's directory);
+# mutable state (db, analytics, inbox, .env, pid) lives in DATA_DIR.
+# Override with MEMORYBRIDGE_DATA env var; defaults to ~/memorybridge.
+CODE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
+
+# Load .env from DATA_DIR so API keys live with the data, not the repo.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(DATA_DIR / ".env", override=False)
+except ImportError:
+    pass
+
+MEMORY_DB              = DATA_DIR / "memory.db"
+ANALYTICS_FILE         = DATA_DIR / "analytics.json"
 DEFAULT_PROFILE        = "default"
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
@@ -65,7 +78,7 @@ DECAY_CONFIG = {
     "boost_on_access": 0.1
 }
 # PID file for duplicate-instance awareness
-PID_DIR = Path.home() / "memorybridge"
+PID_DIR = DATA_DIR
 _PID_FILE = PID_DIR / "instance.pid"
 
 
@@ -1064,7 +1077,7 @@ def ingest_from_inbox(
     import subprocess
     import sys
 
-    inbox = Path.home() / "memorybridge" / "inbox"
+    inbox = DATA_DIR / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
 
     # Detect eligible files first so we can report even if watcher errors
@@ -1075,11 +1088,12 @@ def ingest_from_inbox(
     if not files:
         return json.dumps({
             "status": "empty",
-            "message": "No files in inbox. Drop a ChatGPT, Gemini, or Claude export into ~/memorybridge/inbox/ and call this again.",
+            "message": f"No files in inbox. Drop a ChatGPT, Gemini, or Claude export into {inbox}/ and call this again.",
             "inbox": str(inbox)
         }, indent=2)
 
-    watcher_script = Path.home() / "memorybridge" / "ingestion" / "watcher.py"
+    # Watcher lives with the code (this repo), not the data dir
+    watcher_script = CODE_DIR / "ingestion" / "watcher.py"
     cmd = [
         sys.executable,
         str(watcher_script),
@@ -1096,11 +1110,16 @@ def ingest_from_inbox(
             capture_output=True,
             text=True,
             timeout=600,
-            cwd=str(Path.home() / "memorybridge"),
+            cwd=str(CODE_DIR),
             env={
-                **__import__("os").environ,
+                **os.environ,
                 "HOME": str(Path.home()),
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "MEMORYBRIDGE_DATA": str(DATA_DIR),
+                # Include homebrew + user bins (Apple Silicon brew is /opt/homebrew)
+                "PATH": os.environ.get(
+                    "PATH",
+                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+                ),
             }
         )
         elapsed = (datetime.now() - start).total_seconds()
@@ -1153,6 +1172,43 @@ def ingest_from_inbox(
         }, indent=2)
 
 
+def _start_parent_watchdog() -> None:
+    """Exit if our parent (Claude Desktop's launcher) dies.
+
+    A stdio MCP server must not outlive its client. Two failure modes leave
+    orphans: (1) client crashes without sending SIGTERM, (2) stdio loop stops
+    on stdin EOF but non-daemon threads (e.g. ONNX/FastEmbed workers) keep the
+    process alive. This watchdog polls PPID; if we've been reparented to
+    launchd/init (PPID 1), the client is gone — flush and exit hard.
+    """
+    import threading
+    import time
+
+    def _watch() -> None:
+        while True:
+            if os.getppid() == 1:
+                print("[memorybridge] Parent process gone (reparented to PID 1) — exiting",
+                      file=sys.stderr)
+                _flush_analytics()
+                _cleanup_pid()
+                sys.stderr.flush()
+                os._exit(0)
+            time.sleep(5.0)
+
+    threading.Thread(target=_watch, daemon=True, name="parent-watchdog").start()
+
+
 if __name__ == "__main__":
     _write_pid()
-    mcp.run()
+    _start_parent_watchdog()
+    try:
+        mcp.run()
+    finally:
+        # stdio loop ended (stdin EOF / client disconnect) — never linger.
+        # Worker threads (FastEmbed/ONNX) are non-daemon and would otherwise
+        # keep the process alive as an orphan.
+        print("[memorybridge] MCP loop ended — exiting", file=sys.stderr)
+        _flush_analytics()
+        _cleanup_pid()
+        sys.stderr.flush()
+        os._exit(0)

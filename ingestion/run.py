@@ -17,9 +17,16 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-# Load .env before any module imports that need env vars
+# Data dir: mutable state (db, logs, .env, inbox) — defaults to ~/memorybridge,
+# override with MEMORYBRIDGE_DATA. Code stays in the repo.
+import os
+_DATA_DIR = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
+
+# Load .env before any module imports that need env vars.
+# Data-dir .env is canonical; repo-local .env supported as fallback for dev.
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(_DATA_DIR / ".env")
+load_dotenv(Path(__file__).parent.parent / ".env", override=False)
 
 # Ingestion modules
 from parse_claude import parse as parse_claude
@@ -39,7 +46,7 @@ PARSERS = {
     "gemini": parse_gemini,
 }
 
-MEMORYBRIDGE_DIR = Path.home() / "memorybridge"
+MEMORYBRIDGE_DIR = _DATA_DIR
 LOGS_DIR = MEMORYBRIDGE_DIR / "logs"
 FLAGGED_QUEUE = MEMORYBRIDGE_DIR / "flagged_queue.json"
 
