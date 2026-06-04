@@ -121,6 +121,22 @@ class MemoryStore:
             "WHERE id NOT IN (SELECT id FROM memories)"
         )
         self._conn.commit()
+        # One-time repair (issue #3): the old manual FTS delete passed empty
+        # content, leaving ghost tokens for every deleted memory. Rebuild the
+        # index from the memories table once, marked in meta so it doesn't
+        # rerun on every startup.
+        rebuilt = self._conn.execute(
+            "SELECT value FROM meta WHERE key='fts_rebuilt_v1'"
+        ).fetchone()
+        if not rebuilt:
+            self._conn.execute(
+                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES('fts_rebuilt_v1', ?)",
+                (datetime.now().isoformat(),)
+            )
+            self._conn.commit()
         # Phase 4: lazy-loaded FastEmbed model (cached per-process)
         self._embed_model = None
         self._embed_lock = None
@@ -199,11 +215,7 @@ class MemoryStore:
                     (mid, profile, content, h, category, importance,
                      now, now, json.dumps(tags or []), project_id, tc)
                 )
-                # Update FTS index
-                self._conn.execute(
-                    "INSERT INTO memories_fts(rowid,content) "
-                    "SELECT rowid,content FROM memories WHERE id=?", (mid,)
-                )
+                # FTS sync handled by memories_ai trigger (issue #3)
                 self._conn.commit()
             return mid
         except sqlite3.IntegrityError:
@@ -228,12 +240,11 @@ class MemoryStore:
         # double-issue the FTS delete command against a stale rowid.
         with self._conn.transaction():
             row = self._conn.execute(
-                "SELECT rowid, token_count FROM memories WHERE id=? AND profile=?",
+                "SELECT token_count FROM memories WHERE id=? AND profile=?",
                 (memory_id, profile)
             ).fetchone()
             if not row:
                 return 0
-            rowid = row["rowid"]
             tc = row["token_count"]
             self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
             # Belt-and-suspenders for issue #4: FK CASCADE handles this when
@@ -242,11 +253,9 @@ class MemoryStore:
             self._conn.execute(
                 "DELETE FROM memory_embeddings WHERE id=?", (memory_id,)
             )
-            # Remove from FTS (content-less table delete)
-            self._conn.execute(
-                "INSERT INTO memories_fts(memories_fts,rowid,content) VALUES('delete',?,?)",
-                (rowid, "")
-            )
+            # FTS removal handled by memories_ad trigger with original
+            # content (issue #3 — the old manual delete passed "" which
+            # left ghost tokens in the index).
             self._conn.commit()
         return tc
 

@@ -44,6 +44,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     tokenize='porter ascii'
 );
 
+-- Canonical external-content FTS5 sync (issue #3). The previous manual sync
+-- passed empty content to the 'delete' command, which leaves ghost tokens in
+-- the index (FTS5 needs the ORIGINAL content to locate entries to remove).
+-- Triggers make the index track the table exactly; application code never
+-- writes to memories_fts directly.
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content)
+    VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content)
+    VALUES ('delete', old.rowid, old.content);
+    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
 CREATE TABLE IF NOT EXISTS access_log (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     ts            TEXT NOT NULL,
