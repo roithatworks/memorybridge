@@ -139,7 +139,14 @@ class MemoryStore:
             self._conn.commit()
         # Phase 4: lazy-loaded FastEmbed model (cached per-process)
         self._embed_model = None
-        self._embed_lock = None
+        self._embed_lock = threading.Lock()
+        # Issue #5: backfill embeddings for memories missing vectors, on a
+        # background thread so startup isn't blocked by model load. New
+        # memories are embedded on write (see add_memory).
+        threading.Thread(
+            target=self._backfill_missing_embeddings,
+            daemon=True, name="embedding-backfill"
+        ).start()
 
     # -------------------------------------------------------------------------
     # Profiles
@@ -217,6 +224,14 @@ class MemoryStore:
                 )
                 # FTS sync handled by memories_ai trigger (issue #3)
                 self._conn.commit()
+            # Embed-on-write (issue #5): fire-and-forget on a background
+            # thread — first-call model load can take seconds and must not
+            # block the MCP response or hold the DB lock. Fail-soft; FTS
+            # search covers the memory immediately regardless.
+            threading.Thread(
+                target=self._embed_one, args=(mid, profile, content),
+                daemon=True, name=f"embed-{mid}"
+            ).start()
             return mid
         except sqlite3.IntegrityError:
             self._conn.rollback()
@@ -431,9 +446,6 @@ class MemoryStore:
     def _get_embed_model(self):
         """Lazy-load FastEmbed model once per process (thread-safe)."""
         if self._embed_model is None:
-            import threading
-            if self._embed_lock is None:
-                self._embed_lock = threading.Lock()
             with self._embed_lock:
                 if self._embed_model is None:
                     from fastembed import TextEmbedding
@@ -444,6 +456,63 @@ class MemoryStore:
         """Return list of 384-dim float vectors."""
         model = self._get_embed_model()
         return [v.tolist() for v in model.embed(texts)]
+
+    def _embed_one(self, memory_id: str, profile: str, content: str) -> bool:
+        """Embed and persist a single memory's vector. Fail-soft (issue #5):
+        if fastembed is unavailable or inference fails, the memory still
+        exists and FTS search still works — semantic search just won't see
+        it until the next backfill. Returns True on success."""
+        try:
+            vec = self._embed_texts([content])[0]
+            # Guard against the memory having been deleted while embedding
+            with self._conn.transaction():
+                exists = self._conn.execute(
+                    "SELECT 1 FROM memories WHERE id=?", (memory_id,)
+                ).fetchone()
+                if exists:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO memory_embeddings(id, profile, vector) "
+                        "VALUES(?,?,?)",
+                        (memory_id, profile, json.dumps(vec))
+                    )
+                    self._conn.commit()
+            return True
+        except Exception as e:
+            import sys
+            print(f"[memorybridge] embed failed for {memory_id}: {e}",
+                  file=sys.stderr)
+            return False
+
+    def _backfill_missing_embeddings(self) -> int:
+        """Embed all active memories that have no vector (issue #5).
+        Runs on a background thread at startup; fail-soft."""
+        try:
+            rows = self._conn.execute(
+                """SELECT m.id, m.profile, m.content FROM memories m
+                   LEFT JOIN memory_embeddings e ON m.id = e.id
+                   WHERE m.archived = 0 AND e.id IS NULL"""
+            ).fetchall()
+            if not rows:
+                return 0
+            texts = [r["content"] for r in rows]
+            vectors = self._embed_texts(texts)
+            with self._conn.transaction():
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO memory_embeddings(id, profile, vector) "
+                    "VALUES(?,?,?)",
+                    [(r["id"], r["profile"], json.dumps(v))
+                     for r, v in zip(rows, vectors)]
+                )
+                self._conn.commit()
+            import sys
+            print(f"[memorybridge] backfilled {len(rows)} missing embeddings",
+                  file=sys.stderr)
+            return len(rows)
+        except Exception as e:
+            import sys
+            print(f"[memorybridge] embedding backfill skipped: {e}",
+                  file=sys.stderr)
+            return 0
 
     def build_embeddings(self, profile: str) -> int:
         """
