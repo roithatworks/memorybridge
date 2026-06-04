@@ -5,3 +5,8 @@ __pycache__/
 .DS_Store
 logs/
 flagged_queue.json
+.omc/
+*.db
+*.db-shm
+*.db-wal
+COMMIT_MSG.txt

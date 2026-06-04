@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -30,7 +31,10 @@ logging.basicConfig(
 )
 
 INGESTION_SCRIPT = Path(__file__).parent / "run.py"
-DEFAULT_INBOX = Path.home() / "memorybridge" / "inbox"
+# Inbox lives in the data dir (default ~/memorybridge), not the code repo
+DEFAULT_INBOX = Path(
+    os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge")
+) / "inbox"
 
 
 # ---------------------------------------------------------------------------
