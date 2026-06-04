@@ -14,6 +14,9 @@ Run with: fastmcp run server.py
 
 import json
 import re
+import os
+import sys
+import signal
 import atexit
 import hashlib
 from pathlib import Path
@@ -61,6 +64,50 @@ DECAY_CONFIG = {
     "min_score": 0.1,
     "boost_on_access": 0.1
 }
+# PID file for duplicate-instance awareness
+PID_DIR = Path.home() / "memorybridge"
+_PID_FILE = PID_DIR / "instance.pid"
+
+
+def _write_pid() -> None:
+    """Write current PID to file, replacing any old one."""
+    PID_DIR.mkdir(parents=True, exist_ok=True)
+    _PID_FILE.write_text(str(os.getpid()))
+
+
+def _cleanup_pid() -> None:
+    """Remove PID file if we're still the one in it."""
+    if _PID_FILE.exists() and _PID_FILE.read_text().strip() == str(os.getpid()):
+        _PID_FILE.unlink(missing_ok=True)
+
+
+def _sigterm_handler(signum, frame) -> None:
+    """Handle SIGTERM: flush state, log clearly, exit cleanly.
+
+    Checks if a replacement instance has started (common when Claude Desktop
+    spawns a new memorybridge for a new session). If this process has been
+    superseded, we exit gracefully. Otherwise we log why we're shutting down.
+    """
+    pid_was = os.getpid()
+    current_owner = _PID_FILE.read_text().strip() if _PID_FILE.exists() else None
+
+    if current_owner and current_owner != str(pid_was):
+        print(f"[memorybridge] Received SIGTERM — superseded by instance PID={current_owner}, exiting gracefully", file=sys.stderr)
+    else:
+        print(f"[memorybridge] Received SIGTERM — shutting down", file=sys.stderr)
+
+    _flush_analytics()
+    _cleanup_pid()
+    sys.stderr.flush()
+    # os._exit, not sys.exit: sys.exit raises SystemExit and runs interpreter
+    # finalizers, which deadlock on the stdin reader thread's buffer lock
+    # (fatal "_enter_buffered_busy" crash seen 2026-06-03). State is already
+    # flushed above; exit immediately without finalizers.
+    os._exit(0)
+
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+atexit.register(_cleanup_pid)
 
 # =============================================================================
 # ANALYTICS BUFFER — unchanged from v1.4
@@ -758,6 +805,7 @@ def get_prune_queue(
         JSON with pending queue items and optional pruner report
     """
     _store.ensure_profile(profile)
+    from db.pruner import get_pruner_report
     report = get_pruner_report(_store._conn, since_days=7) if include_report else {}
 
     return json.dumps({
@@ -792,7 +840,7 @@ def resolve_prune_queue(
         return json.dumps(result)
 
     # Return updated rule confidence after recalibration
-    from db.pruner import AUTO_EXECUTE_THRESHOLD
+    from db.pruner import recalibrate_thresholds, AUTO_EXECUTE_THRESHOLD
     rule_row = _store._conn.execute(
         """SELECT rule_name, confidence FROM pruner_rules
            JOIN prune_queue ON pruner_rules.rule_name = prune_queue.rule_name
@@ -994,5 +1042,117 @@ def export_passport(
     return passport
 
 
+@mcp.tool()
+def ingest_from_inbox(
+    profile: str = DEFAULT_PROFILE,
+    preview: bool = False
+) -> str:
+    """
+    Process any export files sitting in ~/memorybridge/inbox/.
+
+    Drop a ChatGPT conversations.json, Gemini MyActivity.json, or Claude
+    export into that folder, then call this tool to ingest it.  Files are
+    auto-detected by format, ingested via the standard pipeline, and moved
+    to inbox/processed/ on success or inbox/failed/ on error.
+
+    Args:
+        profile: Memory profile to write to (default: "default")
+        preview: If True, detect and report files without writing memories
+    Returns:
+        JSON with counts of processed/failed files and per-file results
+    """
+    import subprocess
+    import sys
+
+    inbox = Path.home() / "memorybridge" / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    # Detect eligible files first so we can report even if watcher errors
+    files = sorted(f for f in inbox.iterdir()
+                   if f.is_file() and f.suffix.lower() == ".json"
+                   and f.parent == inbox)  # skip processed/ and failed/ subdirs
+
+    if not files:
+        return json.dumps({
+            "status": "empty",
+            "message": "No files in inbox. Drop a ChatGPT, Gemini, or Claude export into ~/memorybridge/inbox/ and call this again.",
+            "inbox": str(inbox)
+        }, indent=2)
+
+    watcher_script = Path.home() / "memorybridge" / "ingestion" / "watcher.py"
+    cmd = [
+        sys.executable,
+        str(watcher_script),
+        "--inbox", str(inbox),
+        "--profile", profile,
+    ]
+    if preview:
+        cmd.append("--preview")
+
+    start = datetime.now()
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=str(Path.home() / "memorybridge"),
+            env={
+                **__import__("os").environ,
+                "HOME": str(Path.home()),
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+            }
+        )
+        elapsed = (datetime.now() - start).total_seconds()
+
+        stdout_lines = result.stdout.strip().splitlines() if result.stdout else []
+        stderr_lines = result.stderr.strip().splitlines() if result.stderr else []
+
+        # Parse processed/failed counts from watcher log output
+        processed = failed = 0
+        for line in stdout_lines + stderr_lines:
+            if "processed:" in line.lower() and "failed:" in line.lower():
+                try:
+                    import re
+                    p = re.search(r"processed:\s*(\d+)", line, re.IGNORECASE)
+                    f = re.search(r"failed:\s*(\d+)", line, re.IGNORECASE)
+                    if p:
+                        processed = int(p.group(1))
+                    if f:
+                        failed = int(f.group(1))
+                except Exception:
+                    pass
+
+        _store.log_access("ingest_from_inbox", profile,
+                          f"files={len(files)}, processed={processed}, failed={failed}")
+
+        return json.dumps({
+            "status": "ok" if result.returncode == 0 else "error",
+            "files_found": len(files),
+            "files_processed": processed,
+            "files_failed": failed,
+            "elapsed_seconds": round(elapsed, 1),
+            "preview": preview,
+            "profile": profile,
+            "log": stdout_lines[-20:] if stdout_lines else [],
+            "errors": stderr_lines[-10:] if stderr_lines else [],
+            "exit_code": result.returncode,
+        }, indent=2)
+
+    except subprocess.TimeoutExpired:
+        return json.dumps({
+            "status": "timeout",
+            "message": "Ingestion timed out after 600s — large export? Try running manually: python ingestion/watcher.py",
+            "files_found": len(files),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": str(e),
+            "files_found": len(files),
+        }, indent=2)
+
+
 if __name__ == "__main__":
+    _write_pid()
     mcp.run()

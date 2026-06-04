@@ -20,8 +20,10 @@ Confidence lifecycle:
   - Clamped to [MIN_CONFIDENCE (0.20), MAX_CONFIDENCE (0.99)]
 """
 
+import json
 import uuid
 from datetime import datetime, timedelta
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Tunables
