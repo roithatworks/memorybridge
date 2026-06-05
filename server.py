@@ -1198,17 +1198,87 @@ def _start_parent_watchdog() -> None:
     threading.Thread(target=_watch, daemon=True, name="parent-watchdog").start()
 
 
-if __name__ == "__main__":
-    _write_pid()
-    _start_parent_watchdog()
+# =============================================================================
+# REMOTE BRIDGE (HTTP transport) — ChatGPT / Perplexity / Gemini CLI
+# =============================================================================
+# Remote clients get read + add only. A prompt-injected or confused remote
+# model must not be able to destroy memories; destructive and subprocess-
+# spawning tools stay stdio/Claude-local.
+REMOTE_ALLOWED_TOOLS = {
+    "get_memory", "search_memory", "add_memory", "update_memory",
+    "list_projects", "export_passport",
+}
+
+
+def _gate_tools_for_remote() -> list[str]:
+    """Remove non-allowlisted tools from the MCP server. Returns removed names."""
+    removed = []
     try:
-        mcp.run()
-    finally:
-        # stdio loop ended (stdin EOF / client disconnect) — never linger.
-        # Worker threads (FastEmbed/ONNX) are non-daemon and would otherwise
-        # keep the process alive as an orphan.
-        print("[memorybridge] MCP loop ended — exiting", file=sys.stderr)
-        _flush_analytics()
-        _cleanup_pid()
-        sys.stderr.flush()
-        os._exit(0)
+        import asyncio
+        tool_names = list(asyncio.run(mcp.get_tools()).keys())
+    except Exception:
+        tool_names = list(getattr(mcp._tool_manager, "_tools", {}).keys())
+    for name in tool_names:
+        if name not in REMOTE_ALLOWED_TOOLS:
+            try:
+                mcp.remove_tool(name)
+                removed.append(name)
+            except Exception as e:
+                print(f"[memorybridge] FATAL: could not remove tool {name}: {e}",
+                      file=sys.stderr)
+                os._exit(1)  # never serve destructive tools remotely by accident
+    return removed
+
+
+def _run_http() -> None:
+    """Serve over streamable HTTP for remote MCP clients.
+
+    - Bound to 127.0.0.1; exposure to the internet happens only via the
+      Cloudflare tunnel in front of it.
+    - The MCP path embeds a secret (capability URL): ChatGPT's no-auth
+      connector mode and Perplexity's open mode can both use it, and the
+      token never appears in server logs ChatGPT/Perplexity side.
+    - Parent watchdog is NOT started: under launchd our PPID is legitimately
+      1, and the watchdog would kill the server 5s after boot.
+    """
+    token = os.environ.get("MEMORYBRIDGE_TOKEN", "").strip()
+    if len(token) < 32:
+        print("[memorybridge] FATAL: MEMORYBRIDGE_TOKEN missing or under 32 chars "
+              "(set it in DATA_DIR/.env). Refusing to serve HTTP without a secret.",
+              file=sys.stderr)
+        os._exit(1)
+
+    removed = _gate_tools_for_remote()
+    port = int(os.environ.get("MEMORYBRIDGE_PORT", "8484"))
+    print(f"[memorybridge] HTTP bridge on 127.0.0.1:{port} "
+          f"path=/{token[:4]}…/mcp | tools gated: removed {len(removed)} "
+          f"({', '.join(sorted(removed))})", file=sys.stderr)
+    mcp.run(transport="http", host="127.0.0.1", port=port,
+            path=f"/{token}/mcp")
+
+
+if __name__ == "__main__":
+    transport = os.environ.get("MEMORYBRIDGE_TRANSPORT", "stdio").lower()
+    _write_pid()
+    if transport == "http":
+        try:
+            _run_http()
+        finally:
+            print("[memorybridge] HTTP bridge stopped", file=sys.stderr)
+            _flush_analytics()
+            _cleanup_pid()
+            sys.stderr.flush()
+            os._exit(0)
+    else:
+        _start_parent_watchdog()
+        try:
+            mcp.run()
+        finally:
+            # stdio loop ended (stdin EOF / client disconnect) — never linger.
+            # Worker threads (FastEmbed/ONNX) are non-daemon and would otherwise
+            # keep the process alive as an orphan.
+            print("[memorybridge] MCP loop ended — exiting", file=sys.stderr)
+            _flush_analytics()
+            _cleanup_pid()
+            sys.stderr.flush()
+            os._exit(0)
