@@ -84,3 +84,17 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     vector  TEXT NOT NULL   -- JSON array of 384 floats (BAAI/bge-small-en-v1.5)
 );
 CREATE INDEX IF NOT EXISTS idx_embed_profile ON memory_embeddings(profile);
+
+-- Issue #8: analytics_events replaces analytics.json
+CREATE TABLE IF NOT EXISTS analytics_events (
+    id               TEXT PRIMARY KEY,
+    session_date     TEXT NOT NULL,
+    tokens_served    INTEGER NOT NULL DEFAULT 0,
+    memories_returned INTEGER NOT NULL DEFAULT 0,
+    model            TEXT NOT NULL DEFAULT 'claude',
+    operation        TEXT NOT NULL DEFAULT 'get_memory',
+    profile          TEXT NOT NULL DEFAULT 'default',
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_date ON analytics_events(session_date);
+CREATE INDEX IF NOT EXISTS idx_analytics_op   ON analytics_events(operation);

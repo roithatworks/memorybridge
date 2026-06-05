@@ -107,47 +107,51 @@ def find_subset_candidates(conn, profile: str) -> list[dict]:
     Return pairs where candidate's content is fully contained in superseder's content.
     Only flags the SMALLER entry (the one that adds nothing new).
     Skips entries with importance in NEVER_AUTO_DELETE_IMPORTANCE.
+
+    Optimization: memories are sorted by content length ASC in SQL. The inner loop
+    skips any other entry whose normalized length is <= the candidate's — a subset
+    must be strictly shorter, so we only check genuine potential superseders.
+    This roughly halves comparisons vs. the naive O(n²) scan.
     """
     rows = conn.execute(
         "SELECT id, content, importance, category, project_id, token_count "
-        "FROM memories WHERE profile=? AND archived=0",
+        "FROM memories WHERE profile=? AND archived=0 "
+        "ORDER BY LENGTH(content) ASC",
         (profile,)
     ).fetchall()
 
-    memories = [dict(r) for r in rows]
+    memories = [(dict(r), _normalize(r["content"])) for r in rows]
     candidates = []
+    seen_candidates = set()
 
-    for i, mem in enumerate(memories):
+    for mem, norm_content in memories:
         if mem["importance"] in NEVER_AUTO_DELETE_IMPORTANCE:
             continue
-        norm_content = _normalize(mem["content"])
-        for j, other in enumerate(memories):
-            if i == j:
+        if mem["id"] in seen_candidates:
+            continue
+        for other, norm_other in memories:
+            if other["id"] == mem["id"]:
                 continue
-            norm_other = _normalize(other["content"])
-            # mem is a subset of other (other contains everything mem says)
-            if norm_content in norm_other and len(norm_content) < len(norm_other):
-                candidates.append({
-                    "rule_name": "verbatim_subset",
-                    "candidate_id": mem["id"],
-                    "superseded_by": other["id"],
-                    "reason": (
-                        f"Content of {mem['id']} is fully contained within {other['id']}. "
-                        f"Candidate: {mem['content'][:80]}..."
-                    ),
-                    "tokens_freed": mem["token_count"],
-                    "candidate_importance": mem["importance"],
-                })
-                break  # one superseder is enough
+            # subset must be strictly shorter — skip equal-or-shorter entries
+            if len(norm_other) <= len(norm_content):
+                continue
+            if norm_content not in norm_other:
+                continue
+            candidates.append({
+                "rule_name": "verbatim_subset",
+                "candidate_id": mem["id"],
+                "superseded_by": other["id"],
+                "reason": (
+                    f"Content of {mem['id']} is fully contained within {other['id']}. "
+                    f"Candidate: {mem['content'][:80]}..."
+                ),
+                "tokens_freed": mem["token_count"],
+                "candidate_importance": mem["importance"],
+            })
+            seen_candidates.add(mem["id"])
+            break  # one superseder is enough
 
-    # Deduplicate: a candidate_id might match multiple superseders, keep first hit
-    seen = set()
-    unique = []
-    for c in candidates:
-        if c["candidate_id"] not in seen:
-            seen.add(c["candidate_id"])
-            unique.append(c)
-    return unique
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +163,7 @@ def find_stale_project_status(conn, profile: str) -> list[dict]:
     Find project_status entries older than STALE_DAYS where a newer entry
     exists for the same project_id.
     """
-    cutoff = (datetime.now() - timedelta(days=STALE_DAYS)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now() - timedelta(days=STALE_DAYS)).isoformat()
 
     rows = conn.execute(
         """SELECT id, content, importance, project_id, created_at, token_count
@@ -211,10 +215,16 @@ def run_auto_prune(conn, profile: str, delete_fn) -> dict:
     """
     bootstrap_rules(conn)
 
-    all_candidates = (
-        find_subset_candidates(conn, profile) +
-        find_stale_project_status(conn, profile)
-    )
+    # stale_project_status is pure SQL — always run it (effectively O(n) with index).
+    # Subset scan is O(n²) even with the length-guard optimization, so gate it:
+    # run on small profiles (<=500) or every 50th add on larger ones.
+    count = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE profile=? AND archived=0", (profile,)
+    ).fetchone()[0]
+
+    all_candidates = find_stale_project_status(conn, profile)
+    if count <= 500 or count % 50 == 0:
+        all_candidates += find_subset_candidates(conn, profile)
 
     if not all_candidates:
         return {"auto_executed": [], "queued": []}

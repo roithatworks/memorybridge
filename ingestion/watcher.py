@@ -233,6 +233,7 @@ def main():
     summary = scan_inbox(inbox, profile=args.profile, preview=args.preview)
     elapsed = time.time() - start
 
+    print(json.dumps(summary))
     logger.info(
         "Done in %.1fs — processed: %d, failed: %d",
         elapsed, summary["processed"], summary["failed"],

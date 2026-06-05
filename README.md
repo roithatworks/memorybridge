@@ -194,6 +194,43 @@ All data is local:
 
 ---
 
+## Code / Data Split
+
+MemoryBridge keeps code and runtime data in separate locations so the repo stays clean and data survives a re-clone.
+
+**Code** — lives in the GitHub repo (wherever you cloned it). Contains `server.py`, `db/`, `ingestion/`, `ui/`, `launchd/`, `tests/`, and config templates.
+
+**Data** — lives in `~/memorybridge/` by default:
+
+| Path | Contents |
+|---|---|
+| `~/memorybridge/memory.db` | SQLite database — memories, profiles, FTS index, embeddings |
+| `~/memorybridge/analytics.json` | Token usage stats |
+| `~/memorybridge/inbox/` | Drop export files here for auto-ingestion |
+| `~/memorybridge/logs/` | Per-run ingestion reports, watcher log |
+| `~/memorybridge/.env` | Your API keys and config — never committed |
+| `~/memorybridge/instance.pid` | PID of the running server process (auto-managed) |
+
+To relocate the data directory, set `MEMORYBRIDGE_DATA` in your environment before launching:
+
+```bash
+export MEMORYBRIDGE_DATA=/Volumes/external/memorybridge
+```
+
+Or add it to your shell profile (`~/.zprofile`, `~/.bashrc`, etc.).
+
+---
+
+## Server Lifecycle
+
+`server.py` is spawned by the Claude desktop app once per session via the MCP `mcpServers` config. It exits automatically when the session ends — via SIGTERM, stdin EOF, or parent-death watchdog (detects PPID = 1).
+
+**Never run `server.py` under a launchd `KeepAlive` job.** The watchdog kills the process when its parent (Claude) exits; launchd would immediately restart it, creating a respawn loop. The server is session-scoped by design.
+
+Retired launchd job plists are archived in `~/memorybridge/launchd-retired/` for reference. Only the inbox watcher plist (`launchd/com.memorybridge.inbox.plist`) should be active.
+
+---
+
 ## Architecture
 
 ```

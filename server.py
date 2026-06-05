@@ -13,17 +13,18 @@ Run with: fastmcp run server.py
 """
 
 import json
+import logging
 import re
 import os
 import sys
 import signal
 import atexit
-import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from fastmcp import FastMCP
 from db.pruner import run_auto_prune, record_outcome, get_pruner_report
+from db.constants import VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, effective_score  # noqa: F401
 
 try:
     import tiktoken
@@ -56,20 +57,12 @@ except ImportError:
     pass
 
 MEMORY_DB              = DATA_DIR / "memory.db"
-ANALYTICS_FILE         = DATA_DIR / "analytics.json"
 DEFAULT_PROFILE        = "default"
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
 MAX_TOTAL_TOKENS       = 50000
 ARCHIVE_SCORE_THRESHOLD = 0.15
-ANALYTICS_FLUSH_EVERY  = 10
-
-VALID_CATEGORIES = [
-    "preference", "fact", "insight", "decision",
-    "project_status", "relationship", "skill", "constraint"
-]
-IMPORTANCE_LEVELS = ["low", "medium", "high", "critical"]
 
 DECAY_CONFIG = {
     "enabled": True,
@@ -83,7 +76,15 @@ _PID_FILE = PID_DIR / "instance.pid"
 
 
 def _write_pid() -> None:
-    """Write current PID to file, replacing any old one."""
+    """Write current PID to file, replacing any old one.
+
+    TOCTOU NOTE (Issue #17): this write is NOT atomic. Two instances starting
+    simultaneously can both reach this line and overwrite each other's PID.
+    That is acceptable — this file serves supersede-logging only (see
+    _sigterm_handler), NOT mutual exclusion. SQLite's busy_timeout is the real
+    arbiter for concurrent access. Never use the PID file for exclusion
+    decisions.
+    """
     PID_DIR.mkdir(parents=True, exist_ok=True)
     _PID_FILE.write_text(str(os.getpid()))
 
@@ -95,7 +96,7 @@ def _cleanup_pid() -> None:
 
 
 def _sigterm_handler(signum, frame) -> None:
-    """Handle SIGTERM: flush state, log clearly, exit cleanly.
+    """Handle SIGTERM: log clearly, exit cleanly.
 
     Checks if a replacement instance has started (common when Claude Desktop
     spawns a new memorybridge for a new session). If this process has been
@@ -109,7 +110,6 @@ def _sigterm_handler(signum, frame) -> None:
     else:
         print(f"[memorybridge] Received SIGTERM — shutting down", file=sys.stderr)
 
-    _flush_analytics()
     _cleanup_pid()
     sys.stderr.flush()
     # os._exit, not sys.exit: sys.exit raises SystemExit and runs interpreter
@@ -122,91 +122,6 @@ def _sigterm_handler(signum, frame) -> None:
 signal.signal(signal.SIGTERM, _sigterm_handler)
 atexit.register(_cleanup_pid)
 
-# =============================================================================
-# ANALYTICS BUFFER — unchanged from v1.4
-# =============================================================================
-_analytics_buffer: list = []
-_analytics_flush_count: int = 0
-
-
-def _flush_analytics() -> None:
-    """Write buffered analytics events to disk. Called periodically and at shutdown."""
-    global _analytics_buffer, _analytics_flush_count
-    if not _analytics_buffer:
-        return
-    try:
-        if ANALYTICS_FILE.exists():
-            with open(ANALYTICS_FILE, "r") as f:
-                analytics = json.load(f)
-        else:
-            analytics = {
-                "version": "1.0",
-                "created_at": datetime.now().isoformat(),
-                "sessions": [],
-                "daily_stats": {},
-                "by_model": {},
-                "by_operation": {},
-                "savings_estimate": {"baseline_tokens_per_session": 8000}
-            }
-
-        for session in _analytics_buffer:
-            analytics["sessions"].append(session)
-            date_key = session["date"]
-            if date_key not in analytics["daily_stats"]:
-                analytics["daily_stats"][date_key] = {
-                    "tokens_served": 0, "sessions": 0, "memories_returned": 0
-                }
-            analytics["daily_stats"][date_key]["tokens_served"] += session["tokens_served"]
-            analytics["daily_stats"][date_key]["sessions"] += 1
-            analytics["daily_stats"][date_key]["memories_returned"] += session["memories_returned"]
-
-            model = session["model"]
-            if model not in analytics["by_model"]:
-                analytics["by_model"][model] = {"tokens": 0, "sessions": 0}
-            analytics["by_model"][model]["tokens"] += session["tokens_served"]
-            analytics["by_model"][model]["sessions"] += 1
-
-            operation = session["operation"]
-            if operation not in analytics["by_operation"]:
-                analytics["by_operation"][operation] = {"tokens": 0, "count": 0}
-            analytics["by_operation"][operation]["tokens"] += session["tokens_served"]
-            analytics["by_operation"][operation]["count"] += 1
-
-        if len(analytics["sessions"]) > 10000:
-            analytics["sessions"] = analytics["sessions"][-10000:]
-
-        analytics["last_updated"] = datetime.now().isoformat()
-        ANALYTICS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(ANALYTICS_FILE, "w") as f:
-            json.dump(analytics, f, indent=2)
-
-        _analytics_buffer = []
-        _analytics_flush_count = 0
-    except Exception:
-        pass
-
-
-atexit.register(_flush_analytics)
-
-
-def log_to_analytics(tokens_served: int, memories_returned: int,
-                     model: str = "claude", profile: str = "default",
-                     operation: str = "get_memory") -> None:
-    """Buffer an analytics event. Flushes to disk every ANALYTICS_FLUSH_EVERY calls."""
-    global _analytics_flush_count
-    _analytics_buffer.append({
-        "timestamp": datetime.now().isoformat(),
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "tokens_served": tokens_served,
-        "memories_returned": memories_returned,
-        "model": model,
-        "profile": profile,
-        "operation": operation
-    })
-    _analytics_flush_count += 1
-    if _analytics_flush_count >= ANALYTICS_FLUSH_EVERY:
-        _flush_analytics()
-
 
 # =============================================================================
 # STORE — SQLite singleton
@@ -214,6 +129,19 @@ def log_to_analytics(tokens_served: int, memories_returned: int,
 from db.store import MemoryStore  # noqa: E402
 
 _store = MemoryStore(MEMORY_DB)
+
+
+def log_to_analytics(tokens_served: int, memories_returned: int,
+                     model: str = "claude", profile: str = "default",
+                     operation: str = "get_memory") -> None:
+    """Write one analytics event directly to SQLite (issue #8: replaces buffered JSON)."""
+    _store.log_analytics_event(
+        tokens_served=tokens_served,
+        memories_returned=memories_returned,
+        model=model,
+        profile=profile,
+        operation=operation,
+    )
 
 
 # =============================================================================
@@ -245,47 +173,38 @@ def compress_memory(mem: dict, target_tokens: int = 50) -> dict:
             compressed["content"] = truncated
             compressed["compressed"] = True
             compressed["token_count"] = count_tokens(truncated) + 20
+            compressed["content_hash"] = _content_hash(truncated)
             return compressed
+    # Fix #2: binary search the trim point instead of one-word-at-a-time O(n²) loop
     words = content.split()
-    while count_tokens(" ".join(words)) > target_tokens - 1 and len(words) > 3:
-        words = words[:-1]
-    compressed["content"] = " ".join(words) + "…"
+    lo, hi = 3, len(words)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if count_tokens(" ".join(words[:mid])) <= target_tokens - 1:
+            lo = mid
+        else:
+            hi = mid - 1
+    new_content = " ".join(words[:lo]) + "…"
+    compressed["content"] = new_content
     compressed["compressed"] = True
-    compressed["token_count"] = count_tokens(compressed["content"]) + 20
+    compressed["token_count"] = count_tokens(new_content) + 20
+    # Fix #1: recompute content_hash so round-trips don't create duplicates
+    compressed["content_hash"] = _content_hash(new_content)
     return compressed
 
 
 def apply_decay(memories: list, decay_config: dict) -> list:
     if not decay_config.get("enabled", True):
         return memories
-    half_life = decay_config.get("half_life_days", 30)
-    min_score = decay_config.get("min_score", 0.1)
     today = datetime.now()
     for mem in memories:
-        try:
-            created = datetime.fromisoformat(mem.get("created_at", today.strftime("%Y-%m-%d")))
-        except Exception:
-            created = today
-        days_old = (today - created).days
-        decay_factor = 0.5 ** (days_old / half_life)
-        base_score = mem.get("relevance_score", 1.0)
-        mem["effective_score"] = max(base_score * decay_factor, min_score)
-        importance = mem.get("importance", "medium")
-        importance_boost = {"low": 0.8, "medium": 1.0, "high": 1.2, "critical": 1.5}
-        mem["effective_score"] *= importance_boost.get(importance, 1.0)
-        access_count = mem.get("access_count", 0)
-        if access_count > 0:
-            mem["effective_score"] *= (1 + min(access_count * 0.05, 0.5))
+        mem["effective_score"] = effective_score(mem, today)
     return memories
 
 
 # =============================================================================
 # RESULT CLEANING — Phase 2.5: strip internal scoring metadata
 # =============================================================================
-
-def _content_hash(content: str) -> str:
-    return hashlib.sha256(content.strip().lower().encode()).hexdigest()
-
 
 _RESULT_FIELDS = {"id", "content", "category", "importance",
                   "project_id", "tags", "token_count", "created_at"}
@@ -325,21 +244,28 @@ def get_memory(
     if profile_data is None:
         return json.dumps({"error": f"Profile '{profile}' not found"})
 
-    memories = _store.get_memories(profile, category=category)
-
-    # Apply decay scoring
-    memories = apply_decay([m.copy() for m in memories], DECAY_CONFIG)
-
     if context_hint:
-        hint_lower = context_hint.lower()
-        memories = [
-            m for m in memories
-            if hint_lower in m.get("content", "").lower()
-            or hint_lower in str(m.get("tags", [])).lower()
-            or hint_lower in str(m.get("project_id", "")).lower()
-        ]
+        # Use hybrid BM25+semantic search for context_hint so phrasing
+        # variants (e.g. "job search" vs "Director+ PM role") are matched.
+        # Merge with a full get_memories pull so non-hint memories fill the
+        # remaining token budget in decay-score order.
+        hint_results = _store.search_hybrid(
+            profile, context_hint, category=category,
+            limit=20, max_tokens=MAX_TOKENS_DEFAULT
+        )
+        hint_ids = {m["id"] for m in hint_results}
 
-    memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
+        # Full list for budget fill — apply decay, exclude hint hits (added first)
+        all_memories = _store.get_memories(profile, category=category)
+        all_memories = apply_decay([m.copy() for m in all_memories], DECAY_CONFIG)
+        remainder = [m for m in all_memories if m["id"] not in hint_ids]
+        remainder.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
+
+        memories = hint_results + remainder
+    else:
+        memories = _store.get_memories(profile, category=category)
+        memories = apply_decay([m.copy() for m in memories], DECAY_CONFIG)
+        memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
 
     identity = profile_data["identity"]
     projects = profile_data["projects"]
@@ -475,10 +401,14 @@ def update_memory(
     profile: str = DEFAULT_PROFILE
 ) -> str:
     """
-    Batch-add multiple facts in a single operation.
+    BATCH-ADD operation — inserts new memory rows. This does NOT edit or mutate
+    existing memories. Each fact in the list is inserted as a new row; duplicate
+    content (same content_hash) is silently skipped.
+
+    To edit an existing memory in place, use edit_memory(memory_id=...) instead.
 
     Args:
-        facts: List of facts to remember
+        facts: List of facts to remember (each becomes a new memory row)
         category: Category for all facts
         importance: Importance level for all facts
         project: Optional project association
@@ -530,6 +460,59 @@ def update_memory(
 
 
 @mcp.tool()
+def edit_memory(
+    memory_id: str,
+    content: Optional[str] = None,
+    importance: Optional[str] = None,
+    category: Optional[str] = None,
+    project: Optional[str] = None,
+    profile: str = DEFAULT_PROFILE
+) -> str:
+    """
+    Edit an existing memory in place by memory_id.
+
+    Only the fields you supply are changed — omitted fields are left untouched.
+    If content is updated, content_hash and token_count are recomputed automatically.
+
+    Args:
+        memory_id: ID of the memory to edit (e.g. "mem_abc12345")
+        content: New content text (optional)
+        importance: New importance level — low / medium / high / critical (optional)
+        category: New category (optional)
+        project: New project association (optional)
+        profile: Memory profile the memory belongs to
+    Returns:
+        JSON confirmation, or {"error": ...} if memory_id not found / validation fails
+    """
+    if importance is not None and importance not in IMPORTANCE_LEVELS:
+        return json.dumps({"error": f"Invalid importance. Valid: {IMPORTANCE_LEVELS}"})
+    if category is not None and category not in VALID_CATEGORIES:
+        return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
+
+    kwargs = {}
+    if content is not None:
+        kwargs["content"] = content
+    if importance is not None:
+        kwargs["importance"] = importance
+    if category is not None:
+        kwargs["category"] = category
+    if project is not None:
+        kwargs["project_id"] = project
+
+    updated = _store.edit_memory(profile, memory_id, **kwargs)
+    if not updated:
+        return json.dumps({"error": f"memory_id '{memory_id}' not found in profile '{profile}'"})
+
+    _store.log_access("edit_memory", profile, f"id={memory_id}, fields={list(kwargs.keys())}")
+    return json.dumps({
+        "status": "updated",
+        "memory_id": memory_id,
+        "profile": profile,
+        "fields_changed": list(kwargs.keys())
+    }, indent=2)
+
+
+@mcp.tool()
 def search_memory(
     query: str,
     category: Optional[str] = None,
@@ -558,10 +541,9 @@ def search_memory(
     results = _store.search_hybrid(profile, query, category=category,
                                    limit=limit, max_tokens=max_tokens)
 
-    # Boost relevance score for accessed memories
-    for mem in results:
-        _store.boost_on_access(profile, mem["id"],
-                               boost=DECAY_CONFIG.get("boost_on_access", 0.1))
+    # Boost relevance score for all returned memories in a single commit (issue #12)
+    _store.boost_batch(profile, [m["id"] for m in results],
+                       boost=DECAY_CONFIG.get("boost_on_access", 0.1))
 
     tokens_served = sum(m.get("token_count", 0) for m in results)
     _store.log_access("search_memory", profile,
@@ -623,43 +605,30 @@ def get_token_stats(profile: str = DEFAULT_PROFILE) -> str:
             all_profiles[p_name] = stats
             total_stored += stats["total_tokens"]
 
-        total_served = _store._conn.execute(
-            "SELECT COALESCE(SUM(tokens_served), 0) FROM access_log"
-        ).fetchone()[0]
-        served_by_profile = {}
-        for row in _store._conn.execute(
-            "SELECT profile, SUM(tokens_served) as t FROM access_log GROUP BY profile"
-        ).fetchall():
-            served_by_profile[row["profile"]] = row["t"] or 0
+        token_summary = _store.get_access_log_token_summary()
 
         return json.dumps({
             "global": {
                 "total_tokens_stored": total_stored,
-                "total_tokens_served": total_served,
+                "total_tokens_served": token_summary["total_served"],
                 "max_budget": MAX_TOTAL_TOKENS,
                 "utilization": f"{(total_stored / MAX_TOTAL_TOKENS) * 100:.1f}%"
             },
             "by_profile": all_profiles,
-            "served_by_profile": served_by_profile
+            "served_by_profile": token_summary["by_profile"]
         }, indent=2)
 
     _store.ensure_profile(profile)
     stats = _store.token_stats(profile)
-    archived_row = _store._conn.execute(
-        "SELECT COUNT(*) as c, COALESCE(SUM(token_count), 0) as t "
-        "FROM memories WHERE profile=? AND archived=1", (profile,)
-    ).fetchone()
-    total_served = _store._conn.execute(
-        "SELECT COALESCE(SUM(tokens_served), 0) FROM access_log WHERE profile=?",
-        (profile,)
-    ).fetchone()[0]
+    archived_row = _store.get_archived_stats(profile)
+    total_served = _store.get_tokens_served(profile)
 
     return json.dumps({
         "profile": profile,
         "active": stats,
         "archived": {
-            "count": archived_row["c"],
-            "tokens": archived_row["t"]
+            "count": archived_row["count"],
+            "tokens": archived_row["tokens"]
         },
         "served_total": total_served,
         "budget": {
@@ -782,24 +751,12 @@ def get_access_log(limit: int = 50, include_tokens: bool = True) -> str:
     entries = _store.get_access_log(limit=limit)
     result = {
         "entries": entries,
-        "total_logged": _store._conn.execute(
-            "SELECT COUNT(*) FROM access_log"
-        ).fetchone()[0],
+        "total_logged": _store.get_access_log_count(),
         "returned": len(entries)
     }
     if include_tokens:
-        total_served = _store._conn.execute(
-            "SELECT COALESCE(SUM(tokens_served), 0) FROM access_log"
-        ).fetchone()[0]
-        served_by_profile = {}
-        for row in _store._conn.execute(
-            "SELECT profile, SUM(tokens_served) as t FROM access_log GROUP BY profile"
-        ).fetchall():
-            served_by_profile[row["profile"]] = row["t"] or 0
-        result["token_summary"] = {
-            "total_served": total_served,
-            "by_profile": served_by_profile
-        }
+        token_summary = _store.get_access_log_token_summary()
+        result["token_summary"] = token_summary
     return json.dumps(result, indent=2)
 
 
@@ -853,13 +810,8 @@ def resolve_prune_queue(
         return json.dumps(result)
 
     # Return updated rule confidence after recalibration
-    from db.pruner import recalibrate_thresholds, AUTO_EXECUTE_THRESHOLD
-    rule_row = _store._conn.execute(
-        """SELECT rule_name, confidence FROM pruner_rules
-           JOIN prune_queue ON pruner_rules.rule_name = prune_queue.rule_name
-           WHERE prune_queue.id = ?""",
-        (queue_id,)
-    ).fetchone()
+    from db.pruner import AUTO_EXECUTE_THRESHOLD
+    rule_row = _store.get_rule_confidence_after(queue_id)
 
     result["rule_confidence_after"] = round(rule_row["confidence"], 3) if rule_row else None
     result["auto_executes_now"] = (
@@ -903,6 +855,26 @@ def export_for_model(
     budget = budgets.get(depth, max_tokens)
     tokens_used = 0
 
+    # --- Build shared base data (Issue #20: all models draw from the same pool) ---
+    # Collect exported memories in a list so we can count what was actually included.
+    exported_memories: list = []
+
+    # Shared memory-iteration helper used by all three model branches.
+    def _collect_memories(lines_or_parts, append_fn, fmt_fn):
+        """Iterate memories within budget; populate exported_memories side-effect."""
+        nonlocal tokens_used
+        for m in memories:
+            if tokens_used >= budget - 50:
+                break
+            content = m.get("content", "")
+            mem_tokens = count_tokens(content)
+            if tokens_used + mem_tokens > budget - 50:
+                remaining = budget - tokens_used - 50
+                content = content[:remaining * 3] + "…"
+            append_fn(fmt_fn(content))
+            tokens_used += count_tokens(content) + 2
+            exported_memories.append(m)
+
     if model == "chatgpt":
         lines = [
             "# Memory Chip",
@@ -932,16 +904,7 @@ def export_for_model(
 
         if memories and depth in ("full", "summary") and tokens_used < budget - 100:
             lines.append("## Key Memories")
-            for m in memories:
-                if tokens_used >= budget - 50:
-                    break
-                content = m.get("content", "")
-                mem_tokens = count_tokens(content)
-                if tokens_used + mem_tokens > budget - 50:
-                    remaining = budget - tokens_used - 50
-                    content = content[:remaining * 3] + "…"
-                lines.append(f"- {content}")
-                tokens_used += count_tokens(content) + 2
+            _collect_memories(lines, lines.append, lambda c: f"- {c}")
             lines.append("")
 
         if projects and depth == "full" and tokens_used < budget - 100:
@@ -956,6 +919,8 @@ def export_for_model(
         export_text = "\n".join(lines)
 
     elif model == "gemini":
+        # Gemini: pipe-separated compact format, but includes ALL memories within
+        # budget — not just 3 preference snippets (Issue #20 fix).
         parts = [f"User: {identity.get('name', 'Unknown')} - {identity.get('role', 'Unknown')}"]
         tokens_used = count_tokens(parts[0])
 
@@ -965,29 +930,38 @@ def export_for_model(
                 parts.append(tone_part)
                 tokens_used += count_tokens(tone_part)
 
-        if memories and depth in ("full", "summary"):
-            prefs_mems = [m for m in memories if m.get("category") == "preference"][:3]
-            if prefs_mems:
-                pref_text = "; ".join(m["content"][:30] for m in prefs_mems)
-                if tokens_used + count_tokens(pref_text) < budget:
-                    parts.append(f"Prefs: {pref_text}")
-                    tokens_used += count_tokens(pref_text)
+        if memories and depth in ("full", "summary") and tokens_used < budget - 100:
+            _collect_memories(parts, parts.append, lambda c: f"Mem: {c}")
+
+        if projects and depth == "full" and tokens_used < budget - 100:
+            active = [p.get("name", p["id"]) for p in projects if p.get("status") == "active"]
+            if active:
+                proj_part = f"Projects: {', '.join(active)}"
+                if tokens_used + count_tokens(proj_part) < budget:
+                    parts.append(proj_part)
+                    tokens_used += count_tokens(proj_part)
 
         export_text = " | ".join(parts)
 
     elif model == "ollama":
+        # Ollama: semicolon-separated terse format, but includes ALL memories
+        # within budget — not just name/role/project ids (Issue #20 fix).
         parts = [
             f"User={identity.get('name', 'Unknown')}",
             f"Role={identity.get('role', 'Unknown')[:30]}"
         ]
         tokens_used = sum(count_tokens(p) for p in parts)
 
-        if depth in ("full", "summary"):
-            active = [p["id"] for p in projects if p.get("status") == "active"][:3]
+        if memories and depth in ("full", "summary") and tokens_used < budget - 100:
+            _collect_memories(parts, parts.append, lambda c: f"Mem={c[:80]}")
+
+        if projects and depth in ("full", "summary") and tokens_used < budget - 100:
+            active = [p["id"] for p in projects if p.get("status") == "active"]
             if active:
                 proj_part = f"Projects={','.join(active)}"
                 if tokens_used + count_tokens(proj_part) < budget:
                     parts.append(proj_part)
+                    tokens_used += count_tokens(proj_part)
 
         export_text = ";".join(parts)
 
@@ -999,7 +973,9 @@ def export_for_model(
                       f"model={model}, tokens={final_tokens}", final_tokens)
     log_to_analytics(
         tokens_served=final_tokens,
-        memories_returned=len([m for m in memories if m.get("effective_score", 0) > 0.3]),
+        # Fix Issue #20: count memories actually included in the export,
+        # not memories that merely have effective_score > 0.3.
+        memories_returned=len(exported_memories),
         model=model,
         profile=profile,
         operation="export_for_model"
@@ -1127,20 +1103,18 @@ def ingest_from_inbox(
         stdout_lines = result.stdout.strip().splitlines() if result.stdout else []
         stderr_lines = result.stderr.strip().splitlines() if result.stderr else []
 
-        # Parse processed/failed counts from watcher log output
-        processed = failed = 0
-        for line in stdout_lines + stderr_lines:
-            if "processed:" in line.lower() and "failed:" in line.lower():
-                try:
-                    import re
-                    p = re.search(r"processed:\s*(\d+)", line, re.IGNORECASE)
-                    f = re.search(r"failed:\s*(\d+)", line, re.IGNORECASE)
-                    if p:
-                        processed = int(p.group(1))
-                    if f:
-                        failed = int(f.group(1))
-                except Exception:
-                    pass
+        # Parse processed/failed/skipped counts from watcher JSON stdout
+        processed = failed = skipped = 0
+        for line in stdout_lines:
+            try:
+                summary = json.loads(line)
+                if isinstance(summary, dict) and "processed" in summary:
+                    processed = summary.get("processed", 0)
+                    failed = summary.get("failed", 0)
+                    skipped = summary.get("skipped", 0)
+                    break
+            except (json.JSONDecodeError, ValueError):
+                continue
 
         _store.log_access("ingest_from_inbox", profile,
                           f"files={len(files)}, processed={processed}, failed={failed}")
@@ -1189,7 +1163,6 @@ def _start_parent_watchdog() -> None:
             if os.getppid() == 1:
                 print("[memorybridge] Parent process gone (reparented to PID 1) — exiting",
                       file=sys.stderr)
-                _flush_analytics()
                 _cleanup_pid()
                 sys.stderr.flush()
                 os._exit(0)
@@ -1205,7 +1178,7 @@ def _start_parent_watchdog() -> None:
 # model must not be able to destroy memories; destructive and subprocess-
 # spawning tools stay stdio/Claude-local.
 REMOTE_ALLOWED_TOOLS = {
-    "get_memory", "search_memory", "add_memory", "update_memory",
+    "get_memory", "search_memory", "add_memory", "update_memory", "edit_memory",
     "list_projects", "export_passport",
 }
 
@@ -1265,7 +1238,6 @@ if __name__ == "__main__":
             _run_http()
         finally:
             print("[memorybridge] HTTP bridge stopped", file=sys.stderr)
-            _flush_analytics()
             _cleanup_pid()
             sys.stderr.flush()
             os._exit(0)
@@ -1278,7 +1250,6 @@ if __name__ == "__main__":
             # Worker threads (FastEmbed/ONNX) are non-daemon and would otherwise
             # keep the process alive as an orphan.
             print("[memorybridge] MCP loop ended — exiting", file=sys.stderr)
-            _flush_analytics()
             _cleanup_pid()
             sys.stderr.flush()
             os._exit(0)

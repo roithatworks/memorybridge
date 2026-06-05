@@ -4,21 +4,19 @@ All SQL lives here. server.py contains zero SQL.
 Tool signatures are unchanged — this is a drop-in persistence swap.
 """
 
-import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_SQL = Path(__file__).parent / "schema.sql"
+from db.constants import (  # noqa: E402
+    VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score
+)
 
-VALID_CATEGORIES = [
-    "preference", "fact", "insight", "decision",
-    "project_status", "relationship", "skill", "constraint"
-]
-IMPORTANCE_LEVELS = ["low", "medium", "high", "critical"]
+SCHEMA_SQL = Path(__file__).parent / "schema.sql"
 
 
 class _LockedConnection:
@@ -67,20 +65,6 @@ class _LockedConnection:
 
 def _mem_id() -> str:
     return f"mem_{uuid.uuid4().hex[:8]}"
-
-
-def _content_hash(content: str) -> str:
-    """SHA256 of normalized content — same normalization as Phase 2.5 server.py."""
-    return hashlib.sha256(content.strip().lower().encode()).hexdigest()
-
-
-def _count_tokens(text: str) -> int:
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text)) + 20
-    except Exception:
-        return len(text.split()) + 20
 
 
 class MemoryStore:
@@ -208,7 +192,7 @@ class MemoryStore:
         self.ensure_profile(profile)
         h = _content_hash(content)
         mid = _mem_id()
-        now = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now().isoformat()
         tc = _count_tokens(content)
         try:
             # Hold the lock across INSERT + FTS sync + commit so another
@@ -247,6 +231,49 @@ class MemoryStore:
                                importance=importance, project_id=project_id):
                 added += 1
         return added
+
+    def edit_memory(self, profile: str, memory_id: str, **kwargs) -> bool:
+        """Edit an existing memory in place. Only provided keyword fields are updated.
+
+        Supported kwargs: content, importance, category, project_id.
+        If content is provided, content_hash and token_count are recomputed.
+        Returns True if the row was found and updated, False if not found.
+        """
+        allowed = {"content", "importance", "category", "project_id"}
+        fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+        if not fields:
+            # Nothing to update — check existence and return
+            exists = self._conn.execute(
+                "SELECT 1 FROM memories WHERE id=? AND profile=?",
+                (memory_id, profile)
+            ).fetchone()
+            return exists is not None
+
+        if "content" in fields:
+            fields["content_hash"] = _content_hash(fields["content"])
+            fields["token_count"] = _count_tokens(fields["content"])
+
+        set_clause = ", ".join(f"{col}=?" for col in fields)
+        values = list(fields.values()) + [memory_id, profile]
+
+        with self._conn.transaction():
+            cur = self._conn.execute(
+                f"UPDATE memories SET {set_clause} WHERE id=? AND profile=?",
+                values
+            )
+            self._conn.commit()
+
+        updated = cur.rowcount > 0
+
+        # Re-embed if content changed (fire-and-forget, fail-soft)
+        if updated and "content" in fields:
+            threading.Thread(
+                target=self._embed_one,
+                args=(memory_id, profile, fields["content"]),
+                daemon=True, name=f"embed-edit-{memory_id}"
+            ).start()
+
+        return updated
 
     def delete_memory(self, profile: str, memory_id: str) -> int:
         """Delete memory. Returns token_count freed, or 0 if not found."""
@@ -326,9 +353,19 @@ class MemoryStore:
 
         try:
             rows = self._conn.execute(sql, params).fetchall()
-        except sqlite3.OperationalError:
-            # FTS query parse error — fall back to empty
-            return []
+        except sqlite3.OperationalError as fts_err:
+            logging.warning("FTS5 parse error for query %r: %s — falling back to LIKE search", query, fts_err)
+            like_pattern = f"%{query}%"
+            like_sql = (
+                "SELECT * FROM memories WHERE profile=? AND archived=0 AND content LIKE ?"
+            )
+            like_params = [profile, like_pattern]
+            if category:
+                like_sql += " AND category=?"
+                like_params.append(category)
+            like_sql += " LIMIT ?"
+            like_params.append(limit * 3)
+            rows = self._conn.execute(like_sql, like_params).fetchall()
 
         results, tokens_used = [], 0
         for row in rows:
@@ -344,7 +381,7 @@ class MemoryStore:
     def boost_on_access(self, profile: str, memory_id: str,
                         boost: float = 0.1) -> None:
         """Increment access_count and boost relevance_score (capped at 1.0)."""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now().isoformat()
         self._conn.execute(
             """UPDATE memories
                SET access_count = access_count + 1,
@@ -354,6 +391,27 @@ class MemoryStore:
             (today, boost, memory_id, profile)
         )
         self._conn.commit()
+
+    def boost_batch(self, profile: str, ids: list,
+                    boost: float = 0.1) -> None:
+        """Boost relevance_score for multiple memories in a single commit.
+
+        Replaces calling boost_on_access once per result (issue #12): uses
+        executemany + a single conn.commit() instead of N commits.
+        """
+        if not ids:
+            return
+        today = datetime.now().isoformat()
+        with self._conn.transaction():
+            self._conn.executemany(
+                """UPDATE memories
+                   SET access_count = access_count + 1,
+                       last_accessed = ?,
+                       relevance_score = MIN(relevance_score + ?, 1.0)
+                   WHERE id = ? AND profile = ?""",
+                [(today, boost, mid, profile) for mid in ids]
+            )
+            self._conn.commit()
 
     # -------------------------------------------------------------------------
     # Pruning
@@ -369,25 +427,12 @@ class MemoryStore:
 
         to_archive = []
         for row in rows:
-            try:
-                created = datetime.fromisoformat(row["created_at"])
-            except Exception:
-                created = now
-            days = (now - created).days
-            decay = 0.5 ** (days / 30)
-            importance_boost = {
-                "low": 0.8, "medium": 1.0, "high": 1.2, "critical": 1.5
-            }.get(row["importance"], 1.0)
-            access_boost = 1 + min(row["access_count"] * 0.05, 0.5)
-            effective = max(
-                row["relevance_score"] * decay * importance_boost * access_boost,
-                0.1
-            )
-            if effective < threshold:
+            score = effective_score(dict(row), now)
+            if score < threshold:
                 to_archive.append(row["id"])
 
         if to_archive:
-            now_str = now.strftime("%Y-%m-%d")
+            now_str = now.isoformat()
             with self._conn.transaction():
                 self._conn.executemany(
                     "UPDATE memories SET archived=1, archived_at=?, "
@@ -415,6 +460,144 @@ class MemoryStore:
             "SELECT * FROM access_log ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_access_log_count(self) -> int:
+        """Return total number of rows in access_log."""
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM access_log"
+        ).fetchone()[0]
+
+    def get_access_log_token_summary(self) -> dict:
+        """Return total tokens served and a per-profile breakdown from access_log."""
+        total_served = self._conn.execute(
+            "SELECT COALESCE(SUM(tokens_served), 0) FROM access_log"
+        ).fetchone()[0]
+        served_by_profile = {}
+        for row in self._conn.execute(
+            "SELECT profile, SUM(tokens_served) as t FROM access_log GROUP BY profile"
+        ).fetchall():
+            served_by_profile[row["profile"]] = row["t"] or 0
+        return {"total_served": total_served, "by_profile": served_by_profile}
+
+    def get_archived_stats(self, profile: str) -> dict:
+        """Return count and total tokens for archived memories in a profile."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) as c, COALESCE(SUM(token_count), 0) as t "
+            "FROM memories WHERE profile=? AND archived=1", (profile,)
+        ).fetchone()
+        return {"count": row["c"], "tokens": row["t"]}
+
+    def get_tokens_served(self, profile: str) -> int:
+        """Return total tokens_served from access_log for a profile."""
+        return self._conn.execute(
+            "SELECT COALESCE(SUM(tokens_served), 0) FROM access_log WHERE profile=?",
+            (profile,)
+        ).fetchone()[0]
+
+    # -------------------------------------------------------------------------
+    # Analytics events (issue #8: replaces analytics.json)
+    # -------------------------------------------------------------------------
+
+    def log_analytics_event(self, tokens_served: int, memories_returned: int,
+                            model: str = "claude", profile: str = "default",
+                            operation: str = "get_memory") -> None:
+        """Insert one analytics event row. Errors go to stderr — never silently swallowed."""
+        import uuid as _uuid
+        now = datetime.now()
+        try:
+            self._conn.execute(
+                "INSERT INTO analytics_events"
+                "(id, session_date, tokens_served, memories_returned, model, operation, profile, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    f"ae_{_uuid.uuid4().hex[:8]}",
+                    now.strftime("%Y-%m-%d"),
+                    tokens_served,
+                    memories_returned,
+                    model,
+                    operation,
+                    profile,
+                    now.isoformat(),
+                )
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logging.warning("log_analytics_event failed: %s", exc)
+
+    def get_analytics_summary(self, since_days: int = 30) -> dict:
+        """Return daily_stats, by_model, by_operation aggregations via SQL GROUP BY.
+
+        Mirrors the dict shape that analytics.py previously read from analytics.json
+        so the UI can be updated with a minimal diff.
+        """
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=since_days)).strftime("%Y-%m-%d")
+
+        daily_rows = self._conn.execute(
+            """SELECT session_date,
+                      SUM(tokens_served)     AS tokens_served,
+                      COUNT(*)               AS sessions,
+                      SUM(memories_returned) AS memories_returned
+               FROM analytics_events
+               WHERE session_date >= ?
+               GROUP BY session_date
+               ORDER BY session_date""",
+            (cutoff,)
+        ).fetchall()
+        daily_stats = {
+            r["session_date"]: {
+                "tokens_served": r["tokens_served"] or 0,
+                "sessions": r["sessions"] or 0,
+                "memories_returned": r["memories_returned"] or 0,
+            }
+            for r in daily_rows
+        }
+
+        model_rows = self._conn.execute(
+            """SELECT model,
+                      SUM(tokens_served) AS tokens,
+                      COUNT(*)           AS sessions
+               FROM analytics_events
+               WHERE session_date >= ?
+               GROUP BY model""",
+            (cutoff,)
+        ).fetchall()
+        by_model = {
+            r["model"]: {"tokens": r["tokens"] or 0, "sessions": r["sessions"] or 0}
+            for r in model_rows
+        }
+
+        op_rows = self._conn.execute(
+            """SELECT operation,
+                      SUM(tokens_served) AS tokens,
+                      COUNT(*)           AS count
+               FROM analytics_events
+               WHERE session_date >= ?
+               GROUP BY operation""",
+            (cutoff,)
+        ).fetchall()
+        by_operation = {
+            r["operation"]: {"tokens": r["tokens"] or 0, "count": r["count"] or 0}
+            for r in op_rows
+        }
+
+        return {
+            "daily_stats": daily_stats,
+            "by_model": by_model,
+            "by_operation": by_operation,
+        }
+
+    def get_rule_confidence_after(self, queue_id: str) -> dict | None:
+        """Return rule_name and confidence for the pruner_rule linked to a queue item."""
+        row = self._conn.execute(
+            """SELECT rule_name, confidence FROM pruner_rules
+               JOIN prune_queue ON pruner_rules.rule_name = prune_queue.rule_name
+               WHERE prune_queue.id = ?""",
+            (queue_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {"rule_name": row["rule_name"], "confidence": row["confidence"]}
 
     # -------------------------------------------------------------------------
     # Stats

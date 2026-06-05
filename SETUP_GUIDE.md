@@ -129,12 +129,34 @@ You don't need to do anything special once it's set up. Claude will automaticall
 
 ## Where Your Data Lives
 
-All memories are stored locally in two files:
+All runtime data is stored locally in `~/memorybridge/` (never committed to the repo):
 
-- `~/memorybridge/memory.json` — your memories
-- `~/memorybridge/analytics.json` — usage stats
+| Path | Contents |
+|---|---|
+| `~/memorybridge/memory.db` | SQLite database — all memories, profiles, search indexes |
+| `~/memorybridge/analytics.json` | Token usage stats |
+| `~/memorybridge/inbox/` | Drop export files here for auto-ingestion |
+| `~/memorybridge/logs/` | Per-run ingestion reports, watcher log |
+| `~/memorybridge/.env` | Your API keys — copy from `.env.example` in the repo |
+| `~/memorybridge/instance.pid` | Auto-managed PID file for the running server |
 
-You can open these in any text editor. They're plain JSON — human-readable and easy to back up.
+**Relocating the data directory:** set `MEMORYBRIDGE_DATA` in your environment to any path and all data will live there instead of `~/memorybridge/`.
+
+```bash
+export MEMORYBRIDGE_DATA=/Volumes/external/memorybridge
+```
+
+Add this to your shell profile (`~/.zprofile` or `~/.bashrc`) to make it permanent.
+
+---
+
+## Server Lifecycle
+
+The server (`server.py`) is launched automatically by the Claude desktop app at the start of each session — you never run it manually. It exits when the session ends via SIGTERM, stdin EOF, or a parent-death watchdog (which fires when the process's PPID becomes 1).
+
+**Do not run `server.py` under a launchd `KeepAlive` job.** The watchdog is designed to kill the server when Claude exits; launchd would immediately restart it, creating a respawn loop. Session-scoped is intentional.
+
+If you previously had a launchd job for the server itself, the retired plist is archived in `~/memorybridge/launchd-retired/`. Only the inbox watcher (`com.memorybridge.inbox.plist`) should be active in `~/Library/LaunchAgents/`.
 
 ---
 

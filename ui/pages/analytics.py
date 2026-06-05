@@ -1,19 +1,22 @@
 """
 Analytics page — token usage trends, operation breakdown, baseline comparison.
+
+Data source: analytics_events table in SQLite (issue #8).
+analytics.json is left untouched if it exists — migration reads live DB only.
 """
-import json
+import os
 from pathlib import Path
 
-
-ANALYTICS_FILE = Path.home() / "memorybridge" / "analytics.json"
 BASELINE_TOKENS_PER_SEARCH = 1_740  # pre-v1.4 average
 
 
 def load_analytics() -> dict:
-    if not ANALYTICS_FILE.exists():
-        return {}
+    """Return analytics summary from SQLite via MemoryStore.get_analytics_summary()."""
     try:
-        return json.loads(ANALYTICS_FILE.read_text())
+        from db.store import MemoryStore
+        data_dir = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
+        store = MemoryStore(data_dir / "memory.db")
+        return store.get_analytics_summary(since_days=90)
     except Exception:
         return {}
 
@@ -24,8 +27,8 @@ def render():
     st.header("📊 Analytics")
 
     data = load_analytics()
-    if not data:
-        st.info(f"No analytics data yet. File expected at `{ANALYTICS_FILE}`")
+    if not data or not any(data.get(k) for k in ("daily_stats", "by_model", "by_operation")):
+        st.info("No analytics data yet. Use MemoryBridge tools to generate events.")
         return
 
     # -------------------------------------------------------------------------
