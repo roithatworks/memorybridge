@@ -1,8 +1,10 @@
 """
 MemoryBridge Adaptive Auto-Pruner
 ==================================
-Runs after every add_memory call. Detects redundant/stale memories,
+Called after every add_memory call. Detects redundant/stale memories,
 auto-executes high-confidence cases, queues uncertain ones for human review.
+The expensive subset scan runs immediately for small profiles and on a cadence
+for large profiles so add_memory does not degrade to O(n^2) work per write.
 
 Learns over time: every decision (auto or human) is logged to pruner_log.
 Rule confidence thresholds auto-adjust based on approval/rejection history.
@@ -36,6 +38,9 @@ MIN_CONFIDENCE           = 0.20
 MAX_CONFIDENCE           = 0.99
 STALE_DAYS               = 30
 NEVER_AUTO_DELETE_IMPORTANCE = {"critical"}  # always queue, never auto-execute
+SUBSET_SWEEP_ALWAYS_BELOW_COUNT = 100
+SUBSET_SWEEP_ADD_INTERVAL = 50
+SUBSET_SWEEP_GROWTH_RATIO = 0.10
 
 RULE_NAMES = ["verbatim_subset", "stale_project_status"]
 
@@ -80,6 +85,15 @@ CREATE TABLE IF NOT EXISTS pruner_log (
     triggered_by TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pruner_sweeps (
+    profile      TEXT NOT NULL,
+    sweep_name   TEXT NOT NULL,
+    last_memory_count INTEGER NOT NULL DEFAULT 0,
+    adds_since_sweep INTEGER NOT NULL DEFAULT 0,
+    last_run_at  TEXT NOT NULL,
+    PRIMARY KEY(profile, sweep_name)
+);
 """
 
 
@@ -114,19 +128,26 @@ def find_subset_candidates(conn, profile: str) -> list[dict]:
         (profile,)
     ).fetchall()
 
-    memories = [dict(r) for r in rows]
+    memories = []
+    for row in rows:
+        mem = dict(row)
+        mem["_norm_content"] = _normalize(mem["content"])
+        mem["_norm_len"] = len(mem["_norm_content"])
+        memories.append(mem)
+    memories.sort(key=lambda m: m["_norm_len"])
     candidates = []
 
     for i, mem in enumerate(memories):
         if mem["importance"] in NEVER_AUTO_DELETE_IMPORTANCE:
             continue
-        norm_content = _normalize(mem["content"])
-        for j, other in enumerate(memories):
-            if i == j:
+        norm_content = mem["_norm_content"]
+        if not norm_content:
+            continue
+        for other in memories[i + 1:]:
+            if mem["_norm_len"] >= other["_norm_len"]:
                 continue
-            norm_other = _normalize(other["content"])
             # mem is a subset of other (other contains everything mem says)
-            if norm_content in norm_other and len(norm_content) < len(norm_other):
+            if norm_content in other["_norm_content"]:
                 candidates.append({
                     "rule_name": "verbatim_subset",
                     "candidate_id": mem["id"],
@@ -148,6 +169,87 @@ def find_subset_candidates(conn, profile: str) -> list[dict]:
             seen.add(c["candidate_id"])
             unique.append(c)
     return unique
+
+
+# ---------------------------------------------------------------------------
+# Sweep cadence helpers
+# ---------------------------------------------------------------------------
+
+def _active_memory_count(conn, profile: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS count FROM memories WHERE profile=? AND archived=0",
+        (profile,)
+    ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def _load_sweep_state(conn, profile: str, sweep_name: str):
+    return conn.execute(
+        """SELECT * FROM pruner_sweeps
+           WHERE profile=? AND sweep_name=?""",
+        (profile, sweep_name)
+    ).fetchone()
+
+
+def _mark_subset_sweep_skipped(conn, profile: str, memory_count: int, now: str) -> None:
+    row = _load_sweep_state(conn, profile, "verbatim_subset")
+    if row:
+        conn.execute(
+            """UPDATE pruner_sweeps
+               SET adds_since_sweep=adds_since_sweep+1
+               WHERE profile=? AND sweep_name='verbatim_subset'""",
+            (profile,)
+        )
+    else:
+        conn.execute(
+            """INSERT INTO pruner_sweeps
+               (profile,sweep_name,last_memory_count,adds_since_sweep,last_run_at)
+               VALUES(?,?,?,?,?)""",
+            (profile, "verbatim_subset", memory_count, 1, now)
+        )
+    conn.commit()
+
+
+def _mark_subset_sweep_ran(conn, profile: str, memory_count: int, now: str) -> None:
+    conn.execute(
+        """INSERT INTO pruner_sweeps
+           (profile,sweep_name,last_memory_count,adds_since_sweep,last_run_at)
+           VALUES(?,?,?,?,?)
+           ON CONFLICT(profile,sweep_name) DO UPDATE SET
+             last_memory_count=excluded.last_memory_count,
+             adds_since_sweep=0,
+             last_run_at=excluded.last_run_at""",
+        (profile, "verbatim_subset", memory_count, 0, now)
+    )
+    conn.commit()
+
+
+def should_run_subset_sweep(conn, profile: str, memory_count: int, force: bool = False) -> tuple[bool, str]:
+    """
+    The substring subset rule is O(n^2), so large profiles run it on a cadence.
+    Small profiles still run every time because the scan is cheap and keeps the
+    original immediate-dedup behavior.
+    """
+    if force:
+        return True, "forced"
+    if memory_count < SUBSET_SWEEP_ALWAYS_BELOW_COUNT:
+        return True, "small_profile"
+
+    row = _load_sweep_state(conn, profile, "verbatim_subset")
+    if not row:
+        return True, "first_large_profile_sweep"
+
+    adds_since = int(row["adds_since_sweep"]) + 1
+    last_count = int(row["last_memory_count"])
+    growth_threshold = max(1, int(last_count * SUBSET_SWEEP_GROWTH_RATIO))
+
+    if adds_since >= SUBSET_SWEEP_ADD_INTERVAL:
+        return True, "add_interval"
+    if memory_count >= last_count + growth_threshold:
+        return True, "memory_count_growth"
+    if memory_count < last_count:
+        return True, "memory_count_shrank"
+    return False, "cadence_not_due"
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +302,7 @@ def find_stale_project_status(conn, profile: str) -> list[dict]:
 # Core runner
 # ---------------------------------------------------------------------------
 
-def run_auto_prune(conn, profile: str, delete_fn) -> dict:
+def run_auto_prune(conn, profile: str, delete_fn, force_subset_sweep: bool = False) -> dict:
     """
     Main entry point. Called after every add_memory.
 
@@ -210,18 +312,34 @@ def run_auto_prune(conn, profile: str, delete_fn) -> dict:
     Returns summary dict with auto_executed and queued counts.
     """
     bootstrap_rules(conn)
-
-    all_candidates = (
-        find_subset_candidates(conn, profile) +
-        find_stale_project_status(conn, profile)
+    now = datetime.now().isoformat()
+    memory_count = _active_memory_count(conn, profile)
+    run_subset_sweep, subset_reason = should_run_subset_sweep(
+        conn, profile, memory_count, force=force_subset_sweep
     )
 
+    all_candidates = []
+    if run_subset_sweep:
+        all_candidates.extend(find_subset_candidates(conn, profile))
+        _mark_subset_sweep_ran(conn, profile, memory_count, now)
+    else:
+        _mark_subset_sweep_skipped(conn, profile, memory_count, now)
+
+    all_candidates.extend(find_stale_project_status(conn, profile))
+
+    sweep_status = {
+        "verbatim_subset": {
+            "ran": run_subset_sweep,
+            "reason": subset_reason,
+            "memory_count": memory_count,
+        }
+    }
+
     if not all_candidates:
-        return {"auto_executed": [], "queued": []}
+        return {"auto_executed": [], "queued": [], "sweeps": sweep_status}
 
     auto_executed = []
     queued = []
-    now = datetime.now().isoformat()
 
     for cand in all_candidates:
         rule_name = cand["rule_name"]
@@ -289,7 +407,7 @@ def run_auto_prune(conn, profile: str, delete_fn) -> dict:
                 "reason": cand["reason"],
             })
 
-    return {"auto_executed": auto_executed, "queued": queued}
+    return {"auto_executed": auto_executed, "queued": queued, "sweeps": sweep_status}
 
 
 # ---------------------------------------------------------------------------

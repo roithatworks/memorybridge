@@ -16,6 +16,8 @@ from datetime import datetime, timedelta
 
 from db.pruner import (
     PRUNER_SCHEMA,
+    SUBSET_SWEEP_ADD_INTERVAL,
+    SUBSET_SWEEP_ALWAYS_BELOW_COUNT,
     INITIAL_CONFIDENCE,
     bootstrap_rules,
     find_subset_candidates,
@@ -207,6 +209,68 @@ class TestAutoExecuteRouting:
             "SELECT COUNT(*) FROM prune_queue WHERE candidate_id='mem_a' AND resolved=0"
         ).fetchone()[0]
         assert count <= 1
+
+
+class TestSubsetSweepCadence:
+
+    def _seed_large_profile(self, conn, count=SUBSET_SWEEP_ALWAYS_BELOW_COUNT + 5):
+        for i in range(count):
+            _add(conn, f"mem_seed_{i}", f"seed memory {i} with unique payload")
+
+    def _set_sweep_state(self, conn, memory_count, adds_since=0):
+        conn.execute(
+            """INSERT INTO pruner_sweeps
+               (profile,sweep_name,last_memory_count,adds_since_sweep,last_run_at)
+               VALUES(?,?,?,?,?)""",
+            ("default", "verbatim_subset", memory_count, adds_since, datetime.now().isoformat())
+        )
+        conn.commit()
+
+    def test_large_profile_skips_subset_scan_between_cadence_runs(self, conn):
+        self._seed_large_profile(conn)
+        _add(conn, "mem_short", "Cale likes concise reports")
+        _add(conn, "mem_long", "Cale likes concise reports with deployment evidence")
+        memory_count = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE profile='default' AND archived=0"
+        ).fetchone()[0]
+        self._set_sweep_state(conn, memory_count, adds_since=0)
+
+        result = run_auto_prune(conn, "default", make_delete_fn({}))
+
+        assert result["queued"] == []
+        assert result["sweeps"]["verbatim_subset"]["ran"] is False
+        assert result["sweeps"]["verbatim_subset"]["reason"] == "cadence_not_due"
+
+    def test_large_profile_runs_subset_scan_after_add_interval(self, conn):
+        self._seed_large_profile(conn)
+        _add(conn, "mem_short", "Cale likes concise reports")
+        _add(conn, "mem_long", "Cale likes concise reports with deployment evidence")
+        memory_count = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE profile='default' AND archived=0"
+        ).fetchone()[0]
+        self._set_sweep_state(
+            conn,
+            memory_count,
+            adds_since=SUBSET_SWEEP_ADD_INTERVAL - 1,
+        )
+
+        result = run_auto_prune(conn, "default", make_delete_fn({}))
+
+        assert result["sweeps"]["verbatim_subset"]["ran"] is True
+        assert result["sweeps"]["verbatim_subset"]["reason"] == "add_interval"
+        assert any(item["memory_id"] == "mem_short" for item in result["queued"])
+
+    def test_large_profile_runs_subset_scan_after_growth_threshold(self, conn):
+        self._seed_large_profile(conn, count=120)
+        self._set_sweep_state(conn, memory_count=100, adds_since=4)
+        _add(conn, "mem_short", "Cale likes concise reports")
+        _add(conn, "mem_long", "Cale likes concise reports with deployment evidence")
+
+        result = run_auto_prune(conn, "default", make_delete_fn({}))
+
+        assert result["sweeps"]["verbatim_subset"]["ran"] is True
+        assert result["sweeps"]["verbatim_subset"]["reason"] == "memory_count_growth"
+        assert any(item["memory_id"] == "mem_short" for item in result["queued"])
 
 
 # ---------------------------------------------------------------------------
