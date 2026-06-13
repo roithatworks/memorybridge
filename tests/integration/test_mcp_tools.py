@@ -53,12 +53,12 @@ def test_add_duplicate_returns_duplicate_status(fresh_store):
 
 
 # -------------------------------------------------------------------------
-# update_memory + search_memory
+# add_memories + search_memory
 # -------------------------------------------------------------------------
 
-def test_update_then_search(fresh_store):
+def test_add_memories_then_search(fresh_store):
     import server
-    server.update_memory.fn(
+    server.add_memories.fn(
         facts=["Fact Alpha", "Fact Beta", "Fact Gamma"],
         category="fact", profile="default"
     )
@@ -68,9 +68,9 @@ def test_update_then_search(fresh_store):
     assert any("Alpha" in c for c in contents)
 
 
-def test_update_deduplicates_within_batch(fresh_store):
+def test_add_memories_deduplicates_within_batch(fresh_store):
     import server
-    result = json.loads(server.update_memory.fn(
+    result = json.loads(server.add_memories.fn(
         facts=["Unique fact A", "Unique fact A"],  # duplicate in same batch
         category="fact", profile="default"
     ))
@@ -108,6 +108,54 @@ def test_delete_nonexistent_returns_error(fresh_store):
     import server
     result = json.loads(server.delete_memory.fn(memory_id="mem_fake", profile="default"))
     assert "error" in result
+
+
+# -------------------------------------------------------------------------
+# edit_memory
+# -------------------------------------------------------------------------
+
+def test_edit_memory_content(fresh_store):
+    import server
+    # 1. Add a memory
+    r = json.loads(server.add_memory.fn("Original content", category="fact", importance="medium", profile="default"))
+    mid = r["memory_id"]
+    
+    # 2. Edit the content
+    edit_res = json.loads(server.edit_memory.fn(memory_id=mid, content="Updated content", profile="default"))
+    assert edit_res["status"] == "updated"
+    assert "content" in edit_res["fields_changed"]
+    
+    # 3. Retrieve and verify the edit
+    get_res = json.loads(server.get_memory.fn(profile="default"))
+    memories = get_res["memories"]
+    edited_mem = next(m for m in memories if m["id"] == mid)
+    assert edited_mem["content"] == "Updated content"
+
+
+def test_edit_memory_other_fields(fresh_store):
+    import server
+    # 1. Add a memory
+    r = json.loads(server.add_memory.fn("Original content", category="fact", importance="medium", profile="default"))
+    mid = r["memory_id"]
+    
+    # 2. Edit other fields
+    edit_res = json.loads(server.edit_memory.fn(memory_id=mid, category="preference", importance="high", profile="default"))
+    assert edit_res["status"] == "updated"
+    assert "category" in edit_res["fields_changed"]
+    assert "importance" in edit_res["fields_changed"]
+    
+    # 3. Retrieve and verify the edit
+    get_res = json.loads(server.get_memory.fn(profile="default"))
+    memories = get_res["memories"]
+    edited_mem = next(m for m in memories if m["id"] == mid)
+    assert edited_mem["category"] == "preference"
+    assert edited_mem["importance"] == "high"
+
+
+def test_edit_nonexistent_memory_returns_error(fresh_store):
+    import server
+    edit_res = json.loads(server.edit_memory.fn(memory_id="mem_fake", content="hello", profile="default"))
+    assert "error" in edit_res
 
 
 # -------------------------------------------------------------------------

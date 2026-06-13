@@ -8,10 +8,10 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from server import add_memory as _add_memory_tool, search_memory as _search_memory_tool, update_memory as _update_memory_tool  # noqa: E402
+from server import add_memory as _add_memory_tool, search_memory as _search_memory_tool, add_memories as _add_memories_tool  # noqa: E402
 add_memory = _add_memory_tool.fn
 search_memory = _search_memory_tool.fn
-update_memory = _update_memory_tool.fn
+add_memories = _add_memories_tool.fn
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ def _write_fact(fact: dict, profile: str, preview: bool) -> str:
 
 def _batch_write(facts_by_category: dict, profile: str) -> int:
     """
-    Write groups of facts via update_memory (one call per category).
+    Write groups of facts via add_memories (one call per category).
     Returns total number of facts written.
     """
     written = 0
@@ -73,7 +73,7 @@ def _batch_write(facts_by_category: dict, profile: str) -> int:
         fact_strings = [f["fact"] for f in group]
         project = next((f.get("project") for f in group if f.get("project")), None)
         try:
-            update_memory(
+            add_memories(
                 facts=fact_strings,
                 category=category,
                 importance=importance,
@@ -82,7 +82,7 @@ def _batch_write(facts_by_category: dict, profile: str) -> int:
             )
             written += len(fact_strings)
         except Exception as e:
-            logger.error("update_memory failed for category '%s': %s", category, e)
+            logger.error("add_memories failed for category '%s': %s", category, e)
     return written
 
 

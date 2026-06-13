@@ -83,7 +83,8 @@ Claude calls these automatically — no special syntax required.
 |---|---|
 | `get_memory` | Retrieve memories within a token budget, ranked by decay-adjusted relevance |
 | `add_memory` | Add a single memory with category and importance |
-| `update_memory` | Batch-add multiple facts in one call |
+| `add_memories` | Batch-add multiple facts in one call (does not mutate existing rows) |
+| `edit_memory` | Edit content, importance, category, or project association of an existing memory in place |
 | `search_memory` | Hybrid BM25 + semantic search (default: limit=5, max_tokens=800) |
 | `delete_memory` | Remove a memory by ID |
 | `get_token_stats` | Token usage breakdown by profile |

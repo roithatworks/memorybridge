@@ -393,7 +393,7 @@ def add_memory(
 
 
 @mcp.tool()
-def update_memory(
+def add_memories(
     facts: list[str],
     category: str = "fact",
     importance: str = "medium",
@@ -401,9 +401,9 @@ def update_memory(
     profile: str = DEFAULT_PROFILE
 ) -> str:
     """
-    BATCH-ADD operation — inserts new memory rows. This does NOT edit or mutate
-    existing memories. Each fact in the list is inserted as a new row; duplicate
-    content (same content_hash) is silently skipped.
+    BATCH-ADD operation -- inserts multiple new memory rows. This does NOT edit
+    or mutate existing memories. Each fact in the list is inserted as a new row;
+    duplicate content (same content_hash) is silently skipped.
 
     To edit an existing memory in place, use edit_memory(memory_id=...) instead.
 
@@ -445,7 +445,7 @@ def update_memory(
     if stats["total_tokens"] > MAX_TOTAL_TOKENS:
         pruned = _store.auto_prune(profile, threshold=ARCHIVE_SCORE_THRESHOLD)
 
-    _store.log_access("update_memory", profile,
+    _store.log_access("add_memories", profile,
                       f"added {len(changes)} memories, {total_tokens} tokens")
 
     return json.dumps({
@@ -1178,7 +1178,7 @@ def _start_parent_watchdog() -> None:
 # model must not be able to destroy memories; destructive and subprocess-
 # spawning tools stay stdio/Claude-local.
 REMOTE_ALLOWED_TOOLS = {
-    "get_memory", "search_memory", "add_memory", "update_memory", "edit_memory",
+    "get_memory", "search_memory", "add_memory", "add_memories", "edit_memory",
     "list_projects", "export_passport",
 }
 
