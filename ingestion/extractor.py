@@ -89,7 +89,6 @@ def _call_deepseek(client: OpenAI, conversations: list) -> list:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0,
         )
         raw = resp.choices[0].message.content.strip()
         # Strip accidental markdown fences

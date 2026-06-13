@@ -17,6 +17,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+# Allow importing local ingestion modules when run from other directories
+sys.path.insert(0, str(Path(__file__).parent))
+
 # Data dir: mutable state (db, logs, .env, inbox) — defaults to ~/memorybridge,
 # override with MEMORYBRIDGE_DATA. Code stays in the repo.
 import os
@@ -51,7 +54,7 @@ LOGS_DIR = MEMORYBRIDGE_DIR / "logs"
 FLAGGED_QUEUE = MEMORYBRIDGE_DIR / "flagged_queue.json"
 
 
-def _write_flagged(flagged: list, source: str) -> None:
+def _write_flagged(flagged: list, source: str, profile: str) -> None:
     """Append flagged items to flagged_queue.json."""
     if not flagged:
         return
@@ -74,6 +77,7 @@ def _write_flagged(flagged: list, source: str) -> None:
             "project": fact.get("project"),
             "source_conversation_id": fact.get("source_conversation_id", ""),
             "source": source,
+            "profile": profile,
             "status": "pending",
         })
 
@@ -179,7 +183,7 @@ def main():
 
     # 6. Write flagged queue and log (skip in preview)
     if not args.preview:
-        _write_flagged(flagged, args.source)
+        _write_flagged(flagged, args.source, args.profile)
         log_path = _write_log(report, len(flagged), len(escalated))
         print(f"  Log written to {log_path}")
 
@@ -207,5 +211,4 @@ def main():
 
 if __name__ == "__main__":
     # Allow running from repo root: python ingestion/run.py
-    sys.path.insert(0, str(Path(__file__).parent))
     main()

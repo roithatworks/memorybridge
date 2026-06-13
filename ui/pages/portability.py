@@ -46,7 +46,7 @@ def _validate_input_file_path(file_path: Path) -> Path:
 
 
 def run_ingestion(source: str, file_path: Path, profile: str,
-                  preview: bool = True) -> dict:
+                  preview: bool = True, days: int = None) -> dict:
     """
     Run the ingestion pipeline. Returns parsed JSON from run.py output.
     """
@@ -61,6 +61,8 @@ def run_ingestion(source: str, file_path: Path, profile: str,
     ]
     if preview:
         cmd.append("--preview")
+    if days and days > 0:
+        cmd.extend(["--days", str(days)])
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     # run.py writes a JSON log to ~/memorybridge/logs/ — parse stdout summary
@@ -115,7 +117,7 @@ def render():
                 if st.button("🔍 Preview extraction", use_container_width=True):
                     try:
                         with st.spinner("Running extraction preview…"):
-                            result = run_ingestion(source, tmp_path, profile, preview=True)
+                             result = run_ingestion(source, tmp_path, profile, preview=True, days=days)
                     except ValueError as e:
                         st.error(str(e))
                     else:
@@ -131,7 +133,7 @@ def render():
                 if st.button("✓ Run ingestion", type="primary", use_container_width=True):
                     try:
                         with st.spinner("Ingesting memories…"):
-                            result = run_ingestion(source, tmp_path, profile, preview=False)
+                             result = run_ingestion(source, tmp_path, profile, preview=False, days=days)
                     except ValueError as e:
                         st.error(str(e))
                     else:

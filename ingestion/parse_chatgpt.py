@@ -23,7 +23,7 @@ def _extract_messages_from_mapping(mapping: dict) -> list:
     messages = []
     stack = [root_id] if root_id else []
     while stack:
-        node_id = stack.pop(0)
+        node_id = stack.pop()
         node = mapping.get(node_id, {})
         msg = node.get("message")
         if msg:
@@ -38,7 +38,7 @@ def _extract_messages_from_mapping(mapping: dict) -> list:
                 if text:
                     messages.append({"role": role_raw, "content": text})
 
-        for child_id in children_map.get(node_id, []):
+        for child_id in reversed(children_map.get(node_id, [])):
             stack.append(child_id)
 
     return messages

@@ -193,6 +193,92 @@ def test_chatgpt_parse_empty_mapping_skipped():
     assert len(result["conversations"]) == 0
 
 
+def test_chatgpt_parse_dfs_branching():
+    """Verify that ChatGPT conversation branches (e.g. regenerations) do not interleave
+    under DFS mapping traversal.
+    """
+    from parse_chatgpt import parse
+    # Structure:
+    #       root
+    #        |
+    #      msg-1
+    #     /     \
+    # msg-2a    msg-2b
+    #   |         |
+    # msg-3a    msg-3b
+    branching_data = [
+        {
+            "id": "conv-branching",
+            "title": "Branching Chat",
+            "create_time": 1700000000.0,
+            "mapping": {
+                "root": {
+                    "id": "root",
+                    "parent": None,
+                    "message": None,
+                    "children": ["msg-1"],
+                },
+                "msg-1": {
+                    "id": "msg-1",
+                    "parent": "root",
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Message 1"]},
+                    },
+                    "children": ["msg-2a", "msg-2b"],
+                },
+                "msg-2a": {
+                    "id": "msg-2a",
+                    "parent": "msg-1",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ["Message 2a"]},
+                    },
+                    "children": ["msg-3a"],
+                },
+                "msg-3a": {
+                    "id": "msg-3a",
+                    "parent": "msg-2a",
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Message 3a"]},
+                    },
+                    "children": [],
+                },
+                "msg-2b": {
+                    "id": "msg-2b",
+                    "parent": "msg-1",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ["Message 2b"]},
+                    },
+                    "children": ["msg-3b"],
+                },
+                "msg-3b": {
+                    "id": "msg-3b",
+                    "parent": "msg-2b",
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Message 3b"]},
+                    },
+                    "children": [],
+                },
+            },
+        }
+    ]
+    path = _write_tmp(branching_data)
+    result = parse(str(path))
+    assert len(result["conversations"]) == 1
+    msgs = result["conversations"][0]["messages"]
+    contents = [m["content"] for m in msgs]
+    
+    # Under DFS, msg-2a and its child msg-3a should be traversed fully 
+    # before msg-2b and msg-3b.
+    # Order should be: msg-1, msg-2a, msg-3a, msg-2b, msg-3b
+    assert contents == ["Message 1", "Message 2a", "Message 3a", "Message 2b", "Message 3b"]
+
+
+
 # ---------------------------------------------------------------------------
 # Gemini parser tests
 # ---------------------------------------------------------------------------

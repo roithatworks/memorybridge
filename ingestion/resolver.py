@@ -35,7 +35,7 @@ def _build_user_message(fact: dict) -> str:
 def _resolve_one(client: anthropic.Anthropic, fact: dict) -> dict:
     """Call Claude and return the verdict dict."""
     msg = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-3-5-sonnet-latest",
         max_tokens=256,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": _build_user_message(fact)}],
