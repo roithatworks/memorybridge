@@ -14,6 +14,7 @@ INGESTION_SCRIPT = Path(__file__).parent.parent.parent / "ingestion" / "run.py"
 
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _ALLOWED_SOURCES = {"claude", "chatgpt", "gemini"}
+_ALLOWED_PROFILES = {"default"}
 
 
 def _validate_profile_name(profile: str) -> str:
@@ -24,6 +25,8 @@ def _validate_profile_name(profile: str) -> str:
         )
     if profile.startswith((".", "-")):
         raise ValueError("Invalid profile name. Must not start with '.' or '-'.")
+    if profile not in _ALLOWED_PROFILES:
+        raise ValueError("Invalid profile name. Must be one of: default.")
     return profile
 
 
