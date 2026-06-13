@@ -1,0 +1,83 @@
+# .claudeignore — memorybridge
+# Based on global defaults at ~/.claude/.claudeignore
+
+# Dependencies
+node_modules/
+vendor/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build output
+dist/
+build/
+out/
+.next/
+.nuxt/
+target/
+*.o
+*.a
+*.so
+*.dll
+
+# Locks and logs
+*.lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+*.log
+logs/
+
+# Version control
+.git/
+.svn/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+.coverage
+htmlcov/
+*.lcov
+test-results/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Caches
+.cache/
+.parcel-cache/
+.sass-cache/
+
+# Large data
+*.csv
+*.json.gz
+*.sqlite
+*.db
+
+# ── Project-specific entries below ───────────────────────────────────────────
+
+# Memory bridge DB files (managed by server.py)
+*.dxt
+
+# Ingestion pipeline state
+ingestion/state/
+ingestion/cache/
+
+# Logs
+logs/

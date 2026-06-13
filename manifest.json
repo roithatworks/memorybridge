@@ -21,7 +21,8 @@
   "tools": [
     { "name": "get_memory",       "description": "Retrieve relevant memories within a token budget" },
     { "name": "add_memory",       "description": "Add a new memory with automatic token counting and dedup" },
-    { "name": "update_memory",    "description": "Batch-add multiple facts in one operation" },
+    { "name": "add_memories",     "description": "Batch-add multiple facts in one operation" },
+    { "name": "edit_memory",      "description": "Edit an existing memory in place by memory_id" },
     { "name": "search_memory",    "description": "Search memories using FTS5 BM25 full-text search" },
     { "name": "delete_memory",    "description": "Delete a specific memory by ID" },
     { "name": "get_token_stats",  "description": "Get token usage statistics across profiles" },
