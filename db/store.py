@@ -63,6 +63,15 @@ class _LockedConnection:
         return self._lock
 
 
+def _jaccard_similarity(a: str, b: str) -> float:
+    """Jaccard-style keyword overlap between two strings."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    return len(words_a & words_b) / max(len(words_a), len(words_b))
+
+
 def _mem_id() -> str:
     return f"mem_{uuid.uuid4().hex[:8]}"
 
@@ -256,14 +265,17 @@ class MemoryStore:
         set_clause = ", ".join(f"{col}=?" for col in fields)
         values = list(fields.values()) + [memory_id, profile]
 
-        with self._conn.transaction():
-            cur = self._conn.execute(
-                f"UPDATE memories SET {set_clause} WHERE id=? AND profile=?",
-                values
-            )
-            self._conn.commit()
-
-        updated = cur.rowcount > 0
+        try:
+            with self._conn.transaction():
+                cur = self._conn.execute(
+                    f"UPDATE memories SET {set_clause} WHERE id=? AND profile=?",
+                    values
+                )
+                self._conn.commit()
+            updated = cur.rowcount > 0
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            updated = False
 
         # Re-embed if content changed (fire-and-forget, fail-soft)
         if updated and "content" in fields:
@@ -371,6 +383,7 @@ class MemoryStore:
         for row in rows:
             m = self._row_to_dict(row)
             m.pop("bm25_score", None)
+            m["match_score"] = _jaccard_similarity(query, m["content"])
             if tokens_used + m["token_count"] <= max_tokens:
                 results.append(m)
                 tokens_used += m["token_count"]
@@ -773,11 +786,13 @@ class MemoryStore:
 
         # Re-rank in similarity order
         mem_by_id = {r["id"]: self._row_to_dict(r) for r in mem_rows}
+        sim_by_id = {mid: sim for mid, sim in scored}
         results, tokens_used = [], 0
         for mid, _ in scored:
             if mid not in mem_by_id:
                 continue
             m = mem_by_id[mid]
+            m["match_score"] = sim_by_id[mid]
             if tokens_used + m["token_count"] <= max_tokens:
                 results.append(m)
                 tokens_used += m["token_count"]
@@ -800,6 +815,7 @@ class MemoryStore:
 
         scores: dict[str, float] = {}
         all_mems: dict[str, dict] = {}
+        sim_scores: dict[str, float] = {}
 
         for rank, mem in enumerate(keyword_results):
             mid = mem["id"]
@@ -810,12 +826,14 @@ class MemoryStore:
             mid = mem["id"]
             scores[mid] = scores.get(mid, 0.0) + 1.0 / (60 + rank)
             all_mems[mid] = mem
+            sim_scores[mid] = mem.get("match_score", 0.0)
 
         ranked = sorted(scores, key=lambda k: scores[k], reverse=True)
 
         results, tokens_used = [], 0
         for mid in ranked:
             mem = all_mems[mid]
+            mem["match_score"] = sim_scores.get(mid, mem.get("match_score", _jaccard_similarity(query, mem["content"])))
             if tokens_used + mem["token_count"] <= max_tokens:
                 results.append(mem)
                 tokens_used += mem["token_count"]

@@ -58,6 +58,7 @@ except ImportError:
 
 MEMORY_DB              = DATA_DIR / "memory.db"
 DEFAULT_PROFILE        = "default"
+_current_profile       = DEFAULT_PROFILE
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
@@ -221,7 +222,7 @@ def _clean_result(mem: dict) -> dict:
 
 @mcp.tool()
 def get_memory(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     context_hint: Optional[str] = None,
     category: Optional[str] = None,
     max_tokens: int = MAX_TOKENS_DEFAULT,
@@ -239,6 +240,7 @@ def get_memory(
     Returns:
         JSON with memories, token stats, and budget info
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -335,7 +337,7 @@ def add_memory(
     importance: str = "medium",
     tags: list[str] = None,
     project_id: Optional[str] = None,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """
     Add a new memory with automatic token counting and content-hash dedup.
@@ -350,6 +352,7 @@ def add_memory(
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
+    profile = profile or _current_profile
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
@@ -398,7 +401,7 @@ def add_memories(
     category: str = "fact",
     importance: str = "medium",
     project: Optional[str] = None,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """
     BATCH-ADD operation -- inserts multiple new memory rows. This does NOT edit
@@ -416,6 +419,7 @@ def add_memories(
     Returns:
         Summary with all added memory IDs and total tokens
     """
+    profile = profile or _current_profile
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
@@ -466,7 +470,7 @@ def edit_memory(
     importance: Optional[str] = None,
     category: Optional[str] = None,
     project: Optional[str] = None,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """
     Edit an existing memory in place by memory_id.
@@ -484,6 +488,7 @@ def edit_memory(
     Returns:
         JSON confirmation, or {"error": ...} if memory_id not found / validation fails
     """
+    profile = profile or _current_profile
     if importance is not None and importance not in IMPORTANCE_LEVELS:
         return json.dumps({"error": f"Invalid importance. Valid: {IMPORTANCE_LEVELS}"})
     if category is not None and category not in VALID_CATEGORIES:
@@ -518,7 +523,7 @@ def search_memory(
     category: Optional[str] = None,
     limit: int = SEARCH_LIMIT_DEFAULT,
     max_tokens: int = SEARCH_MAX_TOKENS_DEFAULT,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """
     Search memories using FTS5 BM25 with optional token budget.
@@ -532,6 +537,7 @@ def search_memory(
     Returns:
         JSON with ranked results (internal fields stripped)
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
 
     if category and category not in VALID_CATEGORIES:
@@ -567,9 +573,10 @@ def search_memory(
 @mcp.tool()
 def delete_memory(
     memory_id: str,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """Delete a specific memory by ID."""
+    profile = profile or _current_profile
     tokens_freed = _store.delete_memory(profile, memory_id)
     if tokens_freed == 0:
         # Check if profile even exists
@@ -588,7 +595,7 @@ def delete_memory(
 
 
 @mcp.tool()
-def get_token_stats(profile: str = DEFAULT_PROFILE) -> str:
+def get_token_stats(profile: str = None) -> str:
     """
     Get comprehensive token usage statistics.
 
@@ -597,6 +604,8 @@ def get_token_stats(profile: str = DEFAULT_PROFILE) -> str:
     Returns:
         Token usage breakdown
     """
+    if profile is None:
+        profile = _current_profile
     if profile == "all":
         all_profiles = {}
         total_stored = 0
@@ -642,7 +651,7 @@ def get_token_stats(profile: str = DEFAULT_PROFILE) -> str:
 
 @mcp.tool()
 def prune_memories(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     threshold: Optional[float] = None,
     dry_run: bool = False
 ) -> str:
@@ -656,6 +665,7 @@ def prune_memories(
     Returns:
         List of pruned/would-prune memories
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     threshold = threshold or ARCHIVE_SCORE_THRESHOLD
 
@@ -690,6 +700,7 @@ def prune_memories(
 @mcp.tool()
 def switch_profile(profile_name: str) -> str:
     """Switch active persona context."""
+    global _current_profile
     profile_data = _store.get_profile(profile_name)
     if profile_data is None:
         available = _store.list_profiles()
@@ -698,6 +709,7 @@ def switch_profile(profile_name: str) -> str:
             "available_profiles": available
         })
 
+    _current_profile = profile_name
     stats = _store.token_stats(profile_name)
     _store.log_access("switch_profile", profile_name, "")
     return json.dumps({
@@ -711,8 +723,9 @@ def switch_profile(profile_name: str) -> str:
 
 
 @mcp.tool()
-def list_projects(profile: str = DEFAULT_PROFILE) -> str:
+def list_projects(profile: str = None) -> str:
     """List all projects with status."""
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -762,7 +775,7 @@ def get_access_log(limit: int = 50, include_tokens: bool = True) -> str:
 
 @mcp.tool()
 def get_prune_queue(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     include_report: bool = True
 ) -> str:
     """
@@ -774,6 +787,7 @@ def get_prune_queue(
     Returns:
         JSON with pending queue items and optional pruner report
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     from db.pruner import get_pruner_report
     report = get_pruner_report(_store._conn, since_days=7) if include_report else {}
@@ -790,7 +804,7 @@ def get_prune_queue(
 def resolve_prune_queue(
     queue_id: str,
     approved: bool,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """
     Approve or reject a queued prune candidate.
@@ -803,6 +817,7 @@ def resolve_prune_queue(
     Returns:
         Outcome with tokens freed and updated confidence info
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     result = record_outcome(_store._conn, queue_id, approved, _store.delete_memory)
 
@@ -825,7 +840,7 @@ def resolve_prune_queue(
 @mcp.tool()
 def export_for_model(
     model: str,
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     depth: str = "full",
     max_tokens: int = 2000
 ) -> str:
@@ -838,6 +853,7 @@ def export_for_model(
         depth: Export depth (full, summary, minimal)
         max_tokens: Token budget for export (default 2000)
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -985,7 +1001,7 @@ def export_for_model(
 
 @mcp.tool()
 def export_passport(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     max_tokens: int = 2000,
 ) -> str:
     """
@@ -1001,6 +1017,7 @@ def export_passport(
     Returns:
         Plain-text Memory Passport string.
     """
+    profile = profile or _current_profile
     from ingestion.passport import build_passport
 
     _store.ensure_profile(profile)
@@ -1033,7 +1050,7 @@ def export_passport(
 
 @mcp.tool()
 def ingest_from_inbox(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     preview: bool = False
 ) -> str:
     """

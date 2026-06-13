@@ -6,8 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from server import search_memory as _search_memory_tool  # noqa: E402
-search_memory = _search_memory_tool.fn
+from server import _store  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -24,20 +23,19 @@ _CONFLICT_SIMILARITY = 0.80
 
 def _detect_conflict(fact: dict, profile: str) -> str | None:
     """
-    Call search_memory to find existing memories similar to this fact.
+    Call search_hybrid on the database store to find existing memories similar to this fact.
     Returns the conflicting memory content string if found, else None.
     """
     query = fact.get("fact", "")
     if not query:
         return None
     try:
-        raw = search_memory(query=query, limit=5, profile=profile)
-        result = json.loads(raw)
-        for mem in result.get("results", []):
+        results = _store.search_hybrid(profile=profile, query=query, limit=5)
+        for mem in results:
             if mem.get("match_score", 0) > _CONFLICT_SIMILARITY:
                 return mem.get("content", "")
     except Exception as e:
-        logger.warning("search_memory failed during conflict detection: %s", e)
+        logger.warning("search_hybrid failed during conflict detection: %s", e)
     return None
 
 

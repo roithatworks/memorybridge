@@ -8,9 +8,8 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from server import add_memory as _add_memory_tool, search_memory as _search_memory_tool, add_memories as _add_memories_tool  # noqa: E402
+from server import add_memory as _add_memory_tool, add_memories as _add_memories_tool, _store  # noqa: E402
 add_memory = _add_memory_tool.fn
-search_memory = _search_memory_tool.fn
 add_memories = _add_memories_tool.fn
 
 logger = logging.getLogger(__name__)
@@ -31,10 +30,9 @@ def _keyword_overlap(a: str, b: str) -> float:
 def _search_existing(fact_text: str, profile: str) -> list:
     """Return search results for a fact string."""
     try:
-        raw = search_memory(query=fact_text, limit=5, profile=profile)
-        return json.loads(raw).get("results", [])
+        return _store.search_hybrid(profile=profile, query=fact_text, limit=5)
     except Exception as e:
-        logger.warning("search_memory failed: %s", e)
+        logger.warning("search_hybrid failed: %s", e)
         return []
 
 
