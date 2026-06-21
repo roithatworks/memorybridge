@@ -8,6 +8,11 @@ import anthropic
 
 logger = logging.getLogger(__name__)
 
+# Model for conflict resolution. The old "claude-3-5-sonnet-latest" alias was
+# retired by Anthropic and 404s — every escalated fact was being rejected.
+# Override via RESOLVER_MODEL env var when model names change again.
+RESOLVER_MODEL = os.environ.get("RESOLVER_MODEL", "claude-sonnet-4-5")
+
 SYSTEM_PROMPT = """\
 You are resolving conflicts in a personal AI memory system.
 You will receive a new fact extracted from a conversation and potentially a conflicting existing memory.
@@ -35,7 +40,7 @@ def _build_user_message(fact: dict) -> str:
 def _resolve_one(client: anthropic.Anthropic, fact: dict) -> dict:
     """Call Claude and return the verdict dict."""
     msg = client.messages.create(
-        model="claude-3-5-sonnet-latest",
+        model=RESOLVER_MODEL,
         max_tokens=256,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": _build_user_message(fact)}],
