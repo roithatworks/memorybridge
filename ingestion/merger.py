@@ -7,6 +7,9 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from profile_router import route_profile  # noqa: E402
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from server import add_memory as _add_memory_tool, add_memories as _add_memories_tool, _store  # noqa: E402
 add_memory = _add_memory_tool.fn
@@ -175,31 +178,50 @@ def merge(accepted: list, resolved: list, source: str, profile: str = "default",
             else:
                 write_queue.append(fact)
 
+    # Domain routing: assign each fact to a profile (job_search/consulting/
+    # teaching/personal/default) by content. Done for both preview and write so
+    # the preview report shows the routing. base_profile = the run's --profile.
+    routed_by_profile: dict[str, int] = defaultdict(int)
+    for fact in write_queue:
+        dest = route_profile(fact, base_profile=profile)
+        fact["_dest_profile"] = dest
+        routed_by_profile[dest] += 1
+
     guardrail_rejected = []
     if not preview:
-        # Group by category for efficient batch writes
-        by_category: dict[str, list] = defaultdict(list)
+        # Group by (profile, category) so each group writes to its routed profile.
+        by_profile_category: dict[tuple, list] = defaultdict(list)
         for fact in write_queue:
-            by_category[fact.get("category", "fact")].append(fact)
+            key = (fact["_dest_profile"], fact.get("category", "fact"))
+            by_profile_category[key].append(fact)
 
-        batch = _batch_write(dict(by_category), profile)
-        added_count = batch["written"]
-        guardrail_rejected = batch["rejected"]
+        total_written = 0
+        for (dest_profile, category), group in by_profile_category.items():
+            batch = _batch_write({category: group}, dest_profile)
+            total_written += batch["written"]
+            guardrail_rejected.extend(batch["rejected"])
+        added_count = total_written
+
         for fact in write_queue:
-            changes.append({"action": "added", "fact": fact.get("fact", "")[:80], "category": fact.get("category", "")})
+            changes.append({"action": "added", "fact": fact.get("fact", "")[:80],
+                            "category": fact.get("category", ""),
+                            "profile": fact["_dest_profile"]})
         for fact_text, reason in guardrail_rejected:
             changes.append({"action": "guardrail_rejected",
                             "fact": str(fact_text)[:80], "reason": reason})
     else:
-        # Preview mode: count what would be added
+        # Preview mode: count what would be added, with routed profile shown.
         added_count = len(write_queue)
         for fact in write_queue:
-            changes.append({"action": "would_add", "fact": fact.get("fact", "")[:80], "category": fact.get("category", "")})
+            changes.append({"action": "would_add", "fact": fact.get("fact", "")[:80],
+                            "category": fact.get("category", ""),
+                            "profile": fact["_dest_profile"]})
 
     return {
         "timestamp": datetime.now().isoformat(),
         "source": source,
         "profile": profile,
+        "routed_by_profile": dict(routed_by_profile),
         "added": added_count,
         "skipped_duplicate": skipped_count,
         "merged": merged_count,
