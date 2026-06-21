@@ -116,10 +116,16 @@ def _print_summary(report: dict, conv_count: int, flagged_count: int, elapsed: f
     print(f"Added:     {report['added']} new facts")
     print(f"Skipped:   {report['skipped_duplicate']} duplicates")
     print(f"Merged:    {report['merged']}")
+    if report.get("guardrail_rejected"):
+        print(f"Guardrail: {report['guardrail_rejected']} doc-shaped facts dropped")
     if flagged_count:
         print(f"Flagged:   {flagged_count} (review at {FLAGGED_QUEUE})")
     print(f"Escalated: {report['escalated_count']}")
     print(f"Rejected:  {report['rejected']}")
+    routed = report.get("routed_by_profile") or {}
+    if routed:
+        split = ", ".join(f"{p}: {n}" for p, n in sorted(routed.items(), key=lambda x: -x[1]))
+        print(f"Routed:    {split}")
     print(f"Time:      {elapsed:.1f}s")
     if report.get("preview"):
         print("\n[PREVIEW MODE — no writes performed]")
