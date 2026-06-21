@@ -20,6 +20,13 @@ from pathlib import Path
 # Allow importing local ingestion modules when run from other directories
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Skip the FastEmbed model load/backfill at store construction. This subprocess
+# writes via add_memory (which embeds each new memory on its own thread); paying
+# the one-time model download just to START UP would stall the run with no
+# output. Must be set BEFORE importing router/merger (which import server ->
+# constructs _store).
+os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+
 # Data dir: mutable state (db, logs, .env, inbox) — defaults to ~/memorybridge,
 # override with MEMORYBRIDGE_DATA. Code stays in the repo.
 import os
@@ -35,6 +42,7 @@ load_dotenv(Path(__file__).parent.parent / ".env", override=False)
 from parse_claude import parse as parse_claude
 from parse_chatgpt import parse as parse_chatgpt
 from parse_gemini import parse as parse_gemini
+from parse_hermes import parse as parse_hermes
 from extractor import extract, ExtractionError
 from router import route
 from resolver import resolve
@@ -44,6 +52,7 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(mes
 logger = logging.getLogger("run")
 
 PARSERS = {
+    "hermes": parse_hermes,
     "claude": parse_claude,
     "chatgpt": parse_chatgpt,
     "gemini": parse_gemini,
@@ -118,12 +127,20 @@ def _print_summary(report: dict, conv_count: int, flagged_count: int, elapsed: f
 
 def main():
     parser = argparse.ArgumentParser(description="MemoryBridge ingestion pipeline")
-    parser.add_argument("--source", required=True, choices=["claude", "chatgpt", "gemini"])
-    parser.add_argument("--file", required=True, help="Path to export file")
+    parser.add_argument("--source", required=True,
+                        choices=["hermes", "claude", "chatgpt", "gemini"])
+    parser.add_argument("--file", default=None,
+                        help="Path to export file (optional for hermes; "
+                             "defaults to ~/.hermes/state.db)")
     parser.add_argument("--days", type=int, default=None, help="Only process last N days")
     parser.add_argument("--profile", default="default", help="Memory profile to write to")
     parser.add_argument("--preview", action="store_true", help="Dry run — no writes")
     args = parser.parse_args()
+
+    # All sources except hermes read from an export file; hermes defaults to
+    # the local Hermes state.db when --file is omitted.
+    if args.file is None and args.source != "hermes":
+        parser.error(f"--file is required for source '{args.source}'")
 
     start = time.time()
 

@@ -14,8 +14,15 @@ add_memories = _add_memories_tool.fn
 
 logger = logging.getLogger(__name__)
 
-_EXACT_MATCH_THRESHOLD = 0.80   # search_memory match_score for "already exists"
-_KEYWORD_MERGE_THRESHOLD = 0.85  # keyword overlap for "close enough to merge"
+# Semantic match_score (embedding cosine via search_hybrid) is the reliable
+# duplicate signal — reworded dups like "$126 million in business impact" vs
+# "$126M in cumulative impact" share meaning but few exact words, so the keyword
+# path below can't catch them without also wrongly merging distinct facts.
+# Lowered 0.80 -> 0.72 so semantically-near facts collapse on the embedding
+# score. The keyword path stays HIGH (0.85) as a conservative exact-ish backstop
+# that never fires on merely-similar wording.
+_EXACT_MATCH_THRESHOLD = 0.72   # semantic match_score for "already exists / merge"
+_KEYWORD_MERGE_THRESHOLD = 0.85  # keyword overlap backstop (conservative)
 
 
 def _keyword_overlap(a: str, b: str) -> float:
@@ -56,12 +63,17 @@ def _write_fact(fact: dict, profile: str, preview: bool) -> str:
         return "error"
 
 
-def _batch_write(facts_by_category: dict, profile: str) -> int:
+def _batch_write(facts_by_category: dict, profile: str) -> dict:
     """
     Write groups of facts via add_memories (one call per category).
-    Returns total number of facts written.
+
+    Returns {"written": int, "rejected": [(fact, reason), ...]}. Counts the
+    rows actually inserted (add_memories skips exact duplicates AND
+    guardrail-rejected document-shaped facts) rather than the requested count,
+    and surfaces guardrail rejections so the backfill report is honest.
     """
     written = 0
+    rejected: list = []
     for category, group in facts_by_category.items():
         if not group:
             continue
@@ -71,17 +83,19 @@ def _batch_write(facts_by_category: dict, profile: str) -> int:
         fact_strings = [f["fact"] for f in group]
         project = next((f.get("project") for f in group if f.get("project")), None)
         try:
-            add_memories(
+            added = add_memories(
                 facts=fact_strings,
                 category=category,
                 importance=importance,
                 project=project,
                 profile=profile,
             )
-            written += len(fact_strings)
+            written += added if isinstance(added, int) else 0
+            # add_memories records guardrail-skipped facts on the store.
+            rejected.extend(getattr(_store, "last_rejected", []) or [])
         except Exception as e:
             logger.error("add_memories failed for category '%s': %s", category, e)
-    return written
+    return {"written": written, "rejected": rejected}
 
 
 def merge(accepted: list, resolved: list, source: str, profile: str = "default", preview: bool = False) -> dict:
@@ -161,15 +175,21 @@ def merge(accepted: list, resolved: list, source: str, profile: str = "default",
             else:
                 write_queue.append(fact)
 
+    guardrail_rejected = []
     if not preview:
         # Group by category for efficient batch writes
         by_category: dict[str, list] = defaultdict(list)
         for fact in write_queue:
             by_category[fact.get("category", "fact")].append(fact)
 
-        added_count = _batch_write(dict(by_category), profile)
+        batch = _batch_write(dict(by_category), profile)
+        added_count = batch["written"]
+        guardrail_rejected = batch["rejected"]
         for fact in write_queue:
             changes.append({"action": "added", "fact": fact.get("fact", "")[:80], "category": fact.get("category", "")})
+        for fact_text, reason in guardrail_rejected:
+            changes.append({"action": "guardrail_rejected",
+                            "fact": str(fact_text)[:80], "reason": reason})
     else:
         # Preview mode: count what would be added
         added_count = len(write_queue)
@@ -184,5 +204,6 @@ def merge(accepted: list, resolved: list, source: str, profile: str = "default",
         "skipped_duplicate": skipped_count,
         "merged": merged_count,
         "rejected": rejected_count,
+        "guardrail_rejected": len(guardrail_rejected),
         "changes": changes,
     }
