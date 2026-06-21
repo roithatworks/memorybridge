@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import sys
 from typing import Optional
 
 from openai import OpenAI
@@ -55,7 +56,14 @@ def _get_client() -> OpenAI:
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise ExtractionError("DEEPSEEK_API_KEY not set")
-    return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    # timeout: a non-responding API must fail, not hang the whole run forever.
+    # max_retries=2 covers transient network blips.
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com",
+        timeout=120.0,
+        max_retries=2,
+    )
 
 
 def _truncate_conversation(conv: dict) -> dict:
@@ -132,6 +140,10 @@ def extract(normalized: dict) -> list:
 
     for batch_idx, batch in enumerate(batches):
         logger.info("Extracting batch %d/%d (%d conversations)", batch_idx + 1, len(batches), len(batch))
+        # Always-visible progress (logger is at WARNING in the CLI, so info()
+        # alone is invisible — this is what makes a long run observable).
+        print(f"  [extract] batch {batch_idx + 1}/{len(batches)} "
+              f"({len(batch)} conversations)...", file=sys.stderr, flush=True)
         try:
             facts = _call_deepseek(client, batch)
         except Exception as e:

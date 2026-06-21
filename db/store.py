@@ -6,6 +6,7 @@ Tool signatures are unchanged — this is a drop-in persistence swap.
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import uuid
@@ -13,8 +14,20 @@ from datetime import datetime
 from pathlib import Path
 
 from db.constants import (  # noqa: E402
-    VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score
+    VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score,
+    guardrail_check
 )
+
+
+class GuardrailRejection(ValueError):
+    """Raised when content is document-shaped and rejected by the write path.
+
+    Carries the human-readable reason so callers (MCP tools, ingest pipeline)
+    can report why and route the content to a file instead of a memory.
+    """
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 SCHEMA_SQL = Path(__file__).parent / "schema.sql"
 
@@ -95,51 +108,77 @@ class MemoryStore:
             sqlite3.connect(str(db_path), check_same_thread=False)
         )
         self._conn.row_factory = sqlite3.Row
+        # WAL mode: lets a second connection (e.g. the ingestion subprocess)
+        # READ while the live MCP server holds a write, and vice-versa, instead
+        # of serializing all access. The class docstring already assumes WAL,
+        # but the pragma was never actually set — this enables it. Persists on
+        # the DB file once set, but assert it every open to be safe.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        # busy_timeout: when another connection still holds the write lock,
+        # wait up to N ms then raise sqlite3.OperationalError("database is
+        # locked") INSTEAD OF blocking forever. Without this the ingestion CLI
+        # hangs indefinitely whenever the server is running.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         # FK enforcement is OFF by default in SQLite and is per-connection —
         # without this, ON DELETE CASCADE (memory_embeddings) never fires.
         # Issue #4: 103/128 embeddings were orphaned because of this.
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(SCHEMA_SQL.read_text())
-        # executescript commits and can reset pragmas — re-assert.
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        # Pruner tables (idempotent CREATE IF NOT EXISTS)
-        from db.pruner import PRUNER_SCHEMA, bootstrap_rules
-        self._conn.executescript(PRUNER_SCHEMA)
-        bootstrap_rules(self._conn)
-        self._conn.commit()
-        # One-time hygiene (issue #4): purge embedding rows orphaned while FK
-        # enforcement was off. Idempotent and cheap on every startup.
-        self._conn.execute(
-            "DELETE FROM memory_embeddings "
-            "WHERE id NOT IN (SELECT id FROM memories)"
-        )
-        self._conn.commit()
-        # One-time repair (issue #3): the old manual FTS delete passed empty
-        # content, leaving ghost tokens for every deleted memory. Rebuild the
-        # index from the memories table once, marked in meta so it doesn't
-        # rerun on every startup.
-        rebuilt = self._conn.execute(
-            "SELECT value FROM meta WHERE key='fts_rebuilt_v1'"
-        ).fetchone()
-        if not rebuilt:
+
+        # Is the DB already initialized? If the schema exists, a second process
+        # (e.g. the ingestion CLI opening this DB while the server holds it)
+        # must NOT re-run the one-time schema/DELETE/rebuild writes — those grab
+        # the write lock and needlessly contend, which is what made the backfill
+        # hang. All of that work is idempotent hygiene guarded by meta flags, so
+        # on an already-initialized DB it's a no-op anyway. Fresh DBs (tests,
+        # first run) take the full path below unchanged.
+        already_init = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+        ).fetchone() is not None
+
+        if not already_init:
+            self._conn.executescript(SCHEMA_SQL.read_text())
+            # executescript commits and can reset pragmas — re-assert.
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            # Pruner tables (idempotent CREATE IF NOT EXISTS)
+            from db.pruner import PRUNER_SCHEMA, bootstrap_rules
+            self._conn.executescript(PRUNER_SCHEMA)
+            bootstrap_rules(self._conn)
+            self._conn.commit()
+            # One-time hygiene (issue #4): purge embedding rows orphaned while
+            # FK enforcement was off. Idempotent and cheap.
             self._conn.execute(
-                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
-            )
-            self._conn.execute(
-                "INSERT OR REPLACE INTO meta VALUES('fts_rebuilt_v1', ?)",
-                (datetime.now().isoformat(),)
+                "DELETE FROM memory_embeddings "
+                "WHERE id NOT IN (SELECT id FROM memories)"
             )
             self._conn.commit()
+            # One-time repair (issue #3): rebuild FTS once, marked in meta.
+            rebuilt = self._conn.execute(
+                "SELECT value FROM meta WHERE key='fts_rebuilt_v1'"
+            ).fetchone()
+            if not rebuilt:
+                self._conn.execute(
+                    "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta VALUES('fts_rebuilt_v1', ?)",
+                    (datetime.now().isoformat(),)
+                )
+                self._conn.commit()
+
         # Phase 4: lazy-loaded FastEmbed model (cached per-process)
         self._embed_model = None
         self._embed_lock = threading.Lock()
         # Issue #5: backfill embeddings for memories missing vectors, on a
         # background thread so startup isn't blocked by model load. New
-        # memories are embedded on write (see add_memory).
-        threading.Thread(
-            target=self._backfill_missing_embeddings,
-            daemon=True, name="embedding-backfill"
-        ).start()
+        # memories are embedded on write (see add_memory). Skipped when
+        # MEMORYBRIDGE_NO_EMBED is set — the ingestion subprocess writes via
+        # add_memory (which embeds per-memory) and must not pay the one-time
+        # model download just to start up.
+        if not os.environ.get("MEMORYBRIDGE_NO_EMBED"):
+            threading.Thread(
+                target=self._backfill_missing_embeddings,
+                daemon=True, name="embedding-backfill"
+            ).start()
 
     # -------------------------------------------------------------------------
     # Profiles
@@ -196,8 +235,18 @@ class MemoryStore:
 
     def add_memory(self, profile: str, content: str, *,
                    category: str = "fact", importance: str = "medium",
-                   tags: list = None, project_id: str = None) -> str | None:
-        """Returns memory ID on success, None if exact duplicate."""
+                   tags: list = None, project_id: str = None,
+                   enforce_guardrail: bool = True) -> str | None:
+        """Returns memory ID on success, None if exact duplicate.
+
+        Raises GuardrailRejection if content is document-shaped (too long, too
+        many lines, or markdown-heading/multi-section). Pass
+        enforce_guardrail=False only for trusted internal migrations.
+        """
+        if enforce_guardrail:
+            ok, reason = guardrail_check(content)
+            if not ok:
+                raise GuardrailRejection(reason)
         self.ensure_profile(profile)
         h = _content_hash(content)
         mid = _mem_id()
@@ -233,12 +282,20 @@ class MemoryStore:
     def add_memories(self, profile: str, facts: list[str], *,
                      category: str = "fact", importance: str = "medium",
                      project_id: str = None) -> int:
-        """Batch insert. Returns count of actually inserted rows."""
+        """Batch insert. Returns count of actually inserted rows.
+
+        Guardrail-rejected (document-shaped) facts are skipped, not fatal, and
+        recorded on self.last_rejected as [(fact, reason), ...] for the caller.
+        """
         added = 0
+        self.last_rejected = []
         for fact in facts:
-            if self.add_memory(profile, fact, category=category,
-                               importance=importance, project_id=project_id):
-                added += 1
+            try:
+                if self.add_memory(profile, fact, category=category,
+                                   importance=importance, project_id=project_id):
+                    added += 1
+            except GuardrailRejection as e:
+                self.last_rejected.append((fact, e.reason))
         return added
 
     def edit_memory(self, profile: str, memory_id: str, **kwargs) -> bool:

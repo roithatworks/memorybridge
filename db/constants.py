@@ -22,9 +22,14 @@ def effective_score(row: dict, now: datetime) -> float:
     """
     try:
         created = datetime.fromisoformat(row.get("created_at", ""))
+        # Strip tzinfo so subtraction works regardless of whether the stored
+        # timestamp has a UTC offset (Python 3.11+ fromisoformat parses "+00:00"
+        # as timezone-aware, which can't be subtracted from a naive datetime.now()).
+        created = created.replace(tzinfo=None)
     except Exception:
-        created = now
-    days_old = (now - created).days
+        created = now.replace(tzinfo=None)
+    now_naive = now.replace(tzinfo=None)
+    days_old = (now_naive - created).days
     decay = 0.5 ** (days_old / HALF_LIFE_DAYS)
     importance_boost = _IMPORTANCE_BOOSTS.get(row.get("importance", "medium"), 1.0)
     access_boost = 1 + min(row.get("access_count", 0) * 0.05, 0.5)
@@ -38,6 +43,54 @@ VALID_CATEGORIES = [
 ]
 
 IMPORTANCE_LEVELS = ["low", "medium", "high", "critical"]
+
+
+# --- Write-path guardrails -------------------------------------------------
+# A memory is a COMPRESSED FACT, not a document. These thresholds reject
+# document-shaped content at the write path so reference docs, prompt files,
+# and pasted essays never leak into the context-loaded store. Tune here.
+MAX_MEMORY_TOKENS = 500        # hard cap per memory; over this = "store as a file"
+MAX_MEMORY_NEWLINES = 15       # multi-section docs blow past this
+MAX_MEMORY_H2_SECTIONS = 2     # >=2 "## " headers means it's a document
+
+
+def guardrail_check(content: str) -> tuple[bool, str]:
+    """Deterministic gate for the memory write path.
+
+    Returns (ok, reason). ok=False means the content is document-shaped and
+    should be stored as a file (or compressed into a fact), NOT inserted as a
+    memory. Pure / zero-dependency so it is trivially unit-testable.
+    """
+    text = (content or "").strip()
+    if not text:
+        return False, "empty content"
+
+    tc = _count_tokens(text)
+    if tc > MAX_MEMORY_TOKENS:
+        return False, (
+            f"too long ({tc} tokens > {MAX_MEMORY_TOKENS} cap) — looks like a "
+            f"document; store as a file or compress into a fact"
+        )
+
+    if text.count("\n") >= MAX_MEMORY_NEWLINES:
+        return False, (
+            f"too many lines ({text.count(chr(10))} >= {MAX_MEMORY_NEWLINES}) — "
+            f"document-shaped, not a memory"
+        )
+
+    # Leading markdown title is the strongest document fingerprint.
+    stripped = text.lstrip()
+    if stripped.startswith(("# ", "## ", "### ")):
+        return False, "starts with a markdown heading — looks like a document, not a memory"
+
+    h2 = sum(1 for ln in text.splitlines() if ln.lstrip().startswith("## "))
+    if h2 >= MAX_MEMORY_H2_SECTIONS:
+        return False, (
+            f"has {h2} section headers (>= {MAX_MEMORY_H2_SECTIONS}) — "
+            f"multi-section document, not a memory"
+        )
+
+    return True, ""
 
 
 def _content_hash(content: str) -> str:
