@@ -133,6 +133,40 @@ _NOISE_PATTERNS = [
 ]
 _NOISE_RE = None
 
+# Infrastructure-plumbing trivia — durable but worthless as PORTABLE cross-LLM
+# memory: cron schedules, launchd jobs, script internals, capture-pipeline
+# mechanics. Distinct from ephemeral noise (these don't change minute-to-minute)
+# but no other LLM needs to know the morning-brief cron fires at 9:07. Dropped
+# only when the fact reads like local automation plumbing — see _is_infra_trivia.
+_INFRA_TRIVIA_PATTERNS = [
+    r"\bcron (job|jobs|schedule|scheduling)\b",
+    r"\blaunchd\b", r"\blingon\b",
+    r"\bruns (daily|weekly|every|at \d|on (mon|tue|wed|thu|fri|sat|sun))",
+    r"\bscheduled (cron|job|task|run)\b",
+    r"\b(morning brief|ops radar|capture inbox|document scan|weekly review)\b.*\b(run|cron|schedule|\d(am|pm|:\d))",
+    r"\b\w+\.py\b script",   # "<script>.py script ..." internals
+    r"\bdelivers? (results?|to) telegram\b",
+    r"\bdaemon (is|is not|runs)\b",
+    r"\bauto-start", r"\bbackground service\b",
+]
+_INFRA_RE = None
+# Projects whose facts are local-automation plumbing. Infra-trivia filtering is
+# scoped to these so it never touches business/identity/job-search facts.
+_INFRA_PROJECTS = {"hermes agent", "hermes"}
+
+
+def _is_infra_trivia(fact_text: str, project_id) -> bool:
+    """True if the fact is local automation/plumbing trivia (cron/script/launchd)
+    belonging to a Hermes-infra project — durable but useless cross-LLM."""
+    global _INFRA_RE
+    if _INFRA_RE is None:
+        import re
+        _INFRA_RE = re.compile("|".join(_INFRA_TRIVIA_PATTERNS), re.IGNORECASE)
+    proj = (str(project_id or "")).strip().lower()
+    if proj not in _INFRA_PROJECTS:
+        return False
+    return bool(_INFRA_RE.search(fact_text or ""))
+
 
 def _is_noise(fact_text: str) -> bool:
     """True if the fact is ephemeral operational telemetry, not durable memory."""
@@ -181,6 +215,10 @@ def extract(normalized: dict) -> list:
                 continue
             # Drop ephemeral operational telemetry — it's not durable memory.
             if _is_noise(fact.get("fact", "")):
+                continue
+            # Drop Hermes-infra plumbing trivia (cron/script/launchd internals)
+            # — durable but useless as portable cross-LLM memory.
+            if _is_infra_trivia(fact.get("fact", ""), fact.get("project")):
                 continue
             if "source_conversation_id" not in fact:
                 fact["source_conversation_id"] = batch[0].get("id", "")
