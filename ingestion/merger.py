@@ -86,19 +86,39 @@ def _batch_write(facts_by_category: dict, profile: str) -> dict:
         fact_strings = [f["fact"] for f in group]
         project = next((f.get("project") for f in group if f.get("project")), None)
         try:
-            added = add_memories(
+            result = add_memories(
                 facts=fact_strings,
                 category=category,
                 importance=importance,
                 project=project,
                 profile=profile,
             )
-            written += added if isinstance(added, int) else 0
+            written += _count_added(result)
             # add_memories records guardrail-skipped facts on the store.
             rejected.extend(getattr(_store, "last_rejected", []) or [])
         except Exception as e:
             logger.error("add_memories failed for category '%s': %s", category, e)
     return {"written": written, "rejected": rejected}
+
+
+def _count_added(result) -> int:
+    """Extract the real inserted count from add_memories' return value.
+
+    The add_memories MCP tool returns a JSON *string* like
+    {"status": "updated", "count": N, ...} — NOT an int. The old code did
+    `isinstance(result, int)` which was always False, so `added` was always 0
+    (this is why the footer reported "Added: 0" while facts wrote fine).
+    """
+    if isinstance(result, int):
+        return result
+    if isinstance(result, dict):
+        return int(result.get("count", 0))
+    if isinstance(result, str):
+        try:
+            return int(json.loads(result).get("count", 0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return 0
+    return 0
 
 
 def merge(accepted: list, resolved: list, source: str, profile: str = "default", preview: bool = False) -> dict:
