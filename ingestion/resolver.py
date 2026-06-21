@@ -28,6 +28,46 @@ def _get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=api_key)
 
 
+# Model auto-resolution: model aliases get retired (claude-3-5-sonnet-latest
+# 404'd and silently killed every resolution). Rather than hard-pin and rot,
+# we resolve the model once per run: try RESOLVER_MODEL; if it 404s, query the
+# Models API for the newest available Sonnet and use that. Cached for the run.
+_RESOLVED_MODEL = None
+
+
+def _pick_model(client: anthropic.Anthropic) -> str:
+    """Return a working model id. Prefers RESOLVER_MODEL; auto-falls-back to the
+    newest Sonnet from the Models API if the configured one is unavailable."""
+    global _RESOLVED_MODEL
+    if _RESOLVED_MODEL:
+        return _RESOLVED_MODEL
+
+    # 1. Try the configured model with a 1-token ping.
+    try:
+        client.messages.create(model=RESOLVER_MODEL, max_tokens=1,
+                               messages=[{"role": "user", "content": "hi"}])
+        _RESOLVED_MODEL = RESOLVER_MODEL
+        return _RESOLVED_MODEL
+    except Exception as e:
+        logger.warning("Configured RESOLVER_MODEL '%s' unavailable (%s) — "
+                       "auto-selecting newest Sonnet", RESOLVER_MODEL, str(e)[:60])
+
+    # 2. Ask the Models API for the newest Sonnet (models list is newest-first).
+    try:
+        models = client.models.list(limit=50)
+        sonnets = [m.id for m in models.data if "sonnet" in m.id.lower()]
+        if sonnets:
+            _RESOLVED_MODEL = sonnets[0]
+            logger.warning("Resolver now using auto-selected model: %s", _RESOLVED_MODEL)
+            return _RESOLVED_MODEL
+    except Exception as e:
+        logger.error("Model auto-selection failed: %s", e)
+
+    # 3. Last resort: use the configured name and let calls error visibly.
+    _RESOLVED_MODEL = RESOLVER_MODEL
+    return _RESOLVED_MODEL
+
+
 def _build_user_message(fact: dict) -> str:
     parts = [f"New fact: {fact.get('fact', '')}"]
     if fact.get("conflicts_with"):
@@ -40,18 +80,50 @@ def _build_user_message(fact: dict) -> str:
 def _resolve_one(client: anthropic.Anthropic, fact: dict) -> dict:
     """Call Claude and return the verdict dict."""
     msg = client.messages.create(
-        model=RESOLVER_MODEL,
+        model=_pick_model(client),
         max_tokens=256,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": _build_user_message(fact)}],
     )
     raw = msg.content[0].text.strip()
-    try:
-        verdict = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("Claude resolver returned bad JSON for fact '%s...' — rejecting", fact.get("fact", "")[:40])
+    verdict = _parse_verdict(raw)
+    if verdict is None:
+        logger.warning("Claude resolver returned unparseable JSON for fact '%s...' — rejecting",
+                       fact.get("fact", "")[:40])
         verdict = {"verdict": "reject", "merged_fact": None}
     return verdict
+
+
+def _parse_verdict(raw: str):
+    """Parse the resolver verdict, tolerating markdown fences and preamble.
+
+    Newer Claude models wrap JSON in ```json ... ``` fences (and sometimes add
+    a sentence), even when asked not to. The old 3.5 model returned bare JSON,
+    so the original json.loads(raw) rejected every modern response. Strip the
+    fence, then fall back to extracting the first {...} object.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    # Strip a leading ```json / ``` fence and trailing ```.
+    if text.startswith("```"):
+        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.lstrip("`")
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+        text = text.strip().rstrip("`").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Last resort: grab the first {...} block anywhere in the response.
+    import re
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 def resolve(escalated: list) -> list:

@@ -117,6 +117,32 @@ def _call_deepseek(client: OpenAI, conversations: list) -> list:
             return []
 
 
+# Ephemeral operational telemetry — transient system state that has no durable
+# memory value (cron run results, resource gauges, "nothing happened today").
+# Dropped at extraction so it never reaches the store or the router. Tune here.
+_NOISE_PATTERNS = [
+    r"\bload average", r"\bdisk usage", r"\bdisk space",
+    r"\bhomebrew\b.*\b(outdated|packages?|upgrade)", r"\bbrew (outdated|upgrade)",
+    r"\bno (git )?commits?\b", r"\bno new commits?\b",
+    r"\bcron job (ran|completed|executed|fired)\b",
+    r"\bsystem (load|was rebooted|reboot)", r"\brebooted\b",
+    r"\buptime\b", r"\bswap usage", r"\bmemory usage (is|was|spiked)",
+    r"\bran (successfully|without error)\b.*\b(today|this morning)\b",
+    r"\bfluctuat", r"\bspiked to \d", r"\bstays around \d+%",
+    r"\bbattery (level|is at)",
+]
+_NOISE_RE = None
+
+
+def _is_noise(fact_text: str) -> bool:
+    """True if the fact is ephemeral operational telemetry, not durable memory."""
+    global _NOISE_RE
+    if _NOISE_RE is None:
+        import re
+        _NOISE_RE = re.compile("|".join(_NOISE_PATTERNS), re.IGNORECASE)
+    return bool(_NOISE_RE.search(fact_text or ""))
+
+
 def extract(normalized: dict) -> list:
     """
     Extract facts from all conversations in a normalized export.
@@ -152,6 +178,9 @@ def extract(normalized: dict) -> list:
         # Tag each fact with the first conversation id in the batch as a rough source
         for fact in facts:
             if not isinstance(fact, dict):
+                continue
+            # Drop ephemeral operational telemetry — it's not durable memory.
+            if _is_noise(fact.get("fact", "")):
                 continue
             if "source_conversation_id" not in fact:
                 fact["source_conversation_id"] = batch[0].get("id", "")
