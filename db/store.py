@@ -10,13 +10,18 @@ import os
 import sqlite3
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from db.constants import (  # noqa: E402
     VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score,
-    guardrail_check
+    guardrail_check, _merge_tags, _max_importance
 )
+from db.entities import EntityExtractor
 
 
 class GuardrailRejection(ValueError):
@@ -99,8 +104,35 @@ class MemoryStore:
         mid = store.add_memory("default", "Cale prefers dark mode", category="preference")
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, entity_extractor: EntityExtractor | None = None,
+                 merge_threshold: float = 0.35, merge_min_tags: int = 2,
+                 recency_decay_days: int = 0,
+                 llm_synthesize: Callable | None = None):
+        """Initialize MemoryStore.
+
+        *db_path* — path to the SQLite database file.
+        *entity_extractor* — optional ``EntityExtractor`` instance. When set,
+        ``add_memory`` automatically extracts entity tags from content and
+        merges them with caller-supplied tags. Pass ``False`` to disable
+        even if a default extractor is configured.
+        *merge_threshold* — Jaccard similarity threshold for fuzzy dedup
+        (0.0 = never merge, 1.0 = only merge identical content). Default 0.35.
+        *merge_min_tags* — minimum shared entity tags required to consider
+        two memories as related for fuzzy dedup. Default 2.
+        *recency_decay_days* — half-life in days for recency weighting in
+        search results. 0 (default) = no recency boost. Higher values = slower
+        decay (older memories stay relevant longer).
+        *llm_synthesize* — optional callable ``(question, memory_text) -> str``
+        for the ``reflect()`` synthesis tool. If ``None``, uses keyword-based
+        fallback.
+        """
         self._path = db_path
+        self._entity_extractor = entity_extractor
+        self._merge_threshold = merge_threshold
+        self._merge_min_tags = merge_min_tags
+        self._recency_decay_days = recency_decay_days
+        self._llm_synthesize = llm_synthesize
+        self._reflector: Any = None
         db_path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False is safe only because _LockedConnection
         # serializes every statement (issue #6).
@@ -252,6 +284,22 @@ class MemoryStore:
         mid = _mem_id()
         now = datetime.now().isoformat()
         tc = _count_tokens(content)
+
+        # Entity extraction: if an EntityExtractor is configured, extract
+        # entity tags from content and merge with caller-supplied tags.
+        enriched_tags: list[str] | None = tags
+        if self._entity_extractor:
+            entity_tags = self._entity_extractor.extract(content)
+            if entity_tags:
+                enriched_tags = _merge_tags(tags or [], entity_tags)
+
+        # Fuzzy dedup/merge: check for near-duplicate by entity tag overlap
+        # + content similarity. Runs after entity extraction (tags available)
+        # but before INSERT so we can redirect to UPDATE.
+        merged_id = self._maybe_merge(profile, content, enriched_tags or [])
+        if merged_id:
+            return merged_id
+
         try:
             # Hold the lock across INSERT + FTS sync + commit so another
             # thread's commit can't land mid-sequence (issue #6).
@@ -262,7 +310,7 @@ class MemoryStore:
                         created_at,last_accessed,tags,project_id,token_count)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (mid, profile, content, h, category, importance,
-                     now, now, json.dumps(tags or []), project_id, tc)
+                     now, now, json.dumps(enriched_tags or []), project_id, tc)
                 )
                 # FTS sync handled by memories_ai trigger (issue #3)
                 self._conn.commit()
@@ -278,6 +326,90 @@ class MemoryStore:
         except sqlite3.IntegrityError:
             self._conn.rollback()
             return None  # duplicate content_hash
+
+    # -------------------------------------------------------------------------
+    # Fuzzy dedup / merge
+    # -------------------------------------------------------------------------
+
+    def _maybe_merge(self, profile: str, content: str,
+                     enriched_tags: list[str]) -> str | None:
+        """Check for a near-duplicate memory and merge if found.
+
+        Uses entity tags (from step 1) + Jaccard content similarity.
+        Returns existing memory ID if merged, ``None`` if no match.
+
+        Disabled when ``merge_threshold`` is 0.0 or content has no entity tags.
+        """
+        if self._merge_threshold <= 0.0:
+            return None
+
+        # Need entity tags to find candidates — pure keyword content can't
+        # reliably disambiguate "is this the same topic?"
+        entity_tags = [t for t in enriched_tags if t.startswith("entity:")]
+        if len(entity_tags) < self._merge_min_tags:
+            return None
+
+        # Find candidate memories sharing ≥ merge_min_tags entity tags.
+        tag_list = ",".join(f"'{t}'" for t in entity_tags)
+        try:
+            rows = self._conn.execute(
+                f"""SELECT m.id, m.content, m.importance, m.tags,
+                           COUNT(DISTINCT jt.value) AS shared
+                    FROM memories m, json_each(m.tags) AS jt
+                    WHERE m.profile = ?
+                      AND m.archived = 0
+                      AND jt.value IN ({tag_list})
+                    GROUP BY m.id
+                    HAVING shared >= ?
+                    ORDER BY shared DESC
+                    LIMIT 5""",
+                (profile, self._merge_min_tags),
+            ).fetchall()
+        except Exception:
+            return None  # json_each may fail on old SQLite — fail-soft
+
+        if not rows:
+            return None
+
+        # Score each candidate by Jaccard similarity
+        best_id: str | None = None
+        best_sim = 0.0
+        best_row = None
+        for row in rows:
+            sim = _jaccard_similarity(content, row["content"])
+            if sim > best_sim:
+                best_sim = sim
+                best_id = row["id"]
+                best_row = row
+
+        if best_sim < self._merge_threshold:
+            return None
+
+        # Merge: append new info annotation, bump importance and timestamp
+        now = datetime.now().isoformat()
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        merge_note = f"\n[merged: {date_str}] {content.strip()}"
+        # Keep the higher importance level
+        final_imp = _max_importance(best_row["importance"], "medium")
+
+        try:
+            with self._conn.transaction():
+                self._conn.execute(
+                    """UPDATE memories
+                       SET content = content || ?,
+                           importance = ?,
+                           last_accessed = ?,
+                           access_count = access_count + 1
+                       WHERE id = ? AND profile = ?""",
+                    (merge_note, final_imp, now, best_id, profile),
+                )
+                self._conn.commit()
+            logger.info("Merged new content into existing memory %s (sim=%.2f)",
+                        best_id, best_sim)
+            return best_id
+        except Exception:
+            logger.exception("Merge UPDATE failed for best_id=%s", best_id)
+            return None
 
     def add_memories(self, profile: str, facts: list[str], *,
                      category: str = "fact", importance: str = "medium",
@@ -859,11 +991,17 @@ class MemoryStore:
 
     def search_hybrid(self, profile: str, query: str,
                       category: str = None,
-                      limit: int = 5, max_tokens: int = 800) -> list[dict]:
+                      limit: int = 5, max_tokens: int = 800,
+                      recency_boost: bool = True,
+                      include_related: bool = True) -> list[dict]:
         """
         Reciprocal Rank Fusion of FTS5 BM25 + semantic cosine results.
         RRF score = sum(1 / (60 + rank)) across both lists.
         Falls back to FTS5-only if no embeddings built.
+
+        *recency_boost* — when True (default), applies recency weighting.
+        *include_related* — when True (default), expands results with
+        entity-tag-related memories.
         """
         keyword_results = self.search(profile, query, category=category,
                                       limit=limit * 2, max_tokens=max_tokens * 2)
@@ -887,6 +1025,7 @@ class MemoryStore:
 
         ranked = sorted(scores, key=lambda k: scores[k], reverse=True)
 
+        # Build result list with recency adjustment
         results, tokens_used = [], 0
         for mid in ranked:
             mem = all_mems[mid]
@@ -896,7 +1035,42 @@ class MemoryStore:
                 tokens_used += mem["token_count"]
             if len(results) >= limit:
                 break
+
+        # Apply recency weighting if configured (re-ranks within search results)
+        if recency_boost and self._recency_decay_days > 0 and results:
+            results = self._re_rank_by_recency(results)
+
+        # Expand with related memories by entity tag overlap
+        if include_related and results:
+            results = self._expand_related(results, profile)
+
         return results
+
+    # -------------------------------------------------------------------------
+    # Reflect — synthesis tool
+    # -------------------------------------------------------------------------
+
+    def reflect(self, profile: str, question: str,
+                limit: int = 15, max_tokens: int = 3000) -> dict[str, Any]:
+        """Synthesize a reasoned answer from memories.
+
+        Retrieves relevant memories and produces a structured synthesis.
+        Uses the configured ``llm_synthesize`` callable if provided, otherwise
+        falls back to keyword-based summary.
+
+        Returns a dict with keys: question, key_facts, dates, preferences,
+        contradictions, confidence, raw_synthesis, memory_count, entity_groups.
+        """
+        from db.reflect import Reflector
+
+        if self._reflector is None:
+            self._reflector = Reflector(
+                search_fn=lambda q: self.search_hybrid(
+                    profile, q, limit=limit, max_tokens=max_tokens
+                ),
+                llm_synthesize=self._llm_synthesize,
+            )
+        return self._reflector.reflect(question)
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -907,3 +1081,103 @@ class MemoryStore:
         if isinstance(m.get("tags"), str):
             m["tags"] = json.loads(m["tags"])
         return m
+
+    def _re_rank_by_recency(self, results: list[dict]) -> list[dict]:
+        """Re-rank search results by recency-adjusted score.
+
+        Each result's relevance score is multiplied by an exponential decay
+        factor: ``0.5 ** (days_old / recency_decay_days)`` (same formula as
+        ``effective_score`` in constants.py). Results are re-sorted by the
+        adjusted score.
+
+        Only results with a ``created_at`` field are affected — memories
+        without a valid timestamp keep their original rank.
+        """
+        if not results or self._recency_decay_days <= 0:
+            return results
+
+        now = datetime.now().replace(tzinfo=None)
+        half_life = float(self._recency_decay_days)
+
+        scored: list[tuple[float, int, dict]] = []
+        for idx, mem in enumerate(results):
+            raw_score = mem.get("match_score", 0.5)
+            created = mem.get("created_at", "")
+            if created:
+                try:
+                    dt = datetime.fromisoformat(created).replace(tzinfo=None)
+                    days_old = (now - dt).total_seconds() / 86400.0
+                    recency_factor = 0.5 ** (days_old / half_life)
+                    adjusted = raw_score * recency_factor
+                except (ValueError, TypeError):
+                    adjusted = raw_score
+            else:
+                adjusted = raw_score
+            scored.append((adjusted, idx, mem))
+
+        # Sort by adjusted score descending, then original index as tiebreak
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [mem for _, _, mem in scored]
+
+    def _expand_related(self, results: list[dict], profile: str,
+                        max_related: int = 3) -> list[dict]:
+        """Expand search results with related memories by entity tag overlap.
+
+        Collects all entity tags from the primary results, then finds
+        additional memories that share ≥2 of those tags. Related results
+        are appended after primary results with a ``related: true`` flag.
+
+        Skips memories already in the primary result set. Caps at
+        ``max_related`` additional results.
+        """
+        if not results or max_related <= 0:
+            return results
+
+        # Collect all entity tags from primary results
+        all_entity_tags: set[str] = set()
+        existing_ids: set[str] = set()
+        for mem in results:
+            existing_ids.add(mem["id"])
+            tags = mem.get("tags", [])
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("entity:"):
+                    all_entity_tags.add(tag)
+
+        if len(all_entity_tags) < 2:
+            return results  # Not enough entity signal
+
+        # Query for memories sharing ≥2 entity tags
+        tag_list = ",".join(f"'{t}'" for t in all_entity_tags)
+        try:
+            rows = self._conn.execute(
+                f"""SELECT m.*, COUNT(DISTINCT jt.value) AS shared
+                    FROM memories m, json_each(m.tags) AS jt
+                    WHERE m.profile = ?
+                      AND m.archived = 0
+                      AND jt.value IN ({tag_list})
+                    GROUP BY m.id
+                    HAVING shared >= 2
+                    ORDER BY shared DESC, m.relevance_score DESC
+                    LIMIT ?""",
+                (profile, max_related * 2),
+            ).fetchall()
+        except Exception as e:
+            logger.debug("Related expansion query failed: %s", e)
+            return results
+
+        related: list[dict] = []
+        for row in rows:
+            mem = self._row_to_dict(row)
+            if mem["id"] in existing_ids:
+                continue
+            mem["related"] = True
+            mem["match_score"] = row["shared"] / max(len(all_entity_tags), 1)
+            related.append(mem)
+            existing_ids.add(mem["id"])
+            if len(related) >= max_related:
+                break
+
+        if not related:
+            return results
+
+        return results + related
