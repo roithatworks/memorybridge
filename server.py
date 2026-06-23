@@ -128,8 +128,20 @@ atexit.register(_cleanup_pid)
 # STORE — SQLite singleton
 # =============================================================================
 from db.store import MemoryStore  # noqa: E402
+from db.entities import EntityExtractor  # noqa: E402
 
-_store = MemoryStore(MEMORY_DB)
+# Entity config: DATA_DIR/entities.json overrides defaults
+_entities_path = DATA_DIR / "entities.json"
+_entity_extractor = EntityExtractor(
+    config_path=_entities_path if _entities_path.exists() else None
+)
+# Recency decay: env var or 30-day default
+_recency_decay_days = int(os.environ.get("MEMORYBRIDGE_RECENCY_DAYS", "30"))
+_store = MemoryStore(
+    MEMORY_DB,
+    entity_extractor=_entity_extractor,
+    recency_decay_days=_recency_decay_days,
+)
 
 
 def log_to_analytics(tokens_served: int, memories_returned: int,
@@ -523,7 +535,9 @@ def search_memory(
     category: Optional[str] = None,
     limit: int = SEARCH_LIMIT_DEFAULT,
     max_tokens: int = SEARCH_MAX_TOKENS_DEFAULT,
-    profile: str = None
+    profile: str = None,
+    recency_boost: bool = True,
+    include_related: bool = False,
 ) -> str:
     """
     Search memories using FTS5 BM25 with optional token budget.
@@ -534,6 +548,8 @@ def search_memory(
         limit: Max results (default 5)
         max_tokens: Token cap (default 800)
         profile: Memory profile
+        recency_boost: Apply recency weighting (default: true when configured)
+        include_related: Include related memories by entity tag overlap (default: false)
     Returns:
         JSON with ranked results (internal fields stripped)
     """
@@ -545,7 +561,9 @@ def search_memory(
 
     # Phase 4: hybrid BM25 + semantic search (falls back to FTS5 if no embeddings built)
     results = _store.search_hybrid(profile, query, category=category,
-                                   limit=limit, max_tokens=max_tokens)
+                                   limit=limit, max_tokens=max_tokens,
+                                   recency_boost=recency_boost,
+                                   include_related=include_related)
 
     # Boost relevance score for all returned memories in a single commit (issue #12)
     _store.boost_batch(profile, [m["id"] for m in results],
@@ -568,6 +586,35 @@ def search_memory(
         "total_matches": len(results),
         "tokens_served": tokens_served
     }, indent=2)
+
+
+@mcp.tool()
+def reflect(
+    question: str,
+    profile: str = None,
+    limit: int = 15,
+    max_tokens: int = 3000,
+) -> str:
+    """
+    Synthesize a reasoned answer from memories.
+
+    Retrieves relevant memories, groups by entity tag, and produces a
+    structured synthesis (key facts, dates, preferences, contradictions,
+    confidence). Uses keyword-based fallback when no LLM is configured.
+
+    Args:
+        question: The question to reflect on
+        profile: Memory profile (default: current)
+        limit: Max memories to consider (default 15)
+        max_tokens: Token cap for memory context (default 3000)
+    Returns:
+        JSON with structured synthesis
+    """
+    profile = profile or _current_profile
+    _store.ensure_profile(profile)
+
+    result = _store.reflect(profile, question, limit=limit, max_tokens=max_tokens)
+    return json.dumps(result, indent=2, default=str)
 
 
 @mcp.tool()
@@ -1195,7 +1242,7 @@ def _start_parent_watchdog() -> None:
 # model must not be able to destroy memories; destructive and subprocess-
 # spawning tools stay stdio/Claude-local.
 REMOTE_ALLOWED_TOOLS = {
-    "get_memory", "search_memory", "add_memory", "add_memories", "edit_memory",
+    "get_memory", "search_memory", "reflect", "add_memory", "add_memories", "edit_memory",
     "list_projects", "export_passport",
 }
 

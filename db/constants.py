@@ -106,3 +106,29 @@ def _count_tokens(text: str) -> int:
         return len(enc.encode(text)) + 20
     except Exception:
         return len(text.split()) + 20
+
+
+def _merge_tags(*tag_lists: list[str]) -> list[str]:
+    """Merge and deduplicate tag lists.
+
+    Each tag is stripped and lowercased. Returns a flat deduplicated list
+    preserving the order of first appearance.
+    Useful for merging caller-supplied tags with auto-extracted entity tags.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for tags in tag_lists:
+        for tag in (tags or []):
+            t = tag.strip().lower()
+            if t and t not in seen:
+                seen.add(t)
+                result.append(t)
+    return result
+
+
+_IMPORTANCE_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+
+def _max_importance(a: str, b: str) -> str:
+    """Return the higher of two importance levels."""
+    return a if _IMPORTANCE_RANK.get(a, 0) >= _IMPORTANCE_RANK.get(b, 0) else b
