@@ -120,7 +120,10 @@ def _sigterm_handler(signum, frame) -> None:
     os._exit(0)
 
 
-signal.signal(signal.SIGTERM, _sigterm_handler)
+# Register SIGTERM handler at module level (guarded for non-main imports
+# such as Streamlit UI pages that import server functions).
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 atexit.register(_cleanup_pid)
 
 
