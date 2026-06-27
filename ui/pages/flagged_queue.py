@@ -58,7 +58,7 @@ def accept_item(item_id: str, queue_path: Path = None) -> bool:
         category=item.get("category", "fact"),
         importance=item.get("importance", "medium"),
         project_id=item.get("project"),
-        profile="default",
+        profile=item.get("profile", "default"),
     )
     item["status"] = "accepted"
     save_queue(data, queue_path)
@@ -94,7 +94,7 @@ def batch_accept(queue_path: Path = None) -> int:
                 category=item.get("category", "fact"),
                 importance=item.get("importance", "medium"),
                 project_id=item.get("project"),
-                profile="default",
+                profile=item.get("profile", "default"),
             )
             item["status"] = "accepted"
             count += 1

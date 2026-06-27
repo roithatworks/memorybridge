@@ -124,3 +124,39 @@ def test_category_filter(db):
     prefs = db.get_memories("default", category="preference")
     assert len(prefs) == 1
     assert prefs[0]["content"] == "A preference"
+
+
+def test_search_populates_match_score(db):
+    db.add_memory("default", "Cale prefers dark mode in his IDE", category="preference")
+    
+    # 1. Test keyword search match_score (Jaccard fallback)
+    results_keyword = db.search("default", "dark mode IDE")
+    assert len(results_keyword) > 0
+    assert "match_score" in results_keyword[0]
+    assert results_keyword[0]["match_score"] > 0.0
+
+    # 2. Test semantic/hybrid search match_score
+    db.build_embeddings("default")
+    results_semantic = db.search_semantic("default", "dark mode IDE")
+    assert len(results_semantic) > 0
+    assert "match_score" in results_semantic[0]
+    assert results_semantic[0]["match_score"] > 0.0
+
+    results_hybrid = db.search_hybrid("default", "dark mode IDE")
+    assert len(results_hybrid) > 0
+    assert "match_score" in results_hybrid[0]
+    assert results_hybrid[0]["match_score"] > 0.0
+
+
+def test_edit_memory_integrity_error_dedup(db):
+    mid1 = db.add_memory("default", "Unique content one", category="fact")
+    mid2 = db.add_memory("default", "Unique content two", category="fact")
+    
+    # Edit mid2 to match mid1's content: should fail safely (return False) instead of raising IntegrityError
+    success = db.edit_memory("default", mid2, content="Unique content one")
+    assert success is False
+    
+    # Assert content of mid2 remains unchanged
+    mems = db.get_memories("default")
+    m2 = next(m for m in mems if m["id"] == mid2)
+    assert m2["content"] == "Unique content two"

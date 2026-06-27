@@ -17,6 +17,16 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+# Allow importing local ingestion modules when run from other directories
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Skip the FastEmbed model load/backfill at store construction. This subprocess
+# writes via add_memory (which embeds each new memory on its own thread); paying
+# the one-time model download just to START UP would stall the run with no
+# output. Must be set BEFORE importing router/merger (which import server ->
+# constructs _store).
+os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+
 # Data dir: mutable state (db, logs, .env, inbox) — defaults to ~/memorybridge,
 # override with MEMORYBRIDGE_DATA. Code stays in the repo.
 import os
@@ -32,6 +42,7 @@ load_dotenv(Path(__file__).parent.parent / ".env", override=False)
 from parse_claude import parse as parse_claude
 from parse_chatgpt import parse as parse_chatgpt
 from parse_gemini import parse as parse_gemini
+from parse_hermes import parse as parse_hermes
 from extractor import extract, ExtractionError
 from router import route
 from resolver import resolve
@@ -41,6 +52,7 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(mes
 logger = logging.getLogger("run")
 
 PARSERS = {
+    "hermes": parse_hermes,
     "claude": parse_claude,
     "chatgpt": parse_chatgpt,
     "gemini": parse_gemini,
@@ -51,7 +63,7 @@ LOGS_DIR = MEMORYBRIDGE_DIR / "logs"
 FLAGGED_QUEUE = MEMORYBRIDGE_DIR / "flagged_queue.json"
 
 
-def _write_flagged(flagged: list, source: str) -> None:
+def _write_flagged(flagged: list, source: str, profile: str) -> None:
     """Append flagged items to flagged_queue.json."""
     if not flagged:
         return
@@ -74,6 +86,7 @@ def _write_flagged(flagged: list, source: str) -> None:
             "project": fact.get("project"),
             "source_conversation_id": fact.get("source_conversation_id", ""),
             "source": source,
+            "profile": profile,
             "status": "pending",
         })
 
@@ -103,10 +116,16 @@ def _print_summary(report: dict, conv_count: int, flagged_count: int, elapsed: f
     print(f"Added:     {report['added']} new facts")
     print(f"Skipped:   {report['skipped_duplicate']} duplicates")
     print(f"Merged:    {report['merged']}")
+    if report.get("guardrail_rejected"):
+        print(f"Guardrail: {report['guardrail_rejected']} doc-shaped facts dropped")
     if flagged_count:
         print(f"Flagged:   {flagged_count} (review at {FLAGGED_QUEUE})")
     print(f"Escalated: {report['escalated_count']}")
     print(f"Rejected:  {report['rejected']}")
+    routed = report.get("routed_by_profile") or {}
+    if routed:
+        split = ", ".join(f"{p}: {n}" for p, n in sorted(routed.items(), key=lambda x: -x[1]))
+        print(f"Routed:    {split}")
     print(f"Time:      {elapsed:.1f}s")
     if report.get("preview"):
         print("\n[PREVIEW MODE — no writes performed]")
@@ -114,12 +133,20 @@ def _print_summary(report: dict, conv_count: int, flagged_count: int, elapsed: f
 
 def main():
     parser = argparse.ArgumentParser(description="MemoryBridge ingestion pipeline")
-    parser.add_argument("--source", required=True, choices=["claude", "chatgpt", "gemini"])
-    parser.add_argument("--file", required=True, help="Path to export file")
+    parser.add_argument("--source", required=True,
+                        choices=["hermes", "claude", "chatgpt", "gemini"])
+    parser.add_argument("--file", default=None,
+                        help="Path to export file (optional for hermes; "
+                             "defaults to ~/.hermes/state.db)")
     parser.add_argument("--days", type=int, default=None, help="Only process last N days")
     parser.add_argument("--profile", default="default", help="Memory profile to write to")
     parser.add_argument("--preview", action="store_true", help="Dry run — no writes")
     args = parser.parse_args()
+
+    # All sources except hermes read from an export file; hermes defaults to
+    # the local Hermes state.db when --file is omitted.
+    if args.file is None and args.source != "hermes":
+        parser.error(f"--file is required for source '{args.source}'")
 
     start = time.time()
 
@@ -179,7 +206,7 @@ def main():
 
     # 6. Write flagged queue and log (skip in preview)
     if not args.preview:
-        _write_flagged(flagged, args.source)
+        _write_flagged(flagged, args.source, args.profile)
         log_path = _write_log(report, len(flagged), len(escalated))
         print(f"  Log written to {log_path}")
 
@@ -207,5 +234,4 @@ def main():
 
 if __name__ == "__main__":
     # Allow running from repo root: python ingestion/run.py
-    sys.path.insert(0, str(Path(__file__).parent))
     main()

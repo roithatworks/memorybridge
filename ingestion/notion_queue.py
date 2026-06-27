@@ -28,7 +28,7 @@ _VALID_CATEGORIES = {
     "constraint", "decision", "project_status", "relationship",
 }
 _VALID_IMPORTANCES = {"low", "medium", "high", "critical"}
-_VALID_SOURCES = {"claude", "chatgpt", "gemini"}
+_VALID_SOURCES = {"claude", "chatgpt", "gemini", "hermes", "perplexity"}
 
 
 def build_notion_client():
@@ -62,8 +62,11 @@ def _build_properties(item: dict, source: str, profile: str) -> dict:
         category = "fact"
     if importance not in _VALID_IMPORTANCES:
         importance = "medium"
+    # Preserve real provenance — never silently relabel as "claude" (that
+    # mislabels every hermes/perplexity fact). Unknown sources pass through as
+    # "unknown" so the mistake is visible, not disguised.
     if source not in _VALID_SOURCES:
-        source = "claude"
+        source = source or "unknown"
 
     return {
         "Fact": {

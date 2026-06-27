@@ -212,6 +212,44 @@ def test_switch_profile_nonexistent(fresh_store):
     assert "available_profiles" in result
 
 
+def test_switch_profile_stateful_fallback(fresh_store):
+    import server
+    # Reset state
+    server._current_profile = "default"
+    fresh_store.ensure_profile("work")
+    
+    # Add memories with explicit profiles
+    server.add_memory.fn("Default memory content", category="fact", profile="default")
+    server.add_memory.fn("Work memory content", category="fact", profile="work")
+    
+    # Retrieve omitting profile -> should default to "default"
+    res_default = json.loads(server.get_memory.fn(profile=None))
+    contents_default = [m["content"] for m in res_default["memories"]]
+    assert "Default memory content" in contents_default
+    assert "Work memory content" not in contents_default
+    
+    # Switch profile statefully to "work"
+    switch_res = json.loads(server.switch_profile.fn(profile_name="work"))
+    assert switch_res["status"] == "switched"
+    assert switch_res["profile"] == "work"
+    
+    # Retrieve omitting profile -> should now return "work"
+    res_work = json.loads(server.get_memory.fn(profile=None))
+    contents_work = [m["content"] for m in res_work["memories"]]
+    assert "Work memory content" in contents_work
+    assert "Default memory content" not in contents_work
+
+    # Add memory omitting profile -> should write to "work"
+    server.add_memory.fn("Another work memory", category="fact", profile=None)
+    res_work_updated = json.loads(server.get_memory.fn(profile="work"))
+    contents_work_updated = [m["content"] for m in res_work_updated["memories"]]
+    assert "Another work memory" in contents_work_updated
+    
+    # Reset back to default
+    server.switch_profile.fn(profile_name="default")
+
+
+
 # -------------------------------------------------------------------------
 # list_projects
 # -------------------------------------------------------------------------

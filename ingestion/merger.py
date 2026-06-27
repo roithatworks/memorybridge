@@ -7,16 +7,25 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from profile_router import route_profile  # noqa: E402
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from server import add_memory as _add_memory_tool, search_memory as _search_memory_tool, add_memories as _add_memories_tool  # noqa: E402
+from server import add_memory as _add_memory_tool, add_memories as _add_memories_tool, _store  # noqa: E402
 add_memory = _add_memory_tool.fn
-search_memory = _search_memory_tool.fn
 add_memories = _add_memories_tool.fn
 
 logger = logging.getLogger(__name__)
 
-_EXACT_MATCH_THRESHOLD = 0.80   # search_memory match_score for "already exists"
-_KEYWORD_MERGE_THRESHOLD = 0.85  # keyword overlap for "close enough to merge"
+# Semantic match_score (embedding cosine via search_hybrid) is the reliable
+# duplicate signal — reworded dups like "$126 million in business impact" vs
+# "$126M in cumulative impact" share meaning but few exact words, so the keyword
+# path below can't catch them without also wrongly merging distinct facts.
+# Lowered 0.80 -> 0.72 so semantically-near facts collapse on the embedding
+# score. The keyword path stays HIGH (0.85) as a conservative exact-ish backstop
+# that never fires on merely-similar wording.
+_EXACT_MATCH_THRESHOLD = 0.72   # semantic match_score for "already exists / merge"
+_KEYWORD_MERGE_THRESHOLD = 0.85  # keyword overlap backstop (conservative)
 
 
 def _keyword_overlap(a: str, b: str) -> float:
@@ -31,10 +40,9 @@ def _keyword_overlap(a: str, b: str) -> float:
 def _search_existing(fact_text: str, profile: str) -> list:
     """Return search results for a fact string."""
     try:
-        raw = search_memory(query=fact_text, limit=5, profile=profile)
-        return json.loads(raw).get("results", [])
+        return _store.search_hybrid(profile=profile, query=fact_text, limit=5)
     except Exception as e:
-        logger.warning("search_memory failed: %s", e)
+        logger.warning("search_hybrid failed: %s", e)
         return []
 
 
@@ -58,12 +66,17 @@ def _write_fact(fact: dict, profile: str, preview: bool) -> str:
         return "error"
 
 
-def _batch_write(facts_by_category: dict, profile: str) -> int:
+def _batch_write(facts_by_category: dict, profile: str) -> dict:
     """
     Write groups of facts via add_memories (one call per category).
-    Returns total number of facts written.
+
+    Returns {"written": int, "rejected": [(fact, reason), ...]}. Counts the
+    rows actually inserted (add_memories skips exact duplicates AND
+    guardrail-rejected document-shaped facts) rather than the requested count,
+    and surfaces guardrail rejections so the backfill report is honest.
     """
     written = 0
+    rejected: list = []
     for category, group in facts_by_category.items():
         if not group:
             continue
@@ -73,17 +86,39 @@ def _batch_write(facts_by_category: dict, profile: str) -> int:
         fact_strings = [f["fact"] for f in group]
         project = next((f.get("project") for f in group if f.get("project")), None)
         try:
-            add_memories(
+            result = add_memories(
                 facts=fact_strings,
                 category=category,
                 importance=importance,
                 project=project,
                 profile=profile,
             )
-            written += len(fact_strings)
+            written += _count_added(result)
+            # add_memories records guardrail-skipped facts on the store.
+            rejected.extend(getattr(_store, "last_rejected", []) or [])
         except Exception as e:
             logger.error("add_memories failed for category '%s': %s", category, e)
-    return written
+    return {"written": written, "rejected": rejected}
+
+
+def _count_added(result) -> int:
+    """Extract the real inserted count from add_memories' return value.
+
+    The add_memories MCP tool returns a JSON *string* like
+    {"status": "updated", "count": N, ...} — NOT an int. The old code did
+    `isinstance(result, int)` which was always False, so `added` was always 0
+    (this is why the footer reported "Added: 0" while facts wrote fine).
+    """
+    if isinstance(result, int):
+        return result
+    if isinstance(result, dict):
+        return int(result.get("count", 0))
+    if isinstance(result, str):
+        try:
+            return int(json.loads(result).get("count", 0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return 0
+    return 0
 
 
 def merge(accepted: list, resolved: list, source: str, profile: str = "default", preview: bool = False) -> dict:
@@ -163,28 +198,54 @@ def merge(accepted: list, resolved: list, source: str, profile: str = "default",
             else:
                 write_queue.append(fact)
 
-    if not preview:
-        # Group by category for efficient batch writes
-        by_category: dict[str, list] = defaultdict(list)
-        for fact in write_queue:
-            by_category[fact.get("category", "fact")].append(fact)
+    # Domain routing: assign each fact to a profile (job_search/consulting/
+    # teaching/personal/default) by content. Done for both preview and write so
+    # the preview report shows the routing. base_profile = the run's --profile.
+    routed_by_profile: dict[str, int] = defaultdict(int)
+    for fact in write_queue:
+        dest = route_profile(fact, base_profile=profile)
+        fact["_dest_profile"] = dest
+        routed_by_profile[dest] += 1
 
-        added_count = _batch_write(dict(by_category), profile)
+    guardrail_rejected = []
+    if not preview:
+        # Group by (profile, category) so each group writes to its routed profile.
+        by_profile_category: dict[tuple, list] = defaultdict(list)
         for fact in write_queue:
-            changes.append({"action": "added", "fact": fact.get("fact", "")[:80], "category": fact.get("category", "")})
+            key = (fact["_dest_profile"], fact.get("category", "fact"))
+            by_profile_category[key].append(fact)
+
+        total_written = 0
+        for (dest_profile, category), group in by_profile_category.items():
+            batch = _batch_write({category: group}, dest_profile)
+            total_written += batch["written"]
+            guardrail_rejected.extend(batch["rejected"])
+        added_count = total_written
+
+        for fact in write_queue:
+            changes.append({"action": "added", "fact": fact.get("fact", "")[:80],
+                            "category": fact.get("category", ""),
+                            "profile": fact["_dest_profile"]})
+        for fact_text, reason in guardrail_rejected:
+            changes.append({"action": "guardrail_rejected",
+                            "fact": str(fact_text)[:80], "reason": reason})
     else:
-        # Preview mode: count what would be added
+        # Preview mode: count what would be added, with routed profile shown.
         added_count = len(write_queue)
         for fact in write_queue:
-            changes.append({"action": "would_add", "fact": fact.get("fact", "")[:80], "category": fact.get("category", "")})
+            changes.append({"action": "would_add", "fact": fact.get("fact", "")[:80],
+                            "category": fact.get("category", ""),
+                            "profile": fact["_dest_profile"]})
 
     return {
         "timestamp": datetime.now().isoformat(),
         "source": source,
         "profile": profile,
+        "routed_by_profile": dict(routed_by_profile),
         "added": added_count,
         "skipped_duplicate": skipped_count,
         "merged": merged_count,
         "rejected": rejected_count,
+        "guardrail_rejected": len(guardrail_rejected),
         "changes": changes,
     }
