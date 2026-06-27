@@ -33,7 +33,7 @@ Everything lives in a SQLite database on your machine. Nothing goes to the cloud
 
 ## Installation
 
-**1. Clone and install dependencies**
+### 1. Clone and install dependencies
 
 ```bash
 git clone https://github.com/your-username/memorybridge.git
@@ -41,16 +41,16 @@ cd memorybridge
 pip3 install -r requirements.txt
 ```
 
-**2. Add API keys**
+### 2. Add API keys
 
 Create `~/memorybridge/.env`:
 
-```
+```properties
 DEEPSEEK_API_KEY=your_key_here
 ANTHROPIC_API_KEY=your_key_here
 ```
 
-**3. Register with Claude desktop**
+### 3. Register with Claude desktop
 
 Open `~/Library/Application Support/Claude/claude_desktop_config.json` (create it if missing) and add:
 
@@ -67,7 +67,7 @@ Open `~/Library/Application Support/Claude/claude_desktop_config.json` (create i
 
 Use the absolute path to `server.py` in your clone. Run `pwd` inside the repo to get it.
 
-**4. Restart Claude**
+### 4. Restart Claude
 
 Fully quit Claude (⌘Q) and relaunch. Ask it: *"Can you check if MemoryBridge is connected?"*
 
@@ -80,7 +80,7 @@ Full walkthrough in [SETUP_GUIDE.md](SETUP_GUIDE.md).
 Claude calls these automatically — no special syntax required.
 
 | Tool | Description |
-|---|---|
+| --- | --- |
 | `get_memory` | Retrieve memories within a token budget, ranked by decay-adjusted relevance |
 | `add_memory` | Add a single memory with category and importance |
 | `add_memories` | Batch-add multiple facts in one call (does not mutate existing rows) |
@@ -114,7 +114,7 @@ python ingestion/run.py --source gemini --file ~/Downloads/MyActivity.json --pre
 
 The pipeline:
 
-```
+```text
 Export file → parse → DeepSeek R1 extraction → confidence routing → conflict resolution → memory write
 ```
 
@@ -145,7 +145,7 @@ streamlit run ui/app.py
 Four pages:
 
 | Page | Purpose |
-|---|---|
+| --- | --- |
 | Flagged Queue | Review extractions with 60-84% confidence — accept or reject |
 | Memory Browser | Filter, search, sort, and delete memories |
 | Analytics | Token usage trends, operation breakdown, baseline comparison |
@@ -157,7 +157,7 @@ Four pages:
 
 A portable plain-text snapshot of your memory — paste it into any AI's system prompt.
 
-```
+```markdown
 # Memory Passport
 Profile: default
 Generated: 2026-05-10
@@ -186,7 +186,7 @@ Generate via Claude: *"Export my memory passport"* — or use the Portability ta
 All data is local:
 
 | Path | Contents |
-|---|---|
+| --- | --- |
 | `~/memorybridge/memory.db` | SQLite database — memories, profiles, FTS index, embeddings |
 | `~/memorybridge/analytics.json` | Token usage stats |
 | `~/memorybridge/flagged_queue.json` | Pending manual review queue |
@@ -204,7 +204,7 @@ MemoryBridge keeps code and runtime data in separate locations so the repo stays
 **Data** — lives in `~/memorybridge/` by default:
 
 | Path | Contents |
-|---|---|
+| --- | --- |
 | `~/memorybridge/memory.db` | SQLite database — memories, profiles, FTS index, embeddings |
 | `~/memorybridge/analytics.json` | Token usage stats |
 | `~/memorybridge/inbox/` | Drop export files here for auto-ingestion |
@@ -234,7 +234,7 @@ Retired launchd job plists are archived in `~/memorybridge/launchd-retired/` for
 
 ## Architecture
 
-```
+```text
 server.py              — FastMCP server, 12 MCP tools
 db/store.py            — SQLite persistence, FTS5, embeddings, WAL mode
 db/schema.sql          — Schema with content-hash dedup index
@@ -276,16 +276,19 @@ python -m pytest tests/ -v
 
 ## Troubleshooting
 
-**Claude doesn't see memory tools**
+### Claude doesn't see memory tools
+
 - Fully quit and relaunch Claude (⌘Q — closing the window isn't enough)
 - Verify the path in `claude_desktop_config.json` is the absolute path to `server.py`
 - Run `python3 server.py` in Terminal directly — fix any errors before restarting Claude
 
-**"Module not found" error**
+### "Module not found" error
+
 - Run `pip3 install -r requirements.txt` from the repo root
 - If you have multiple Python versions, confirm which one Claude's config points to: `which python3`
 
-**Inbox watcher isn't firing**
+### Inbox watcher isn't firing
+
 - Check `launchctl list | grep memorybridge` — `com.memorybridge.inbox` should appear
 - Inspect `~/memorybridge/logs/watcher_err.log` for errors
 - Verify the plist paths match your actual username: `plutil -lint ~/Library/LaunchAgents/com.memorybridge.inbox.plist`

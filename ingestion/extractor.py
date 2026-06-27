@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import sys
 from typing import Optional
 
 from openai import OpenAI
@@ -55,7 +56,14 @@ def _get_client() -> OpenAI:
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise ExtractionError("DEEPSEEK_API_KEY not set")
-    return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    # timeout: a non-responding API must fail, not hang the whole run forever.
+    # max_retries=2 covers transient network blips.
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com",
+        timeout=120.0,
+        max_retries=2,
+    )
 
 
 def _truncate_conversation(conv: dict) -> dict:
@@ -89,7 +97,6 @@ def _call_deepseek(client: OpenAI, conversations: list) -> list:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0,
         )
         raw = resp.choices[0].message.content.strip()
         # Strip accidental markdown fences
@@ -108,6 +115,66 @@ def _call_deepseek(client: OpenAI, conversations: list) -> list:
         except json.JSONDecodeError as e2:
             logger.error("Second attempt also failed: %s — skipping batch", e2)
             return []
+
+
+# Ephemeral operational telemetry — transient system state that has no durable
+# memory value (cron run results, resource gauges, "nothing happened today").
+# Dropped at extraction so it never reaches the store or the router. Tune here.
+_NOISE_PATTERNS = [
+    r"\bload average", r"\bdisk usage", r"\bdisk space",
+    r"\bhomebrew\b.*\b(outdated|packages?|upgrade)", r"\bbrew (outdated|upgrade)",
+    r"\bno (git )?commits?\b", r"\bno new commits?\b",
+    r"\bcron job (ran|completed|executed|fired)\b",
+    r"\bsystem (load|was rebooted|reboot)", r"\brebooted\b",
+    r"\buptime\b", r"\bswap usage", r"\bmemory usage (is|was|spiked)",
+    r"\bran (successfully|without error)\b.*\b(today|this morning)\b",
+    r"\bfluctuat", r"\bspiked to \d", r"\bstays around \d+%",
+    r"\bbattery (level|is at)",
+]
+_NOISE_RE = None
+
+# Infrastructure-plumbing trivia — durable but worthless as PORTABLE cross-LLM
+# memory: cron schedules, launchd jobs, script internals, capture-pipeline
+# mechanics. Distinct from ephemeral noise (these don't change minute-to-minute)
+# but no other LLM needs to know the morning-brief cron fires at 9:07. Dropped
+# only when the fact reads like local automation plumbing — see _is_infra_trivia.
+_INFRA_TRIVIA_PATTERNS = [
+    r"\bcron (job|jobs|schedule|scheduling)\b",
+    r"\blaunchd\b", r"\blingon\b",
+    r"\bruns (daily|weekly|every|at \d|on (mon|tue|wed|thu|fri|sat|sun))",
+    r"\bscheduled (cron|job|task|run)\b",
+    r"\b(morning brief|ops radar|capture inbox|document scan|weekly review)\b.*\b(run|cron|schedule|\d(am|pm|:\d))",
+    r"\b\w+\.py\b script",   # "<script>.py script ..." internals
+    r"\bdelivers? (results?|to) telegram\b",
+    r"\bdaemon (is|is not|runs)\b",
+    r"\bauto-start", r"\bbackground service\b",
+]
+_INFRA_RE = None
+# Projects whose facts are local-automation plumbing. Infra-trivia filtering is
+# scoped to these so it never touches business/identity/job-search facts.
+_INFRA_PROJECTS = {"hermes agent", "hermes"}
+
+
+def _is_infra_trivia(fact_text: str, project_id) -> bool:
+    """True if the fact is local automation/plumbing trivia (cron/script/launchd)
+    belonging to a Hermes-infra project — durable but useless cross-LLM."""
+    global _INFRA_RE
+    if _INFRA_RE is None:
+        import re
+        _INFRA_RE = re.compile("|".join(_INFRA_TRIVIA_PATTERNS), re.IGNORECASE)
+    proj = (str(project_id or "")).strip().lower()
+    if proj not in _INFRA_PROJECTS:
+        return False
+    return bool(_INFRA_RE.search(fact_text or ""))
+
+
+def _is_noise(fact_text: str) -> bool:
+    """True if the fact is ephemeral operational telemetry, not durable memory."""
+    global _NOISE_RE
+    if _NOISE_RE is None:
+        import re
+        _NOISE_RE = re.compile("|".join(_NOISE_PATTERNS), re.IGNORECASE)
+    return bool(_NOISE_RE.search(fact_text or ""))
 
 
 def extract(normalized: dict) -> list:
@@ -133,6 +200,10 @@ def extract(normalized: dict) -> list:
 
     for batch_idx, batch in enumerate(batches):
         logger.info("Extracting batch %d/%d (%d conversations)", batch_idx + 1, len(batches), len(batch))
+        # Always-visible progress (logger is at WARNING in the CLI, so info()
+        # alone is invisible — this is what makes a long run observable).
+        print(f"  [extract] batch {batch_idx + 1}/{len(batches)} "
+              f"({len(batch)} conversations)...", file=sys.stderr, flush=True)
         try:
             facts = _call_deepseek(client, batch)
         except Exception as e:
@@ -141,6 +212,13 @@ def extract(normalized: dict) -> list:
         # Tag each fact with the first conversation id in the batch as a rough source
         for fact in facts:
             if not isinstance(fact, dict):
+                continue
+            # Drop ephemeral operational telemetry — it's not durable memory.
+            if _is_noise(fact.get("fact", "")):
+                continue
+            # Drop Hermes-infra plumbing trivia (cron/script/launchd internals)
+            # — durable but useless as portable cross-LLM memory.
+            if _is_infra_trivia(fact.get("fact", ""), fact.get("project")):
                 continue
             if "source_conversation_id" not in fact:
                 fact["source_conversation_id"] = batch[0].get("id", "")

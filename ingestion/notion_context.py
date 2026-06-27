@@ -129,7 +129,9 @@ def _clear_page_blocks(client, page_id: str) -> int:
     """Delete all child blocks from a Notion page. Returns count deleted."""
     deleted = 0
     cursor = None
+    all_block_ids = []
 
+    # 1. Fetch all child block IDs paginatively
     while True:
         kwargs = {"block_id": page_id, "page_size": 100}
         if cursor:
@@ -137,17 +139,19 @@ def _clear_page_blocks(client, page_id: str) -> int:
 
         response = client.blocks.children.list(**kwargs)
         block_ids = [b["id"] for b in response.get("results", [])]
-
-        for bid in block_ids:
-            try:
-                client.blocks.delete(block_id=bid)
-                deleted += 1
-            except Exception as exc:
-                logger.warning("Could not delete block %s: %s", bid, exc)
+        all_block_ids.extend(block_ids)
 
         if not response.get("has_more"):
             break
         cursor = response["next_cursor"]
+
+    # 2. Delete the retrieved blocks in a separate loop
+    for bid in all_block_ids:
+        try:
+            client.blocks.delete(block_id=bid)
+            deleted += 1
+        except Exception as exc:
+            logger.warning("Could not delete block %s: %s", bid, exc)
 
     return deleted
 

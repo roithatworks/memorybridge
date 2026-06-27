@@ -6,15 +6,33 @@ Tool signatures are unchanged — this is a drop-in persistence swap.
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from db.constants import (  # noqa: E402
-    VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score
+    VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score,
+    guardrail_check, _merge_tags, _max_importance
 )
+from db.entities import EntityExtractor
+
+
+class GuardrailRejection(ValueError):
+    """Raised when content is document-shaped and rejected by the write path.
+
+    Carries the human-readable reason so callers (MCP tools, ingest pipeline)
+    can report why and route the content to a file instead of a memory.
+    """
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 SCHEMA_SQL = Path(__file__).parent / "schema.sql"
 
@@ -63,6 +81,15 @@ class _LockedConnection:
         return self._lock
 
 
+def _jaccard_similarity(a: str, b: str) -> float:
+    """Jaccard-style keyword overlap between two strings."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    return len(words_a & words_b) / max(len(words_a), len(words_b))
+
+
 def _mem_id() -> str:
     return f"mem_{uuid.uuid4().hex[:8]}"
 
@@ -77,8 +104,35 @@ class MemoryStore:
         mid = store.add_memory("default", "Cale prefers dark mode", category="preference")
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, entity_extractor: EntityExtractor | None = None,
+                 merge_threshold: float = 0.35, merge_min_tags: int = 2,
+                 recency_decay_days: int = 0,
+                 llm_synthesize: Callable | None = None):
+        """Initialize MemoryStore.
+
+        *db_path* — path to the SQLite database file.
+        *entity_extractor* — optional ``EntityExtractor`` instance. When set,
+        ``add_memory`` automatically extracts entity tags from content and
+        merges them with caller-supplied tags. Pass ``False`` to disable
+        even if a default extractor is configured.
+        *merge_threshold* — Jaccard similarity threshold for fuzzy dedup
+        (0.0 = never merge, 1.0 = only merge identical content). Default 0.35.
+        *merge_min_tags* — minimum shared entity tags required to consider
+        two memories as related for fuzzy dedup. Default 2.
+        *recency_decay_days* — half-life in days for recency weighting in
+        search results. 0 (default) = no recency boost. Higher values = slower
+        decay (older memories stay relevant longer).
+        *llm_synthesize* — optional callable ``(question, memory_text) -> str``
+        for the ``reflect()`` synthesis tool. If ``None``, uses keyword-based
+        fallback.
+        """
         self._path = db_path
+        self._entity_extractor = entity_extractor
+        self._merge_threshold = merge_threshold
+        self._merge_min_tags = merge_min_tags
+        self._recency_decay_days = recency_decay_days
+        self._llm_synthesize = llm_synthesize
+        self._reflector: Any = None
         db_path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False is safe only because _LockedConnection
         # serializes every statement (issue #6).
@@ -86,51 +140,77 @@ class MemoryStore:
             sqlite3.connect(str(db_path), check_same_thread=False)
         )
         self._conn.row_factory = sqlite3.Row
+        # WAL mode: lets a second connection (e.g. the ingestion subprocess)
+        # READ while the live MCP server holds a write, and vice-versa, instead
+        # of serializing all access. The class docstring already assumes WAL,
+        # but the pragma was never actually set — this enables it. Persists on
+        # the DB file once set, but assert it every open to be safe.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        # busy_timeout: when another connection still holds the write lock,
+        # wait up to N ms then raise sqlite3.OperationalError("database is
+        # locked") INSTEAD OF blocking forever. Without this the ingestion CLI
+        # hangs indefinitely whenever the server is running.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         # FK enforcement is OFF by default in SQLite and is per-connection —
         # without this, ON DELETE CASCADE (memory_embeddings) never fires.
         # Issue #4: 103/128 embeddings were orphaned because of this.
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(SCHEMA_SQL.read_text())
-        # executescript commits and can reset pragmas — re-assert.
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        # Pruner tables (idempotent CREATE IF NOT EXISTS)
-        from db.pruner import PRUNER_SCHEMA, bootstrap_rules
-        self._conn.executescript(PRUNER_SCHEMA)
-        bootstrap_rules(self._conn)
-        self._conn.commit()
-        # One-time hygiene (issue #4): purge embedding rows orphaned while FK
-        # enforcement was off. Idempotent and cheap on every startup.
-        self._conn.execute(
-            "DELETE FROM memory_embeddings "
-            "WHERE id NOT IN (SELECT id FROM memories)"
-        )
-        self._conn.commit()
-        # One-time repair (issue #3): the old manual FTS delete passed empty
-        # content, leaving ghost tokens for every deleted memory. Rebuild the
-        # index from the memories table once, marked in meta so it doesn't
-        # rerun on every startup.
-        rebuilt = self._conn.execute(
-            "SELECT value FROM meta WHERE key='fts_rebuilt_v1'"
-        ).fetchone()
-        if not rebuilt:
+
+        # Is the DB already initialized? If the schema exists, a second process
+        # (e.g. the ingestion CLI opening this DB while the server holds it)
+        # must NOT re-run the one-time schema/DELETE/rebuild writes — those grab
+        # the write lock and needlessly contend, which is what made the backfill
+        # hang. All of that work is idempotent hygiene guarded by meta flags, so
+        # on an already-initialized DB it's a no-op anyway. Fresh DBs (tests,
+        # first run) take the full path below unchanged.
+        already_init = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+        ).fetchone() is not None
+
+        if not already_init:
+            self._conn.executescript(SCHEMA_SQL.read_text())
+            # executescript commits and can reset pragmas — re-assert.
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            # Pruner tables (idempotent CREATE IF NOT EXISTS)
+            from db.pruner import PRUNER_SCHEMA, bootstrap_rules
+            self._conn.executescript(PRUNER_SCHEMA)
+            bootstrap_rules(self._conn)
+            self._conn.commit()
+            # One-time hygiene (issue #4): purge embedding rows orphaned while
+            # FK enforcement was off. Idempotent and cheap.
             self._conn.execute(
-                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
-            )
-            self._conn.execute(
-                "INSERT OR REPLACE INTO meta VALUES('fts_rebuilt_v1', ?)",
-                (datetime.now().isoformat(),)
+                "DELETE FROM memory_embeddings "
+                "WHERE id NOT IN (SELECT id FROM memories)"
             )
             self._conn.commit()
+            # One-time repair (issue #3): rebuild FTS once, marked in meta.
+            rebuilt = self._conn.execute(
+                "SELECT value FROM meta WHERE key='fts_rebuilt_v1'"
+            ).fetchone()
+            if not rebuilt:
+                self._conn.execute(
+                    "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta VALUES('fts_rebuilt_v1', ?)",
+                    (datetime.now().isoformat(),)
+                )
+                self._conn.commit()
+
         # Phase 4: lazy-loaded FastEmbed model (cached per-process)
         self._embed_model = None
         self._embed_lock = threading.Lock()
         # Issue #5: backfill embeddings for memories missing vectors, on a
         # background thread so startup isn't blocked by model load. New
-        # memories are embedded on write (see add_memory).
-        threading.Thread(
-            target=self._backfill_missing_embeddings,
-            daemon=True, name="embedding-backfill"
-        ).start()
+        # memories are embedded on write (see add_memory). Skipped when
+        # MEMORYBRIDGE_NO_EMBED is set — the ingestion subprocess writes via
+        # add_memory (which embeds per-memory) and must not pay the one-time
+        # model download just to start up.
+        if not os.environ.get("MEMORYBRIDGE_NO_EMBED"):
+            threading.Thread(
+                target=self._backfill_missing_embeddings,
+                daemon=True, name="embedding-backfill"
+            ).start()
 
     # -------------------------------------------------------------------------
     # Profiles
@@ -187,13 +267,39 @@ class MemoryStore:
 
     def add_memory(self, profile: str, content: str, *,
                    category: str = "fact", importance: str = "medium",
-                   tags: list = None, project_id: str = None) -> str | None:
-        """Returns memory ID on success, None if exact duplicate."""
+                   tags: list = None, project_id: str = None,
+                   enforce_guardrail: bool = True) -> str | None:
+        """Returns memory ID on success, None if exact duplicate.
+
+        Raises GuardrailRejection if content is document-shaped (too long, too
+        many lines, or markdown-heading/multi-section). Pass
+        enforce_guardrail=False only for trusted internal migrations.
+        """
+        if enforce_guardrail:
+            ok, reason = guardrail_check(content)
+            if not ok:
+                raise GuardrailRejection(reason)
         self.ensure_profile(profile)
         h = _content_hash(content)
         mid = _mem_id()
         now = datetime.now().isoformat()
         tc = _count_tokens(content)
+
+        # Entity extraction: if an EntityExtractor is configured, extract
+        # entity tags from content and merge with caller-supplied tags.
+        enriched_tags: list[str] | None = tags
+        if self._entity_extractor:
+            entity_tags = self._entity_extractor.extract(content)
+            if entity_tags:
+                enriched_tags = _merge_tags(tags or [], entity_tags)
+
+        # Fuzzy dedup/merge: check for near-duplicate by entity tag overlap
+        # + content similarity. Runs after entity extraction (tags available)
+        # but before INSERT so we can redirect to UPDATE.
+        merged_id = self._maybe_merge(profile, content, enriched_tags or [])
+        if merged_id:
+            return merged_id
+
         try:
             # Hold the lock across INSERT + FTS sync + commit so another
             # thread's commit can't land mid-sequence (issue #6).
@@ -204,7 +310,7 @@ class MemoryStore:
                         created_at,last_accessed,tags,project_id,token_count)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (mid, profile, content, h, category, importance,
-                     now, now, json.dumps(tags or []), project_id, tc)
+                     now, now, json.dumps(enriched_tags or []), project_id, tc)
                 )
                 # FTS sync handled by memories_ai trigger (issue #3)
                 self._conn.commit()
@@ -221,15 +327,107 @@ class MemoryStore:
             self._conn.rollback()
             return None  # duplicate content_hash
 
+    # -------------------------------------------------------------------------
+    # Fuzzy dedup / merge
+    # -------------------------------------------------------------------------
+
+    def _maybe_merge(self, profile: str, content: str,
+                     enriched_tags: list[str]) -> str | None:
+        """Check for a near-duplicate memory and merge if found.
+
+        Uses entity tags (from step 1) + Jaccard content similarity.
+        Returns existing memory ID if merged, ``None`` if no match.
+
+        Disabled when ``merge_threshold`` is 0.0 or content has no entity tags.
+        """
+        if self._merge_threshold <= 0.0:
+            return None
+
+        # Need entity tags to find candidates — pure keyword content can't
+        # reliably disambiguate "is this the same topic?"
+        entity_tags = [t for t in enriched_tags if t.startswith("entity:")]
+        if len(entity_tags) < self._merge_min_tags:
+            return None
+
+        # Find candidate memories sharing ≥ merge_min_tags entity tags.
+        tag_list = ",".join(f"'{t}'" for t in entity_tags)
+        try:
+            rows = self._conn.execute(
+                f"""SELECT m.id, m.content, m.importance, m.tags,
+                           COUNT(DISTINCT jt.value) AS shared
+                    FROM memories m, json_each(m.tags) AS jt
+                    WHERE m.profile = ?
+                      AND m.archived = 0
+                      AND jt.value IN ({tag_list})
+                    GROUP BY m.id
+                    HAVING shared >= ?
+                    ORDER BY shared DESC
+                    LIMIT 5""",
+                (profile, self._merge_min_tags),
+            ).fetchall()
+        except Exception:
+            return None  # json_each may fail on old SQLite — fail-soft
+
+        if not rows:
+            return None
+
+        # Score each candidate by Jaccard similarity
+        best_id: str | None = None
+        best_sim = 0.0
+        best_row = None
+        for row in rows:
+            sim = _jaccard_similarity(content, row["content"])
+            if sim > best_sim:
+                best_sim = sim
+                best_id = row["id"]
+                best_row = row
+
+        if best_sim < self._merge_threshold:
+            return None
+
+        # Merge: append new info annotation, bump importance and timestamp
+        now = datetime.now().isoformat()
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        merge_note = f"\n[merged: {date_str}] {content.strip()}"
+        # Keep the higher importance level
+        final_imp = _max_importance(best_row["importance"], "medium")
+
+        try:
+            with self._conn.transaction():
+                self._conn.execute(
+                    """UPDATE memories
+                       SET content = content || ?,
+                           importance = ?,
+                           last_accessed = ?,
+                           access_count = access_count + 1
+                       WHERE id = ? AND profile = ?""",
+                    (merge_note, final_imp, now, best_id, profile),
+                )
+                self._conn.commit()
+            logger.info("Merged new content into existing memory %s (sim=%.2f)",
+                        best_id, best_sim)
+            return best_id
+        except Exception:
+            logger.exception("Merge UPDATE failed for best_id=%s", best_id)
+            return None
+
     def add_memories(self, profile: str, facts: list[str], *,
                      category: str = "fact", importance: str = "medium",
                      project_id: str = None) -> int:
-        """Batch insert. Returns count of actually inserted rows."""
+        """Batch insert. Returns count of actually inserted rows.
+
+        Guardrail-rejected (document-shaped) facts are skipped, not fatal, and
+        recorded on self.last_rejected as [(fact, reason), ...] for the caller.
+        """
         added = 0
+        self.last_rejected = []
         for fact in facts:
-            if self.add_memory(profile, fact, category=category,
-                               importance=importance, project_id=project_id):
-                added += 1
+            try:
+                if self.add_memory(profile, fact, category=category,
+                                   importance=importance, project_id=project_id):
+                    added += 1
+            except GuardrailRejection as e:
+                self.last_rejected.append((fact, e.reason))
         return added
 
     def edit_memory(self, profile: str, memory_id: str, **kwargs) -> bool:
@@ -256,14 +454,17 @@ class MemoryStore:
         set_clause = ", ".join(f"{col}=?" for col in fields)
         values = list(fields.values()) + [memory_id, profile]
 
-        with self._conn.transaction():
-            cur = self._conn.execute(
-                f"UPDATE memories SET {set_clause} WHERE id=? AND profile=?",
-                values
-            )
-            self._conn.commit()
-
-        updated = cur.rowcount > 0
+        try:
+            with self._conn.transaction():
+                cur = self._conn.execute(
+                    f"UPDATE memories SET {set_clause} WHERE id=? AND profile=?",
+                    values
+                )
+                self._conn.commit()
+            updated = cur.rowcount > 0
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            updated = False
 
         # Re-embed if content changed (fire-and-forget, fail-soft)
         if updated and "content" in fields:
@@ -371,6 +572,7 @@ class MemoryStore:
         for row in rows:
             m = self._row_to_dict(row)
             m.pop("bm25_score", None)
+            m["match_score"] = _jaccard_similarity(query, m["content"])
             if tokens_used + m["token_count"] <= max_tokens:
                 results.append(m)
                 tokens_used += m["token_count"]
@@ -773,11 +975,13 @@ class MemoryStore:
 
         # Re-rank in similarity order
         mem_by_id = {r["id"]: self._row_to_dict(r) for r in mem_rows}
+        sim_by_id = {mid: sim for mid, sim in scored}
         results, tokens_used = [], 0
         for mid, _ in scored:
             if mid not in mem_by_id:
                 continue
             m = mem_by_id[mid]
+            m["match_score"] = sim_by_id[mid]
             if tokens_used + m["token_count"] <= max_tokens:
                 results.append(m)
                 tokens_used += m["token_count"]
@@ -787,11 +991,17 @@ class MemoryStore:
 
     def search_hybrid(self, profile: str, query: str,
                       category: str = None,
-                      limit: int = 5, max_tokens: int = 800) -> list[dict]:
+                      limit: int = 5, max_tokens: int = 800,
+                      recency_boost: bool = True,
+                      include_related: bool = True) -> list[dict]:
         """
         Reciprocal Rank Fusion of FTS5 BM25 + semantic cosine results.
         RRF score = sum(1 / (60 + rank)) across both lists.
         Falls back to FTS5-only if no embeddings built.
+
+        *recency_boost* — when True (default), applies recency weighting.
+        *include_related* — when True (default), expands results with
+        entity-tag-related memories.
         """
         keyword_results = self.search(profile, query, category=category,
                                       limit=limit * 2, max_tokens=max_tokens * 2)
@@ -800,6 +1010,7 @@ class MemoryStore:
 
         scores: dict[str, float] = {}
         all_mems: dict[str, dict] = {}
+        sim_scores: dict[str, float] = {}
 
         for rank, mem in enumerate(keyword_results):
             mid = mem["id"]
@@ -810,18 +1021,56 @@ class MemoryStore:
             mid = mem["id"]
             scores[mid] = scores.get(mid, 0.0) + 1.0 / (60 + rank)
             all_mems[mid] = mem
+            sim_scores[mid] = mem.get("match_score", 0.0)
 
         ranked = sorted(scores, key=lambda k: scores[k], reverse=True)
 
+        # Build result list with recency adjustment
         results, tokens_used = [], 0
         for mid in ranked:
             mem = all_mems[mid]
+            mem["match_score"] = sim_scores.get(mid, mem.get("match_score", _jaccard_similarity(query, mem["content"])))
             if tokens_used + mem["token_count"] <= max_tokens:
                 results.append(mem)
                 tokens_used += mem["token_count"]
             if len(results) >= limit:
                 break
+
+        # Apply recency weighting if configured (re-ranks within search results)
+        if recency_boost and self._recency_decay_days > 0 and results:
+            results = self._re_rank_by_recency(results)
+
+        # Expand with related memories by entity tag overlap
+        if include_related and results:
+            results = self._expand_related(results, profile)
+
         return results
+
+    # -------------------------------------------------------------------------
+    # Reflect — synthesis tool
+    # -------------------------------------------------------------------------
+
+    def reflect(self, profile: str, question: str,
+                limit: int = 15, max_tokens: int = 3000) -> dict[str, Any]:
+        """Synthesize a reasoned answer from memories.
+
+        Retrieves relevant memories and produces a structured synthesis.
+        Uses the configured ``llm_synthesize`` callable if provided, otherwise
+        falls back to keyword-based summary.
+
+        Returns a dict with keys: question, key_facts, dates, preferences,
+        contradictions, confidence, raw_synthesis, memory_count, entity_groups.
+        """
+        from db.reflect import Reflector
+
+        if self._reflector is None:
+            self._reflector = Reflector(
+                search_fn=lambda q: self.search_hybrid(
+                    profile, q, limit=limit, max_tokens=max_tokens
+                ),
+                llm_synthesize=self._llm_synthesize,
+            )
+        return self._reflector.reflect(question)
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -832,3 +1081,103 @@ class MemoryStore:
         if isinstance(m.get("tags"), str):
             m["tags"] = json.loads(m["tags"])
         return m
+
+    def _re_rank_by_recency(self, results: list[dict]) -> list[dict]:
+        """Re-rank search results by recency-adjusted score.
+
+        Each result's relevance score is multiplied by an exponential decay
+        factor: ``0.5 ** (days_old / recency_decay_days)`` (same formula as
+        ``effective_score`` in constants.py). Results are re-sorted by the
+        adjusted score.
+
+        Only results with a ``created_at`` field are affected — memories
+        without a valid timestamp keep their original rank.
+        """
+        if not results or self._recency_decay_days <= 0:
+            return results
+
+        now = datetime.now().replace(tzinfo=None)
+        half_life = float(self._recency_decay_days)
+
+        scored: list[tuple[float, int, dict]] = []
+        for idx, mem in enumerate(results):
+            raw_score = mem.get("match_score", 0.5)
+            created = mem.get("created_at", "")
+            if created:
+                try:
+                    dt = datetime.fromisoformat(created).replace(tzinfo=None)
+                    days_old = (now - dt).total_seconds() / 86400.0
+                    recency_factor = 0.5 ** (days_old / half_life)
+                    adjusted = raw_score * recency_factor
+                except (ValueError, TypeError):
+                    adjusted = raw_score
+            else:
+                adjusted = raw_score
+            scored.append((adjusted, idx, mem))
+
+        # Sort by adjusted score descending, then original index as tiebreak
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [mem for _, _, mem in scored]
+
+    def _expand_related(self, results: list[dict], profile: str,
+                        max_related: int = 3) -> list[dict]:
+        """Expand search results with related memories by entity tag overlap.
+
+        Collects all entity tags from the primary results, then finds
+        additional memories that share ≥2 of those tags. Related results
+        are appended after primary results with a ``related: true`` flag.
+
+        Skips memories already in the primary result set. Caps at
+        ``max_related`` additional results.
+        """
+        if not results or max_related <= 0:
+            return results
+
+        # Collect all entity tags from primary results
+        all_entity_tags: set[str] = set()
+        existing_ids: set[str] = set()
+        for mem in results:
+            existing_ids.add(mem["id"])
+            tags = mem.get("tags", [])
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("entity:"):
+                    all_entity_tags.add(tag)
+
+        if len(all_entity_tags) < 2:
+            return results  # Not enough entity signal
+
+        # Query for memories sharing ≥2 entity tags
+        tag_list = ",".join(f"'{t}'" for t in all_entity_tags)
+        try:
+            rows = self._conn.execute(
+                f"""SELECT m.*, COUNT(DISTINCT jt.value) AS shared
+                    FROM memories m, json_each(m.tags) AS jt
+                    WHERE m.profile = ?
+                      AND m.archived = 0
+                      AND jt.value IN ({tag_list})
+                    GROUP BY m.id
+                    HAVING shared >= 2
+                    ORDER BY shared DESC, m.relevance_score DESC
+                    LIMIT ?""",
+                (profile, max_related * 2),
+            ).fetchall()
+        except Exception as e:
+            logger.debug("Related expansion query failed: %s", e)
+            return results
+
+        related: list[dict] = []
+        for row in rows:
+            mem = self._row_to_dict(row)
+            if mem["id"] in existing_ids:
+                continue
+            mem["related"] = True
+            mem["match_score"] = row["shared"] / max(len(all_entity_tags), 1)
+            related.append(mem)
+            existing_ids.add(mem["id"])
+            if len(related) >= max_related:
+                break
+
+        if not related:
+            return results
+
+        return results + related

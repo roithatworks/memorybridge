@@ -58,6 +58,7 @@ except ImportError:
 
 MEMORY_DB              = DATA_DIR / "memory.db"
 DEFAULT_PROFILE        = "default"
+_current_profile       = DEFAULT_PROFILE
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
@@ -119,7 +120,10 @@ def _sigterm_handler(signum, frame) -> None:
     os._exit(0)
 
 
-signal.signal(signal.SIGTERM, _sigterm_handler)
+# Register SIGTERM handler at module level (guarded for non-main imports
+# such as Streamlit UI pages that import server functions).
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 atexit.register(_cleanup_pid)
 
 
@@ -127,8 +131,20 @@ atexit.register(_cleanup_pid)
 # STORE — SQLite singleton
 # =============================================================================
 from db.store import MemoryStore  # noqa: E402
+from db.entities import EntityExtractor  # noqa: E402
 
-_store = MemoryStore(MEMORY_DB)
+# Entity config: DATA_DIR/entities.json overrides defaults
+_entities_path = DATA_DIR / "entities.json"
+_entity_extractor = EntityExtractor(
+    config_path=_entities_path if _entities_path.exists() else None
+)
+# Recency decay: env var or 30-day default
+_recency_decay_days = int(os.environ.get("MEMORYBRIDGE_RECENCY_DAYS", "30"))
+_store = MemoryStore(
+    MEMORY_DB,
+    entity_extractor=_entity_extractor,
+    recency_decay_days=_recency_decay_days,
+)
 
 
 def log_to_analytics(tokens_served: int, memories_returned: int,
@@ -221,7 +237,7 @@ def _clean_result(mem: dict) -> dict:
 
 @mcp.tool()
 def get_memory(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     context_hint: Optional[str] = None,
     category: Optional[str] = None,
     max_tokens: int = MAX_TOKENS_DEFAULT,
@@ -239,6 +255,7 @@ def get_memory(
     Returns:
         JSON with memories, token stats, and budget info
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -335,7 +352,7 @@ def add_memory(
     importance: str = "medium",
     tags: list[str] = None,
     project_id: Optional[str] = None,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """
     Add a new memory with automatic token counting and content-hash dedup.
@@ -350,6 +367,7 @@ def add_memory(
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
+    profile = profile or _current_profile
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
@@ -398,7 +416,7 @@ def add_memories(
     category: str = "fact",
     importance: str = "medium",
     project: Optional[str] = None,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """
     BATCH-ADD operation -- inserts multiple new memory rows. This does NOT edit
@@ -416,6 +434,7 @@ def add_memories(
     Returns:
         Summary with all added memory IDs and total tokens
     """
+    profile = profile or _current_profile
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
@@ -466,7 +485,7 @@ def edit_memory(
     importance: Optional[str] = None,
     category: Optional[str] = None,
     project: Optional[str] = None,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """
     Edit an existing memory in place by memory_id.
@@ -484,6 +503,7 @@ def edit_memory(
     Returns:
         JSON confirmation, or {"error": ...} if memory_id not found / validation fails
     """
+    profile = profile or _current_profile
     if importance is not None and importance not in IMPORTANCE_LEVELS:
         return json.dumps({"error": f"Invalid importance. Valid: {IMPORTANCE_LEVELS}"})
     if category is not None and category not in VALID_CATEGORIES:
@@ -518,7 +538,9 @@ def search_memory(
     category: Optional[str] = None,
     limit: int = SEARCH_LIMIT_DEFAULT,
     max_tokens: int = SEARCH_MAX_TOKENS_DEFAULT,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None,
+    recency_boost: bool = True,
+    include_related: bool = False,
 ) -> str:
     """
     Search memories using FTS5 BM25 with optional token budget.
@@ -529,9 +551,12 @@ def search_memory(
         limit: Max results (default 5)
         max_tokens: Token cap (default 800)
         profile: Memory profile
+        recency_boost: Apply recency weighting (default: true when configured)
+        include_related: Include related memories by entity tag overlap (default: false)
     Returns:
         JSON with ranked results (internal fields stripped)
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
 
     if category and category not in VALID_CATEGORIES:
@@ -539,7 +564,9 @@ def search_memory(
 
     # Phase 4: hybrid BM25 + semantic search (falls back to FTS5 if no embeddings built)
     results = _store.search_hybrid(profile, query, category=category,
-                                   limit=limit, max_tokens=max_tokens)
+                                   limit=limit, max_tokens=max_tokens,
+                                   recency_boost=recency_boost,
+                                   include_related=include_related)
 
     # Boost relevance score for all returned memories in a single commit (issue #12)
     _store.boost_batch(profile, [m["id"] for m in results],
@@ -565,11 +592,41 @@ def search_memory(
 
 
 @mcp.tool()
+def reflect(
+    question: str,
+    profile: str = None,
+    limit: int = 15,
+    max_tokens: int = 3000,
+) -> str:
+    """
+    Synthesize a reasoned answer from memories.
+
+    Retrieves relevant memories, groups by entity tag, and produces a
+    structured synthesis (key facts, dates, preferences, contradictions,
+    confidence). Uses keyword-based fallback when no LLM is configured.
+
+    Args:
+        question: The question to reflect on
+        profile: Memory profile (default: current)
+        limit: Max memories to consider (default 15)
+        max_tokens: Token cap for memory context (default 3000)
+    Returns:
+        JSON with structured synthesis
+    """
+    profile = profile or _current_profile
+    _store.ensure_profile(profile)
+
+    result = _store.reflect(profile, question, limit=limit, max_tokens=max_tokens)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
 def delete_memory(
     memory_id: str,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """Delete a specific memory by ID."""
+    profile = profile or _current_profile
     tokens_freed = _store.delete_memory(profile, memory_id)
     if tokens_freed == 0:
         # Check if profile even exists
@@ -588,7 +645,7 @@ def delete_memory(
 
 
 @mcp.tool()
-def get_token_stats(profile: str = DEFAULT_PROFILE) -> str:
+def get_token_stats(profile: str = None) -> str:
     """
     Get comprehensive token usage statistics.
 
@@ -597,6 +654,8 @@ def get_token_stats(profile: str = DEFAULT_PROFILE) -> str:
     Returns:
         Token usage breakdown
     """
+    if profile is None:
+        profile = _current_profile
     if profile == "all":
         all_profiles = {}
         total_stored = 0
@@ -642,7 +701,7 @@ def get_token_stats(profile: str = DEFAULT_PROFILE) -> str:
 
 @mcp.tool()
 def prune_memories(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     threshold: Optional[float] = None,
     dry_run: bool = False
 ) -> str:
@@ -656,6 +715,7 @@ def prune_memories(
     Returns:
         List of pruned/would-prune memories
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     threshold = threshold or ARCHIVE_SCORE_THRESHOLD
 
@@ -690,6 +750,7 @@ def prune_memories(
 @mcp.tool()
 def switch_profile(profile_name: str) -> str:
     """Switch active persona context."""
+    global _current_profile
     profile_data = _store.get_profile(profile_name)
     if profile_data is None:
         available = _store.list_profiles()
@@ -698,6 +759,7 @@ def switch_profile(profile_name: str) -> str:
             "available_profiles": available
         })
 
+    _current_profile = profile_name
     stats = _store.token_stats(profile_name)
     _store.log_access("switch_profile", profile_name, "")
     return json.dumps({
@@ -711,8 +773,9 @@ def switch_profile(profile_name: str) -> str:
 
 
 @mcp.tool()
-def list_projects(profile: str = DEFAULT_PROFILE) -> str:
+def list_projects(profile: str = None) -> str:
     """List all projects with status."""
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -762,7 +825,7 @@ def get_access_log(limit: int = 50, include_tokens: bool = True) -> str:
 
 @mcp.tool()
 def get_prune_queue(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     include_report: bool = True
 ) -> str:
     """
@@ -774,6 +837,7 @@ def get_prune_queue(
     Returns:
         JSON with pending queue items and optional pruner report
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     from db.pruner import get_pruner_report
     report = get_pruner_report(_store._conn, since_days=7) if include_report else {}
@@ -790,7 +854,7 @@ def get_prune_queue(
 def resolve_prune_queue(
     queue_id: str,
     approved: bool,
-    profile: str = DEFAULT_PROFILE
+    profile: str = None
 ) -> str:
     """
     Approve or reject a queued prune candidate.
@@ -803,6 +867,7 @@ def resolve_prune_queue(
     Returns:
         Outcome with tokens freed and updated confidence info
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     result = record_outcome(_store._conn, queue_id, approved, _store.delete_memory)
 
@@ -825,7 +890,7 @@ def resolve_prune_queue(
 @mcp.tool()
 def export_for_model(
     model: str,
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     depth: str = "full",
     max_tokens: int = 2000
 ) -> str:
@@ -838,6 +903,7 @@ def export_for_model(
         depth: Export depth (full, summary, minimal)
         max_tokens: Token budget for export (default 2000)
     """
+    profile = profile or _current_profile
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -985,7 +1051,7 @@ def export_for_model(
 
 @mcp.tool()
 def export_passport(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     max_tokens: int = 2000,
 ) -> str:
     """
@@ -1001,6 +1067,7 @@ def export_passport(
     Returns:
         Plain-text Memory Passport string.
     """
+    profile = profile or _current_profile
     from ingestion.passport import build_passport
 
     _store.ensure_profile(profile)
@@ -1033,7 +1100,7 @@ def export_passport(
 
 @mcp.tool()
 def ingest_from_inbox(
-    profile: str = DEFAULT_PROFILE,
+    profile: str = None,
     preview: bool = False
 ) -> str:
     """
@@ -1178,7 +1245,7 @@ def _start_parent_watchdog() -> None:
 # model must not be able to destroy memories; destructive and subprocess-
 # spawning tools stay stdio/Claude-local.
 REMOTE_ALLOWED_TOOLS = {
-    "get_memory", "search_memory", "add_memory", "add_memories", "edit_memory",
+    "get_memory", "search_memory", "reflect", "add_memory", "add_memories", "edit_memory",
     "list_projects", "export_passport",
 }
 
