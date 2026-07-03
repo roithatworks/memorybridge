@@ -133,6 +133,11 @@ class MemoryStore:
         self._recency_decay_days = recency_decay_days
         self._llm_synthesize = llm_synthesize
         self._reflector: Any = None
+        # Pending embed threads (issue #5): daemon threads for embed-on-write
+        # that must be drained before os._exit(0) so their SQLite writes
+        # complete. Avoids backfill-on-next-startup for fast shutdowns.
+        self._pending_embeds: set[threading.Thread] = set()
+        self._pending_embed_lock = threading.Lock()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False is safe only because _LockedConnection
         # serializes every statement (issue #6).
@@ -314,14 +319,16 @@ class MemoryStore:
                 )
                 # FTS sync handled by memories_ai trigger (issue #3)
                 self._conn.commit()
-            # Embed-on-write (issue #5): fire-and-forget on a background
-            # thread — first-call model load can take seconds and must not
-            # block the MCP response or hold the DB lock. Fail-soft; FTS
-            # search covers the memory immediately regardless.
-            threading.Thread(
-                target=self._embed_one, args=(mid, profile, content),
+            # Embed-on-write (issue #5): background thread so model load
+            # doesn't block the MCP response. Tracked in _pending_embeds
+            # so shutdown drains it before os._exit(0).
+            t = threading.Thread(
+                target=self._embed_and_cleanup, args=(mid, profile, content),
                 daemon=True, name=f"embed-{mid}"
-            ).start()
+            )
+            with self._pending_embed_lock:
+                self._pending_embeds.add(t)
+            t.start()
             return mid
         except sqlite3.IntegrityError:
             self._conn.rollback()
@@ -867,6 +874,28 @@ class MemoryStore:
             print(f"[memorybridge] embed failed for {memory_id}: {e}",
                   file=sys.stderr)
             return False
+
+    def _embed_and_cleanup(self, mid: str, profile: str, content: str) -> None:
+        """Wrapper around _embed_one that removes thread from pending set."""
+        try:
+            self._embed_one(mid, profile, content)
+        finally:
+            with self._pending_embed_lock:
+                self._pending_embeds.discard(threading.current_thread())
+
+    def drain_embeds(self, timeout: float = 3.0) -> None:
+        """Block until all pending embed threads finish, or timeout.
+
+        Call before os._exit(0) in the SIGTERM handler to avoid leaving
+        orphaned memory_embeddings rows that trigger backfill on restart.
+        """
+        with self._pending_embed_lock:
+            threads = list(self._pending_embeds)
+        if not threads:
+            return
+        per_thread = timeout / max(len(threads), 1)
+        for t in threads:
+            t.join(timeout=per_thread)
 
     def _backfill_missing_embeddings(self) -> int:
         """Embed all active memories that have no vector (issue #5).
