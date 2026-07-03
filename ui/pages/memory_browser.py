@@ -6,10 +6,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from server import delete_memory as _del_tool, get_token_stats as _stats_tool
-delete_memory = _del_tool.fn
-get_token_stats = _stats_tool.fn
-
 MAX_TOTAL_TOKENS = 50_000
 
 
@@ -87,6 +83,6 @@ def render():
                 )
             with col_del:
                 if st.button("🗑", key=f"del_{mem['id']}", help="Delete memory"):
-                    delete_memory(memory_id=mem["id"], profile=profile)
+                    store.delete_memory(profile, mem["id"])
                     st.rerun()
             st.divider()
