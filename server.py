@@ -53,7 +53,7 @@ DATA_DIR = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"
 try:
     from dotenv import load_dotenv
     load_dotenv(DATA_DIR / ".env", override=False)
-except ImportError:
+except (ImportError, OSError):
     pass
 
 MEMORY_DB              = DATA_DIR / "memory.db"
@@ -113,6 +113,10 @@ def _sigterm_handler(signum, frame) -> None:
 
     _cleanup_pid()
     sys.stderr.flush()
+    # Drain pending embed threads so their SQLite writes land before
+    # os._exit. Without this, daemon threads get killed mid-write and
+    # the next startup backfills orphaned embeddings (issue #5).
+    _store.drain_embeds(timeout=3.0)
     # os._exit, not sys.exit: sys.exit raises SystemExit and runs interpreter
     # finalizers, which deadlock on the stdin reader thread's buffer lock
     # (fatal "_enter_buffered_busy" crash seen 2026-06-03). State is already
