@@ -11,8 +11,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from server import add_memory as _add_memory_tool
-add_memory = _add_memory_tool.fn
+from db.store import MemoryStore
+from db.constants import _content_hash
+
+# Lazy store — initialized once per Streamlit session
+_STORE: MemoryStore | None = None
+
+
+def _get_store() -> MemoryStore:
+    global _STORE
+    if _STORE is None:
+        from pathlib import Path
+        _STORE = MemoryStore(Path.home() / "memorybridge" / "memory.db")
+    return _STORE
 
 FLAGGED_QUEUE_PATH = Path.home() / "memorybridge" / "flagged_queue.json"
 
@@ -53,12 +64,13 @@ def accept_item(item_id: str, queue_path: Path = None) -> bool:
     if item is None:
         return False
 
-    add_memory(
-        content=item["fact"],
+    store = _get_store()
+    store.add_memory(
+        item.get("profile", "default"),
+        item["fact"],
         category=item.get("category", "fact"),
         importance=item.get("importance", "medium"),
         project_id=item.get("project"),
-        profile=item.get("profile", "default"),
     )
     item["status"] = "accepted"
     save_queue(data, queue_path)
