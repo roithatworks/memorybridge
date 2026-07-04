@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 from db.constants import (  # noqa: E402
     VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score,
-    guardrail_check, _merge_tags, _max_importance
+    guardrail_check, _merge_tags, _max_importance, generate_tags
 )
 from db.entities import EntityExtractor
 
@@ -273,12 +273,16 @@ class MemoryStore:
     def add_memory(self, profile: str, content: str, *,
                    category: str = "fact", importance: str = "medium",
                    tags: list = None, project_id: str = None,
-                   enforce_guardrail: bool = True) -> str | None:
+                   enforce_guardrail: bool = True,
+                   skip_enrichment: bool = False) -> str | None:
         """Returns memory ID on success, None if exact duplicate.
 
         Raises GuardrailRejection if content is document-shaped (too long, too
         many lines, or markdown-heading/multi-section). Pass
         enforce_guardrail=False only for trusted internal migrations.
+
+        Pass skip_enrichment=True for internal auto-saves (conversation
+        snippets, session summaries) that don't need full tag enrichment.
         """
         if enforce_guardrail:
             ok, reason = guardrail_check(content)
@@ -297,6 +301,17 @@ class MemoryStore:
             entity_tags = self._entity_extractor.extract(content)
             if entity_tags:
                 enriched_tags = _merge_tags(tags or [], entity_tags)
+
+        # Topical tag enrichment: adds category, project, content-type
+        # (question, decision, bug, etc.), and keyword tags.
+        # Skip for internal auto-saves (conversation snippets, summaries).
+        if not skip_enrichment:
+            enriched_tags = generate_tags(
+                content,
+                category=category,
+                project_id=project_id,
+                existing_tags=enriched_tags or [],
+            )
 
         # Fuzzy dedup/merge: check for near-duplicate by entity tag overlap
         # + content similarity. Runs after entity extraction (tags available)
