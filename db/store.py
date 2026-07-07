@@ -409,10 +409,16 @@ class MemoryStore:
         if best_sim < self._merge_threshold:
             return None
 
-        # Merge: append new info annotation, bump importance and timestamp
+        # Merge: append new info annotation, bump importance and timestamp.
+        # Recompute content_hash and token_count for the merged content — the
+        # old code left both stale, which under-counted the token budget and
+        # broke exact-dedup (content_hash no longer matched content).
         now = datetime.now().isoformat()
         date_str = datetime.now().strftime("%Y-%m-%d")
         merge_note = f"\n[merged: {date_str}] {content.strip()}"
+        new_content = (best_row["content"] or "") + merge_note
+        new_hash = _content_hash(new_content)
+        new_tokens = _count_tokens(new_content)
         # Keep the higher importance level
         final_imp = _max_importance(best_row["importance"], "medium")
 
@@ -420,12 +426,14 @@ class MemoryStore:
             with self._conn.transaction():
                 self._conn.execute(
                     """UPDATE memories
-                       SET content = content || ?,
+                       SET content = ?,
+                           content_hash = ?,
+                           token_count = ?,
                            importance = ?,
                            last_accessed = ?,
                            access_count = access_count + 1
                        WHERE id = ? AND profile = ?""",
-                    (merge_note, final_imp, now, best_id, profile),
+                    (new_content, new_hash, new_tokens, final_imp, now, best_id, profile),
                 )
                 self._conn.commit()
             logger.info("Merged new content into existing memory %s (sim=%.2f)",
@@ -970,7 +978,10 @@ class MemoryStore:
         return len(ids)
 
     def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
-        """Fast cosine similarity using numpy."""
+        """Fast cosine similarity using numpy. Returns 0.0 on a shape mismatch
+        rather than raising, so a stale-dimension vector can't crash a search."""
+        if len(a) != len(b):
+            return 0.0
         import numpy as np
         va, vb = np.array(a, dtype=np.float32), np.array(b, dtype=np.float32)
         denom = np.linalg.norm(va) * np.linalg.norm(vb)
@@ -991,6 +1002,7 @@ class MemoryStore:
 
         # Embed query
         q_vec = self._embed_texts([query])[0]
+        q_len = len(q_vec)
 
         # Fetch all embedding rows for profile
         rows = self._conn.execute(
@@ -998,12 +1010,33 @@ class MemoryStore:
             (profile,)
         ).fetchall()
 
-        # Score by cosine similarity
+        # Score by cosine similarity. Guard against stale/mismatched vectors:
+        # if the embedding model ever changes dimension, old rows would make
+        # numpy's dot product raise and take down every search. Skip any vector
+        # whose length differs from the current query vector (or won't parse),
+        # and fall back to keyword search if none are usable.
         scored = []
+        mismatched = 0
         for row in rows:
-            vec = json.loads(row["vector"])
-            sim = self._cosine_similarity(q_vec, vec)
-            scored.append((row["id"], sim))
+            try:
+                vec = json.loads(row["vector"])
+            except (json.JSONDecodeError, TypeError):
+                mismatched += 1
+                continue
+            if not isinstance(vec, list) or len(vec) != q_len:
+                mismatched += 1
+                continue
+            scored.append((row["id"], self._cosine_similarity(q_vec, vec)))
+
+        if mismatched:
+            logger.warning(
+                "search_semantic: %d/%d embeddings for profile '%s' have a stale "
+                "dimension (current=%d) and were skipped — rebuild with "
+                "build_embeddings(profile).", mismatched, len(rows), profile, q_len)
+        if not scored:
+            # Every stored vector is unusable (e.g. model changed) — don't return
+            # an empty result set; degrade to keyword/FTS search.
+            return self.search(profile, query, limit=limit, max_tokens=max_tokens)
 
         # Sort descending by similarity
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -1109,14 +1142,17 @@ class MemoryStore:
         """
         from db.reflect import Reflector
 
-        if self._reflector is None:
-            self._reflector = Reflector(
-                search_fn=lambda q: self.search_hybrid(
-                    profile, q, limit=limit, max_tokens=max_tokens
-                ),
-                llm_synthesize=self._llm_synthesize,
-            )
-        return self._reflector.reflect(question)
+        # Build the Reflector per call. Caching it on the instance froze the
+        # first call's profile/limit/max_tokens into the search closure, so a
+        # later reflect() for a different profile searched the first profile's
+        # memories — a cross-profile data leak. The Reflector is cheap to build.
+        reflector = Reflector(
+            search_fn=lambda q: self.search_hybrid(
+                profile, q, limit=limit, max_tokens=max_tokens
+            ),
+            llm_synthesize=self._llm_synthesize,
+        )
+        return reflector.reflect(question)
 
     # -------------------------------------------------------------------------
     # Internal helpers
