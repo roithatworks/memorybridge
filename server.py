@@ -1440,6 +1440,7 @@ def _run_http() -> None:
     # capability path clients expect; otherwise fall back to mcp.run so a
     # FastMCP API change can never leave the bridge serving on the wrong path.
     mcp_path = f"/{token}/mcp"
+    # FastMCP 2.x exposes http_app(path=...); older builds used streamable_http_app.
     app_factory = getattr(mcp, "http_app", None) or getattr(mcp, "streamable_http_app", None)
     app = None
     if callable(app_factory):
@@ -1455,8 +1456,12 @@ def _run_http() -> None:
               f"path=/<redacted>/mcp | tools gated: removed {len(removed)} "
               f"({', '.join(sorted(removed))}) | rate limit {rate_limit}/{rate_window}s per IP",
               file=sys.stderr)
+        # lifespan="on": the streamable-HTTP session manager is started by the
+        # Starlette lifespan; the ASGI wrapper forwards lifespan scopes, and
+        # forcing it on (vs "auto") makes a lifespan failure loud instead of
+        # degrading every request to a 500.
         uvicorn.run(wrapped, host="127.0.0.1", port=port,
-                    access_log=False, log_level="warning")
+                    access_log=False, log_level="warning", lifespan="on")
     else:
         print(f"[memorybridge] WARNING: could not attach rate-limiting middleware "
               f"(FastMCP app factory unavailable); serving without per-IP rate "
