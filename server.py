@@ -59,6 +59,10 @@ except (ImportError, OSError):
 MEMORY_DB              = DATA_DIR / "memory.db"
 DEFAULT_PROFILE        = "default"
 _current_profile       = DEFAULT_PROFILE
+# True only while serving over the HTTP bridge (remote clients). Gates the
+# auto-pruner's delete path so a remote-origin write can never destroy a
+# memory — candidates are routed to the review queue instead. See #37.
+_REMOTE_MODE           = False
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
@@ -391,8 +395,10 @@ def add_memory(
     if stats["total_tokens"] > MAX_TOTAL_TOKENS:
         budget_pruned = _store.auto_prune(profile, threshold=ARCHIVE_SCORE_THRESHOLD)
 
-    # Adaptive dedup/staleness prune
-    prune_result = run_auto_prune(_store._conn, profile, _store.delete_memory)
+    # Adaptive dedup/staleness prune. Over the remote bridge, never auto-delete:
+    # route candidates to the review queue so a remote write can't destroy data.
+    prune_result = run_auto_prune(_store._conn, profile, _store.delete_memory,
+                                  allow_auto_delete=not _REMOTE_MODE)
 
     _store.log_access("add_memory", profile, f"id={mid}, tokens={token_count}")
 
@@ -1252,11 +1258,9 @@ def _start_parent_watchdog() -> None:
 #     (destruction-equivalent for a confused/hostile remote model).
 #   - add_memories: removed — it is a batch wrapper over add_memory with no
 #     added remote value and the same side effects.
-# NOTE (issue #37, still open): add_memory below can still trigger the
-# auto-pruner's delete path. Fully neutralizing that requires threading a
-# no-op delete callback through run_auto_prune for remote-origin writes;
-# tracked separately. This allowlist change closes the direct overwrite/
-# batch vectors now.
+#   - add_memory: kept (remote clients need to write), but its auto-prune
+#     delete path is disabled for remote writes via _REMOTE_MODE — candidates
+#     are routed to the review queue instead of deleted (issue #37).
 REMOTE_ALLOWED_TOOLS = {
     "get_memory", "search_memory", "reflect", "add_memory",
     "list_projects", "export_passport",
@@ -1308,6 +1312,11 @@ def _run_http() -> None:
     - Parent watchdog is NOT started: under launchd our PPID is legitimately
       1, and the watchdog would kill the server 5s after boot.
     """
+    # Mark remote mode so the auto-pruner's delete path is disabled for
+    # writes that arrive over this bridge (see add_memory / issue #37).
+    global _REMOTE_MODE
+    _REMOTE_MODE = True
+
     token = os.environ.get("MEMORYBRIDGE_TOKEN", "").strip()
     if len(token) < 32:
         print("[memorybridge] FATAL: MEMORYBRIDGE_TOKEN missing or under 32 chars "
