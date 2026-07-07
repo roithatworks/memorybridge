@@ -1331,7 +1331,6 @@ def _run_http() -> None:
     # uvicorn access logger records the full path on every request, which would
     # write the secret to stdout/stderr and any tunnel/proxy log. Disable it so
     # the token never lands in a log. Never print even a prefix of the token.
-    import logging
     logging.getLogger("uvicorn.access").disabled = True
 
     print(f"[memorybridge] HTTP bridge on 127.0.0.1:{port} "
