@@ -98,15 +98,18 @@ def batch_accept(queue_path: Path = None) -> int:
     Returns count of items accepted.
     """
     data = load_queue(queue_path)
+    store = _get_store()
     count = 0
     for item in data.get("items", []):
         if item.get("status") == "pending":
-            add_memory(
-                content=item["fact"],
+            # Was a bare add_memory(...) — an undefined name that raised
+            # NameError on the first pending item, so "Accept all" never worked.
+            store.add_memory(
+                item.get("profile", "default"),
+                item["fact"],
                 category=item.get("category", "fact"),
                 importance=item.get("importance", "medium"),
                 project_id=item.get("project"),
-                profile=item.get("profile", "default"),
             )
             item["status"] = "accepted"
             count += 1
