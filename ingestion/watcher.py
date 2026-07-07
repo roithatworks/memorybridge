@@ -87,6 +87,20 @@ def detect_source(file_path: Path) -> str | None:
 # File movement helpers
 # ---------------------------------------------------------------------------
 
+def _is_stable(file_path: Path, wait: float = 1.5) -> bool:
+    """Two-sample size check: True only if the file size is unchanged over a
+    short interval. A file mid-copy (Finder drag, browser download) is still
+    growing; processing it would parse truncated JSON and wrongly condemn the
+    completed file to failed/. Unstable files are left for the next run."""
+    try:
+        s1 = file_path.stat().st_size
+        time.sleep(wait)
+        s2 = file_path.stat().st_size
+    except OSError:
+        return False
+    return s1 == s2
+
+
 def _unique_dest(dest_dir: Path, filename: str) -> Path:
     """Return a path in dest_dir that doesn't already exist."""
     candidate = dest_dir / filename
@@ -195,6 +209,13 @@ def scan_inbox(inbox: Path, profile: str = "default", preview: bool = False,
     skipped = 0
 
     for f in files:
+        # Skip files that are still being written (leave them for the next run)
+        # rather than parsing a truncated copy and dumping it into failed/.
+        if not _dry_run and not _is_stable(f):
+            logger.info("Skipping %s — still being written (size changing)", f.name)
+            skipped += 1
+            continue
+
         source = detect_source(f)
         if source is None:
             logger.warning("Cannot detect source for %s — moving to failed/", f.name)
