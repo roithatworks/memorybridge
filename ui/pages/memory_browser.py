@@ -82,7 +82,27 @@ def render():
                     f"Created: {mem.get('created_at', '')}"
                 )
             with col_del:
-                if st.button("🗑", key=f"del_{mem['id']}", help="Delete memory"):
-                    store.delete_memory(profile, mem["id"])
-                    st.rerun()
+                # Two-click confirmation + audit log. delete_memory is a hard
+                # DELETE with no undo, so a single misclick must not destroy a
+                # memory, and UI deletes must be recorded like the MCP tool's.
+                if st.session_state.get("_confirm_del") == mem["id"]:
+                    if st.button("✓", key=f"confirmdel_{mem['id']}",
+                                 help="Confirm permanent delete"):
+                        store.delete_memory(profile, mem["id"])
+                        try:
+                            store.log_access("delete_memory", profile,
+                                             f"id={mem['id']} (via UI)")
+                        except Exception:
+                            pass
+                        st.session_state.pop("_confirm_del", None)
+                        st.rerun()
+                    if st.button("✕", key=f"canceldel_{mem['id']}", help="Cancel"):
+                        st.session_state.pop("_confirm_del", None)
+                        st.rerun()
+                else:
+                    if st.button("🗑", key=f"del_{mem['id']}", help="Delete memory"):
+                        st.session_state["_confirm_del"] = mem["id"]
+                        st.rerun()
+            if st.session_state.get("_confirm_del") == mem["id"]:
+                st.warning("Click ✓ to permanently delete this memory, or ✕ to cancel.")
             st.divider()
