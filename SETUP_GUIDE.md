@@ -1,52 +1,51 @@
 # MemoryBridge — Setup Guide
 
-MemoryBridge gives Claude a persistent, local memory that works across every conversation — Claude desktop app, Cowork mode, Claude.ai (via export), and even other AI models. Your memories stay on your machine. Nothing goes to the cloud.
+MemoryBridge gives Claude a persistent, local memory that works across every conversation — Claude desktop app, Cowork mode, Claude.ai (via export), and even other AI models. Your **memory database stays on your machine**. (The optional ingestion pipeline — extracting facts from ChatGPT/Gemini/Claude exports — sends that conversation content to the DeepSeek and Anthropic APIs, and can sync flagged facts to Notion, only when you configure those. The core memory store and stdio serving are fully local.)
+
+---
+
+## Code vs. data
+
+MemoryBridge keeps **code** and **data** separate:
+
+- **Code** — the git repo (`server.py`, `db/`, `ingestion/`, `ui/`, …). Clone it wherever you keep code. `server.py` imports the `db/` and `ingestion/` packages, so it must run from inside the clone — copying `server.py` alone will not work.
+- **Data** — `~/memorybridge/` (memory.db, .env, inbox/, logs/). Override with `MEMORYBRIDGE_DATA`.
+
+This guide clones the code to `~/apps/memorybridge`; use any path you like and substitute it below.
 
 ---
 
 ## What You Need
 
 - A Mac (instructions below are Mac-specific; Windows/Linux paths differ slightly)
-- Python 3.10 or later
-- The Claude desktop app installed
+- Python 3.11 or later
+- `git`, and the Claude desktop app installed
 
 ---
 
-## Step 1 — Put the Files in Place
-
-Create a folder called `memorybridge` in your home directory and copy `server.py` and `requirements.txt` into it:
+## Step 1 — Clone the repository
 
 ```bash
-mkdir ~/memorybridge
-cp server.py ~/memorybridge/
-cp requirements.txt ~/memorybridge/
+mkdir -p ~/apps
+git clone https://github.com/roithatworks/memorybridge.git ~/apps/memorybridge
 ```
 
-Your folder should look like this:
-```
-~/memorybridge/
-  server.py
-  requirements.txt
-```
+The data directory (`~/memorybridge/`) is created automatically on first run — you do **not** put code there.
 
 ---
 
 ## Step 2 — Install Dependencies
 
-Open Terminal and run:
-
 ```bash
-pip3 install -r ~/memorybridge/requirements.txt
+cd ~/apps/memorybridge
+pip3 install -r requirements.txt          # add --break-system-packages if pip refuses
+# optional, to run the test suite:
+pip3 install -r requirements-dev.txt
 ```
 
-If you get a permissions error, try:
+Verify:
 ```bash
-pip3 install --user fastmcp tiktoken
-```
-
-To verify it worked:
-```bash
-python3 -c "import fastmcp; print('fastmcp OK')"
+cd ~/apps/memorybridge && python3 -c "import fastmcp; import db.store; print('MemoryBridge deps OK')"
 ```
 
 ---
@@ -65,7 +64,7 @@ python3 -c "import fastmcp; print('fastmcp OK')"
     "memorybridge": {
       "command": "python3",
       "args": [
-        "/Users/YOUR_USERNAME/memorybridge/server.py"
+        "/Users/YOUR_USERNAME/apps/memorybridge/server.py"
       ]
     }
   }
@@ -81,7 +80,7 @@ If you already have other MCP servers configured, add the `"memorybridge"` block
   "mcpServers": {
     "memorybridge": {
       "command": "python3",
-      "args": ["/Users/YOUR_USERNAME/memorybridge/server.py"]
+      "args": ["/Users/YOUR_USERNAME/apps/memorybridge/server.py"]
     },
     "some-other-server": { ... }
   }
@@ -171,7 +170,7 @@ MemoryBridge is registered as a system-level MCP server, which means it's availa
 **Claude says it doesn't have memory tools:**
 - Make sure you fully quit and relaunched Claude (not just closed the window)
 - Check that the path in `claude_desktop_config.json` matches your actual username
-- Run `python3 ~/memorybridge/server.py` in Terminal — if it errors, fix those errors first
+- Run `cd ~/apps/memorybridge && python3 server.py` in Terminal — if it errors, fix those errors first (it must run from inside the clone so `db/` and `ingestion/` import)
 
 **"Module not found" error:**
 - Run `pip3 install fastmcp` again

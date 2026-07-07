@@ -3,7 +3,7 @@
     "memorybridge": {
       "command": "python3",
       "args": [
-        "/Users/YOUR_USERNAME/memorybridge/server.py"
+        "/Users/YOUR_USERNAME/apps/memorybridge/server.py"
       ]
     }
   }
