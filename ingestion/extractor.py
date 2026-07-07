@@ -247,8 +247,24 @@ def extract(normalized: dict) -> list:
     except ExtractionError:
         raise
 
+    # Cost guard (#44): extraction is one paid API call per _BATCH_SIZE
+    # conversations, so an unbounded history can silently run up a large bill
+    # (made worse by the watcher's retry-on-timeout). Cap the number processed
+    # by default; override with MEMORYBRIDGE_MAX_CONVERSATIONS=0 (unlimited) or a
+    # larger number. Also print an up-front estimate of API calls.
+    max_conv = int(os.environ.get("MEMORYBRIDGE_MAX_CONVERSATIONS", "500"))
+    total = len(conversations)
+    if max_conv > 0 and total > max_conv:
+        print(f"  [extract] WARNING: {total} conversations exceeds cap {max_conv}; "
+              f"processing the first {max_conv}. Set MEMORYBRIDGE_MAX_CONVERSATIONS=0 "
+              f"to process all (higher API cost).", file=sys.stderr, flush=True)
+        logger.warning("Capping extraction: %d -> %d conversations", total, max_conv)
+        conversations = conversations[:max_conv]
+
     all_facts = []
     batches = [conversations[i:i + _BATCH_SIZE] for i in range(0, len(conversations), _BATCH_SIZE)]
+    print(f"  [extract] {len(conversations)} conversations -> ~{len(batches)} API "
+          f"calls (batch size {_BATCH_SIZE})", file=sys.stderr, flush=True)
 
     for batch_idx, batch in enumerate(batches):
         logger.info("Extracting batch %d/%d (%d conversations)", batch_idx + 1, len(batches), len(batch))

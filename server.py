@@ -66,6 +66,21 @@ _current_profile       = DEFAULT_PROFILE
 # auto-pruner's delete path so a remote-origin write can never destroy a
 # memory — candidates are routed to the review queue instead. See #37.
 _REMOTE_MODE           = False
+
+
+def _active_profile() -> str:
+    """Resolve the profile for a call that omitted one.
+
+    Over the HTTP bridge (`_REMOTE_MODE`), NEVER resolve through the mutable
+    process-global `_current_profile`: it is shared across all concurrent
+    remote requests, so one client's `switch_profile` would silently retarget
+    every other client's reads/writes (#70). Remote requests default to
+    DEFAULT_PROFILE; a remote client that needs a specific profile passes it
+    explicitly. Local stdio (single session) keeps the switchable global.
+    """
+    return DEFAULT_PROFILE if _REMOTE_MODE else _current_profile
+
+
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
@@ -266,7 +281,7 @@ def get_memory(
     Returns:
         JSON with memories, token stats, and budget info
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -378,15 +393,20 @@ def add_memory(
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
         return json.dumps({"error": f"Invalid importance. Valid: {IMPORTANCE_LEVELS}"})
 
-    mid = _store.add_memory(profile, content,
-                            category=category, importance=importance,
-                            tags=tags, project_id=project_id)
+    try:
+        mid = _store.add_memory(profile, content,
+                                category=category, importance=importance,
+                                tags=tags, project_id=project_id)
+    except GuardrailRejection as e:
+        # Document-shaped content: return the structured error contract every
+        # other validation path uses, instead of surfacing an unhandled MCP error.
+        return json.dumps({"status": "rejected", "reason": str(e)})
     if mid is None:
         return json.dumps({"status": "duplicate", "reason": "identical content already exists"})
 
@@ -447,7 +467,7 @@ def add_memories(
     Returns:
         Summary with all added memory IDs and total tokens
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
@@ -536,7 +556,7 @@ def edit_memory(
     Returns:
         JSON confirmation, or {"error": ...} if memory_id not found / validation fails
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     if importance is not None and importance not in IMPORTANCE_LEVELS:
         return json.dumps({"error": f"Invalid importance. Valid: {IMPORTANCE_LEVELS}"})
     if category is not None and category not in VALID_CATEGORIES:
@@ -589,7 +609,7 @@ def search_memory(
     Returns:
         JSON with ranked results (internal fields stripped)
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
 
     if category and category not in VALID_CATEGORIES:
@@ -646,7 +666,7 @@ def reflect(
     Returns:
         JSON with structured synthesis
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
 
     result = _store.reflect(profile, question, limit=limit, max_tokens=max_tokens)
@@ -659,7 +679,7 @@ def delete_memory(
     profile: str = None
 ) -> str:
     """Delete a specific memory by ID."""
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     tokens_freed = _store.delete_memory(profile, memory_id)
     if tokens_freed == 0:
         # Check if profile even exists
@@ -748,7 +768,7 @@ def prune_memories(
     Returns:
         List of pruned/would-prune memories
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     threshold = threshold or ARCHIVE_SCORE_THRESHOLD
 
@@ -808,7 +828,7 @@ def switch_profile(profile_name: str) -> str:
 @mcp.tool()
 def list_projects(profile: str = None) -> str:
     """List all projects with status."""
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -870,7 +890,7 @@ def get_prune_queue(
     Returns:
         JSON with pending queue items and optional pruner report
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     from db.pruner import get_pruner_report
     report = get_pruner_report(_store._conn, since_days=7) if include_report else {}
@@ -900,7 +920,7 @@ def resolve_prune_queue(
     Returns:
         Outcome with tokens freed and updated confidence info
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     result = record_outcome(_store._conn, queue_id, approved, _store.delete_memory)
 
@@ -936,7 +956,7 @@ def export_for_model(
         depth: Export depth (full, summary, minimal)
         max_tokens: Token budget for export (default 2000)
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -1100,7 +1120,7 @@ def export_passport(
     Returns:
         Plain-text Memory Passport string.
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     from ingestion.passport import build_passport
 
     _store.ensure_profile(profile)
@@ -1152,6 +1172,11 @@ def ingest_from_inbox(
     """
     import subprocess
     import sys
+
+    # Normalize like every other tool — otherwise a default call passes
+    # profile=None straight into the subprocess argv (TypeError / a profile
+    # literally named "None").
+    profile = profile or _active_profile()
 
     inbox = DATA_DIR / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
