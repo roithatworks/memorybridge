@@ -38,11 +38,16 @@ def _keyword_overlap(a: str, b: str) -> float:
 
 
 def _search_existing(fact_text: str, profile: str) -> list:
-    """Return search results for a fact string."""
+    """Return search results for a fact string.
+
+    Note: search_hybrid/search_semantic already degrade to keyword search when
+    the embedding model is unavailable, so reaching this handler means a real
+    query failure. Log at ERROR (not WARNING) — a swallowed failure here means
+    dedup is silently off and the store will fill with duplicates."""
     try:
         return _store.search_hybrid(profile=profile, query=fact_text, limit=5)
     except Exception as e:
-        logger.warning("search_hybrid failed: %s", e)
+        logger.error("search_hybrid failed for dedup (dedup DEGRADED): %s", e)
         return []
 
 

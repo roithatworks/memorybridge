@@ -1000,8 +1000,17 @@ class MemoryStore:
         if count == 0:
             return self.search(profile, query, limit=limit, max_tokens=max_tokens)
 
-        # Embed query
-        q_vec = self._embed_texts([query])[0]
+        # Embed query. If the embedding model can't load (fastembed missing,
+        # download failed), DON'T let the exception propagate — callers (merger,
+        # router) catch it and return [], which silently disables dedup and
+        # conflict detection and floods the store with duplicates. Degrade to
+        # keyword/FTS search instead: weaker, but still catches duplicates.
+        try:
+            q_vec = self._embed_texts([query])[0]
+        except Exception as e:
+            logger.error("Embedding model unavailable (%s) — falling back to "
+                         "keyword search; semantic dedup is degraded.", e)
+            return self.search(profile, query, limit=limit, max_tokens=max_tokens)
         q_len = len(q_vec)
 
         # Fetch all embedding rows for profile

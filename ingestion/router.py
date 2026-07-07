@@ -35,7 +35,10 @@ def _detect_conflict(fact: dict, profile: str) -> str | None:
             if mem.get("match_score", 0) > _CONFLICT_SIMILARITY:
                 return mem.get("content", "")
     except Exception as e:
-        logger.warning("search_hybrid failed during conflict detection: %s", e)
+        # search degrades to keyword search on embed failure, so reaching here is
+        # a real failure — conflict detection is silently off. Make it visible.
+        logger.error("search_hybrid failed during conflict detection "
+                     "(conflict check DEGRADED): %s", e)
     return None
 
 

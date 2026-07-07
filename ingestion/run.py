@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -61,6 +62,46 @@ PARSERS = {
 MEMORYBRIDGE_DIR = _DATA_DIR
 LOGS_DIR = MEMORYBRIDGE_DIR / "logs"
 FLAGGED_QUEUE = MEMORYBRIDGE_DIR / "flagged_queue.json"
+# Idempotency ledger (#45): sha256 of every conversation already ingested, so
+# re-dropping the same export doesn't re-pay extraction or double-write.
+INGESTED_LEDGER = MEMORYBRIDGE_DIR / "ingested_conversations.json"
+
+
+def _conv_hash(source: str, conv: dict) -> str:
+    """Stable content hash of a conversation for the idempotency ledger."""
+    payload = json.dumps(
+        {"source": source, "id": conv.get("id", ""),
+         "messages": conv.get("messages", [])},
+        sort_keys=True, ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_ledger() -> dict:
+    """Load the ingested-conversation ledger ({hash: iso_ts}). Tolerant of a
+    missing or corrupt file (treated as empty)."""
+    if not INGESTED_LEDGER.exists():
+        return {}
+    try:
+        data = json.loads(INGESTED_LEDGER.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("ingested_conversations.json unreadable — treating as empty")
+        return {}
+
+
+def _record_ingested(source: str, convs: list) -> None:
+    """Atomically add the given conversations' hashes to the ledger."""
+    if not convs:
+        return
+    ledger = _load_ledger()
+    now = datetime.now().isoformat()
+    for c in convs:
+        ledger[_conv_hash(source, c)] = now
+    INGESTED_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    tmp = INGESTED_LEDGER.with_name(f"{INGESTED_LEDGER.name}.tmp")
+    tmp.write_text(json.dumps(ledger, indent=0))
+    os.replace(tmp, INGESTED_LEDGER)
 
 
 def _write_flagged(flagged: list, source: str, profile: str) -> None:
@@ -174,6 +215,35 @@ def main():
     conv_count = len(normalized.get("conversations", []))
     print(f"  Found {conv_count} conversations")
 
+    # 1b. Idempotency (#45): skip conversations already ingested in a prior run
+    # so a re-dropped export doesn't re-pay extraction or double-write. Record
+    # (below) only after a successful run. MEMORYBRIDGE_FORCE_REINGEST=1 bypasses.
+    force_reingest = os.environ.get("MEMORYBRIDGE_FORCE_REINGEST", "").lower() \
+        in ("1", "true", "yes")
+    _max_conv = int(os.environ.get("MEMORYBRIDGE_MAX_CONVERSATIONS", "500"))
+
+    def _cap(seq):
+        return seq[:_max_conv] if (_max_conv > 0 and len(seq) > _max_conv) else seq
+
+    convs_to_record = []
+    if not args.preview:
+        all_convs = normalized.get("conversations", [])
+        if force_reingest:
+            convs_to_record = _cap(all_convs)
+        else:
+            ledger = _load_ledger()
+            unseen = [c for c in all_convs
+                      if _conv_hash(args.source, c) not in ledger]
+            already = len(all_convs) - len(unseen)
+            if already:
+                print(f"  Skipping {already} already-ingested conversations "
+                      f"(idempotency; set MEMORYBRIDGE_FORCE_REINGEST=1 to reprocess)")
+            normalized["conversations"] = unseen
+            conv_count = len(unseen)
+            # Record only what extraction will actually process (mirrors the
+            # #44 cost cap, which truncates to the first _max_conv).
+            convs_to_record = _cap(unseen)
+
     if conv_count == 0:
         print("No conversations to process.")
         return
@@ -264,6 +334,10 @@ def main():
             print(f"Ingestion accounted for none of {intended} intended facts — "
                   f"treating as failure.", file=sys.stderr)
             sys.exit(1)
+
+        # Success — record processed conversations in the idempotency ledger.
+        # Placed AFTER the failure exit above so a failed run can be retried.
+        _record_ingested(args.source, convs_to_record)
 
 
 if __name__ == "__main__":
