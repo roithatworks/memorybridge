@@ -372,7 +372,9 @@ class MemoryStore:
             return None
 
         # Find candidate memories sharing ≥ merge_min_tags entity tags.
-        tag_list = ",".join(f"'{t}'" for t in entity_tags)
+        # Bind tags as ? placeholders — never interpolate caller-supplied
+        # tag values into SQL (they reach here from add_memory's `tags` arg).
+        placeholders = ",".join("?" for _ in entity_tags)
         try:
             rows = self._conn.execute(
                 f"""SELECT m.id, m.content, m.importance, m.tags,
@@ -380,12 +382,12 @@ class MemoryStore:
                     FROM memories m, json_each(m.tags) AS jt
                     WHERE m.profile = ?
                       AND m.archived = 0
-                      AND jt.value IN ({tag_list})
+                      AND jt.value IN ({placeholders})
                     GROUP BY m.id
                     HAVING shared >= ?
                     ORDER BY shared DESC
                     LIMIT 5""",
-                (profile, self._merge_min_tags),
+                (profile, *entity_tags, self._merge_min_tags),
             ).fetchall()
         except Exception:
             return None  # json_each may fail on old SQLite — fail-soft
@@ -1190,20 +1192,23 @@ class MemoryStore:
         if len(all_entity_tags) < 2:
             return results  # Not enough entity signal
 
-        # Query for memories sharing ≥2 entity tags
-        tag_list = ",".join(f"'{t}'" for t in all_entity_tags)
+        # Query for memories sharing ≥2 entity tags.
+        # Bind tags as ? placeholders — these values originate from stored
+        # `tags` (ultimately caller-supplied) and must never be interpolated.
+        entity_tag_list = list(all_entity_tags)
+        placeholders = ",".join("?" for _ in entity_tag_list)
         try:
             rows = self._conn.execute(
                 f"""SELECT m.*, COUNT(DISTINCT jt.value) AS shared
                     FROM memories m, json_each(m.tags) AS jt
                     WHERE m.profile = ?
                       AND m.archived = 0
-                      AND jt.value IN ({tag_list})
+                      AND jt.value IN ({placeholders})
                     GROUP BY m.id
                     HAVING shared >= 2
                     ORDER BY shared DESC, m.relevance_score DESC
                     LIMIT ?""",
-                (profile, max_related * 2),
+                (profile, *entity_tag_list, max_related * 2),
             ).fetchall()
         except Exception as e:
             logger.debug("Related expansion query failed: %s", e)
