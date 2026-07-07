@@ -21,6 +21,7 @@ Confidence lifecycle:
 """
 
 import json
+import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -36,6 +37,12 @@ MIN_CONFIDENCE           = 0.20
 MAX_CONFIDENCE           = 0.99
 STALE_DAYS               = 30
 NEVER_AUTO_DELETE_IMPORTANCE = {"critical"}  # always queue, never auto-execute
+
+# Rules whose deletions must ALWAYS be human-reviewed, no matter how confident
+# the rule has become. verbatim_subset infers "the shorter fact is redundant"
+# from containment, which is often a refinement/exception rather than a true
+# duplicate — too risky to ever auto-delete unattended.
+REVIEW_ONLY_RULES = {"verbatim_subset"}
 
 RULE_NAMES = ["verbatim_subset", "stale_project_status"]
 
@@ -135,7 +142,20 @@ def find_subset_candidates(conn, profile: str) -> list[dict]:
             # subset must be strictly shorter — skip equal-or-shorter entries
             if len(norm_other) <= len(norm_content):
                 continue
-            if norm_content not in norm_other:
+            # Only supersede within the same category AND project. A longer fact
+            # in a different topic/scope is usually a refinement or exception
+            # ("uses Notion" vs "uses Notion only for teaching"), not a true
+            # duplicate — deleting the shorter one would lose the general fact.
+            if mem.get("category") != other.get("category"):
+                continue
+            if mem.get("project_id") != other.get("project_id"):
+                continue
+            # Require WHOLE-WORD contiguous containment, not a raw substring, so
+            # "SAP" isn't treated as contained in "mishap". Word-boundary
+            # lookarounds also tolerate adjacent punctuation ("roles" matches
+            # "roles, remote…") which a naive space-pad would miss.
+            if not re.search(r"(?<!\w)" + re.escape(norm_content) + r"(?!\w)",
+                             norm_other):
                 continue
             candidates.append({
                 "rule_name": "verbatim_subset",
@@ -262,7 +282,8 @@ def run_auto_prune(conn, profile: str, delete_fn, allow_auto_delete: bool = True
         if already_logged:
             continue
 
-        if confidence >= AUTO_EXECUTE_THRESHOLD and allow_auto_delete:
+        review_only = rule_name in REVIEW_ONLY_RULES
+        if confidence >= AUTO_EXECUTE_THRESHOLD and allow_auto_delete and not review_only:
             # Auto-execute
             tokens_freed = delete_fn(profile, cand["candidate_id"])
             _log_decision(conn, profile, rule_name, "delete", cand,
@@ -457,9 +478,11 @@ def get_pruner_report(conn, since_days: int = 7) -> dict:
             "queue_count": r["queue_count"],
         })
 
-    # Recalibration events (threshold crossings) in the period
-    recal_changes = recalibrate_thresholds(conn)
-
+    # NOTE: get_pruner_report is READ-ONLY. It must not call
+    # recalibrate_thresholds() — that writes pruner_rules and commits, so every
+    # report/UI-poll nudged rule confidence and could silently escalate rules
+    # into auto-delete mode. Recalibration happens where it belongs, in
+    # record_outcome() on an actual user decision.
     return {
         "period_days": since_days,
         "auto_deleted_count": len(auto_deleted),
@@ -479,7 +502,9 @@ def get_pruner_report(conn, since_days: int = 7) -> dict:
             for q in queued_pending
         ],
         "rule_states": rule_summaries,
-        "recalibration_changes": recal_changes,
+        # Recalibration is applied by record_outcome(), not by this read-only
+        # report; kept for response-shape compatibility.
+        "recalibration_changes": [],
     }
 
 
