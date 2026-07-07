@@ -64,16 +64,31 @@ FLAGGED_QUEUE = MEMORYBRIDGE_DIR / "flagged_queue.json"
 
 
 def _write_flagged(flagged: list, source: str, profile: str) -> None:
-    """Append flagged items to flagged_queue.json."""
+    """Append flagged items to flagged_queue.json (atomically, without ever
+    silently discarding existing pending items)."""
     if not flagged:
         return
 
+    FLAGGED_QUEUE.parent.mkdir(parents=True, exist_ok=True)
     existing = {"generated": datetime.now().isoformat(), "items": []}
     if FLAGGED_QUEUE.exists():
         try:
-            existing = json.loads(FLAGGED_QUEUE.read_text())
-        except Exception:
-            pass
+            loaded = json.loads(FLAGGED_QUEUE.read_text())
+            if isinstance(loaded, dict) and isinstance(loaded.get("items"), list):
+                existing = loaded
+            else:
+                raise ValueError("unexpected queue shape")
+        except Exception as e:
+            # Do NOT silently overwrite an unreadable queue — that would drop
+            # every pending review item. Preserve it as a .corrupt backup first.
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            bak = FLAGGED_QUEUE.with_name(f"{FLAGGED_QUEUE.name}.corrupt-{ts}")
+            try:
+                FLAGGED_QUEUE.replace(bak)
+                logger.error("flagged_queue.json unreadable (%s) — backed up to %s",
+                             e, bak)
+            except Exception:
+                logger.error("flagged_queue.json unreadable (%s) and backup failed", e)
 
     for fact in flagged:
         existing["items"].append({
@@ -91,8 +106,10 @@ def _write_flagged(flagged: list, source: str, profile: str) -> None:
         })
 
     existing["generated"] = datetime.now().isoformat()
-    FLAGGED_QUEUE.parent.mkdir(parents=True, exist_ok=True)
-    FLAGGED_QUEUE.write_text(json.dumps(existing, indent=2))
+    # Atomic write: a crash mid-write must not corrupt the queue.
+    tmp = FLAGGED_QUEUE.with_name(f"{FLAGGED_QUEUE.name}.tmp")
+    tmp.write_text(json.dumps(existing, indent=2))
+    os.replace(tmp, FLAGGED_QUEUE)
 
 
 def _write_log(report: dict, flagged_count: int, escalated_count: int) -> Path:
@@ -230,6 +247,23 @@ def main():
 
     elapsed = time.time() - start
     _print_summary(report, conv_count, len(flagged), elapsed)
+
+    # Honest exit status for the watcher (#60). The watcher uses our exit code to
+    # decide processed/ vs failed/. If facts were meant to be written but the
+    # merge accounted for NONE of them (not added, not duplicate, not merged, not
+    # guardrail-rejected, not conflict-rejected), the writes silently vanished —
+    # exit non-zero so the file lands in failed/ instead of being archived as a
+    # success. Legitimate all-duplicate / all-flagged runs still exit 0.
+    if not args.preview:
+        intended = len(accepted) + sum(
+            1 for r in resolved if r.get("verdict") in ("accept", "merge"))
+        accounted = (report.get("added", 0) + report.get("skipped_duplicate", 0)
+                     + report.get("merged", 0) + report.get("guardrail_rejected", 0)
+                     + report.get("rejected", 0))
+        if intended > 0 and accounted == 0:
+            print(f"Ingestion accounted for none of {intended} intended facts — "
+                  f"treating as failure.", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
