@@ -1,0 +1,12 @@
+# MemoryBridge UI hardening. The review UI can delete memories and spawn
+# ingestion subprocesses, so it must not be reachable from the LAN.
+[server]
+# Bind to loopback only — do not listen on 0.0.0.0.
+address = "localhost"
+headless = true
+# Keep browser XSRF/CORS protections on (Streamlit's safe defaults).
+enableXsrfProtection = true
+enableCORS = true
+
+[browser]
+gatherUsageStats = false
