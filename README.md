@@ -4,7 +4,7 @@ Persistent, local-first memory for Claude — and every other AI you use.
 
 Every Claude session starts from zero. MemoryBridge fixes that. It runs a lightweight local MCP server that gives Claude a set of memory tools via the Model Context Protocol. Tell it something once, and it remembers — across sessions, profiles, and AI models.
 
-Everything lives in a SQLite database on your machine. Nothing goes to the cloud.
+Your memory database lives in SQLite on your machine — the store and stdio serving are fully local. The **optional** ingestion pipeline is the one exception: extracting durable facts from ChatGPT/Gemini/Claude exports sends that conversation content to the DeepSeek and Anthropic APIs, and can sync flagged facts to Notion, only when you configure those keys.
 
 ---
 
@@ -295,4 +295,4 @@ python -m pytest tests/ -v
 
 ---
 
-*Local-first. No telemetry. No cloud.*
+*Local-first storage. No telemetry. Third-party APIs (DeepSeek/Anthropic/Notion) are used only by the optional ingestion pipeline when you configure them.*

@@ -3,7 +3,7 @@
   "name": "memorybridge",
   "display_name": "MemoryBridge",
   "version": "3.0.0",
-  "description": "Persistent, local, token-budget-aware memory for AI assistants. Stores memories in SQLite on your machine — nothing goes to the cloud.",
+  "description": "Persistent, local, token-budget-aware memory for AI assistants. Memories are stored in SQLite on your machine; the optional ingestion pipeline uses the DeepSeek/Anthropic APIs (and optionally Notion) only when configured.",
   "long_description": "MemoryBridge gives AI assistants a persistent memory that lives on your computer. Memories are stored locally in SQLite with FTS5 search, decay scoring, and automatic pruning to stay within token budgets. Supports multiple profiles, cross-model export (ChatGPT, Gemini, Ollama), and a portable Memory Passport format for pasting into any AI context window.",
   "author": {
     "name": "Cale Corbett"
