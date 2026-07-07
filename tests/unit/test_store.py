@@ -149,14 +149,18 @@ def test_search_populates_match_score(db):
 
 
 def test_edit_memory_integrity_error_dedup(db):
+    import pytest
+    from db.store import DuplicateContentError
     mid1 = db.add_memory("default", "Unique content one", category="fact")
     mid2 = db.add_memory("default", "Unique content two", category="fact")
-    
-    # Edit mid2 to match mid1's content: should fail safely (return False) instead of raising IntegrityError
-    success = db.edit_memory("default", mid2, content="Unique content one")
-    assert success is False
-    
-    # Assert content of mid2 remains unchanged
+
+    # Editing mid2 to match mid1's content is a DUPLICATE — raise
+    # DuplicateContentError (distinct from a "not found" False), and must not
+    # corrupt data (#53).
+    with pytest.raises(DuplicateContentError):
+        db.edit_memory("default", mid2, content="Unique content one")
+
+    # Content of mid2 remains unchanged
     mems = db.get_memories("default")
     m2 = next(m for m in mems if m["id"] == mid2)
     assert m2["content"] == "Unique content two"

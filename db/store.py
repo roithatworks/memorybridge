@@ -34,6 +34,12 @@ class GuardrailRejection(ValueError):
         self.reason = reason
         super().__init__(reason)
 
+
+class DuplicateContentError(ValueError):
+    """Raised when an edit would make a memory's content identical to another
+    memory's (content_hash UNIQUE collision) — distinct from 'not found'."""
+
+
 SCHEMA_SQL = Path(__file__).parent / "schema.sql"
 
 
@@ -495,8 +501,12 @@ class MemoryStore:
                 self._conn.commit()
             updated = cur.rowcount > 0
         except sqlite3.IntegrityError:
+            # The new content collides with another memory's content_hash
+            # (UNIQUE idx). That's a DUPLICATE, not a missing memory — signal it
+            # distinctly so the caller doesn't report a misleading "not found".
             self._conn.rollback()
-            updated = False
+            raise DuplicateContentError(
+                "edit would duplicate the content of an existing memory")
 
         # Re-embed if content changed (fire-and-forget, fail-soft)
         if updated and "content" in fields:
@@ -1103,7 +1113,7 @@ class MemoryStore:
                       category: str = None,
                       limit: int = 5, max_tokens: int = 800,
                       recency_boost: bool = True,
-                      include_related: bool = True) -> list[dict]:
+                      include_related: bool = False) -> list[dict]:
         """
         Reciprocal Rank Fusion of FTS5 BM25 + semantic cosine results.
         RRF score = sum(1 / (60 + rank)) across both lists.

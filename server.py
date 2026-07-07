@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Optional
 from fastmcp import FastMCP
 from db.pruner import run_auto_prune, record_outcome, get_pruner_report
-from db.constants import VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, effective_score  # noqa: F401
+from db.constants import VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score  # noqa: F401
 
 try:
     import tiktoken
@@ -156,7 +156,7 @@ atexit.register(_cleanup_pid)
 # =============================================================================
 # STORE — SQLite singleton
 # =============================================================================
-from db.store import MemoryStore, GuardrailRejection  # noqa: E402
+from db.store import MemoryStore, GuardrailRejection, DuplicateContentError  # noqa: E402
 from db.entities import EntityExtractor  # noqa: E402
 
 # Entity config: DATA_DIR/entities.json overrides defaults
@@ -344,7 +344,7 @@ def get_memory(
     response = {
         "profile": profile,
         "identity": identity,
-        "memories": selected_memories,
+        "memories": [_clean_result(m) for m in selected_memories],
         "projects": projects,
         "model_preferences": model_preferences,
         "token_stats": {
@@ -410,7 +410,9 @@ def add_memory(
     if mid is None:
         return json.dumps({"status": "duplicate", "reason": "identical content already exists"})
 
-    token_count = count_tokens(content) + count_tokens(" ".join(tags or [])) + 20
+    # Report exactly what the store persisted (db.constants._count_tokens on the
+    # content), not a different formula — the two used to diverge (#55).
+    token_count = _count_tokens(content)
 
     # Budget-based prune (existing behaviour)
     stats = _store.token_stats(profile)
@@ -572,7 +574,10 @@ def edit_memory(
     if project is not None:
         kwargs["project_id"] = project
 
-    updated = _store.edit_memory(profile, memory_id, **kwargs)
+    try:
+        updated = _store.edit_memory(profile, memory_id, **kwargs)
+    except DuplicateContentError as e:
+        return json.dumps({"error": f"duplicate content: {e}"})
     if not updated:
         return json.dumps({"error": f"memory_id '{memory_id}' not found in profile '{profile}'"})
 
