@@ -23,6 +23,8 @@ Exit codes:
 
 import argparse
 import json
+import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -36,8 +38,21 @@ sys.path.insert(0, str(_REPO))
 
 from db.constants import generate_tags  # noqa: E402
 
-_DB_PATH = Path.home() / "memorybridge" / "memory.db"
+_DATA_DIR = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
+_DB_PATH = _DATA_DIR / "memory.db"
 _PROFILE = "default"
+
+
+def _backup_db(db_path: Path) -> Path:
+    """Timestamped backup of the DB (+ WAL/SHM) before any bulk write."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = db_path.with_name(f"{db_path.name}.bak-backfill-tags-{ts}")
+    shutil.copy2(db_path, backup)
+    for ext in ("-wal", "-shm"):
+        side = db_path.with_name(db_path.name + ext)
+        if side.exists():
+            shutil.copy2(side, backup.with_name(backup.name + ext))
+    return backup
 
 
 def main():
@@ -63,6 +78,13 @@ def main():
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    # Wait for the write lock instead of erroring instantly if the live server
+    # is mid-write (the store uses WAL + busy_timeout; match it here).
+    conn.execute("PRAGMA busy_timeout=5000")
+
+    if not args.dry_run:
+        backup = _backup_db(db_path)
+        print(f"ℹ Backup written: {backup}")
 
     # Fetch memories
     # Using offset pagination for simplicity — backfill is a one-shot script
