@@ -307,15 +307,21 @@ _MAX_TAGS = 12
 
 
 def _cap_tags(tags: list[str], max_tags: int = _MAX_TAGS) -> list[str]:
-    """Truncate tag list if it exceeds max_tags.
+    """Truncate a tag list if it exceeds max_tags, but ALWAYS keep every
+    `entity:` and `project:` tag.
 
-    Priority order: existing/caller tags first, then category, then
-    project, then content-type, then keywords. This ensures the most
-    informative tags survive the truncation.
+    Fuzzy dedup (_maybe_merge) and related-expansion (_expand_related) key
+    entirely off entity tags, so a blind head-slice could silently drop them
+    below the merge threshold and disable dedup for that row. Only the less
+    critical keyword/content-type tags are truncated.
     """
     if len(tags) <= max_tags:
         return tags
-    return tags[:max_tags]
+    priority = [t for t in tags if t.startswith(("entity:", "project:"))]
+    rest = [t for t in tags if not t.startswith(("entity:", "project:"))]
+    if len(priority) >= max_tags:
+        return priority  # keep all entity/project tags even beyond the cap
+    return priority + rest[:max_tags - len(priority)]
 
 
 # --- Keyword extraction (n-gram + stop-word heuristic) ----------------------
