@@ -185,17 +185,35 @@ class TestAutoExecuteRouting:
         assert "mem_a" not in deleted
 
     def test_auto_executes_when_above_threshold(self, conn):
-        # Force confidence above threshold
+        # Use a non-review-only rule (stale_project_status) to exercise the
+        # auto-execute path. verbatim_subset is review-only (see next test).
         conn.execute(
-            "UPDATE pruner_rules SET confidence=0.90 WHERE rule_name='verbatim_subset'"
+            "UPDATE pruner_rules SET confidence=0.90 WHERE rule_name='stale_project_status'"
+        )
+        conn.commit()
+        _add(conn, "mem_old", "CAR site pre-launch",
+             category="project_status", project_id="car", days_ago=40)
+        _add(conn, "mem_new", "CAR site live",
+             category="project_status", project_id="car", days_ago=2)
+        deleted = {}
+        result = run_auto_prune(conn, "default", make_delete_fn(deleted))
+        assert len(result["auto_executed"]) >= 1
+        assert "mem_old" in deleted
+
+    def test_verbatim_subset_is_review_only(self, conn):
+        # verbatim_subset must NEVER auto-delete, even at max confidence — a
+        # contained shorter fact is often a refinement, not a duplicate (#51).
+        conn.execute(
+            "UPDATE pruner_rules SET confidence=0.99 WHERE rule_name='verbatim_subset'"
         )
         conn.commit()
         _add(conn, "mem_a", "short fact here")
         _add(conn, "mem_b", "short fact here extended with more content")
         deleted = {}
         result = run_auto_prune(conn, "default", make_delete_fn(deleted))
-        assert len(result["auto_executed"]) >= 1
-        assert "mem_a" in deleted
+        assert len(result["auto_executed"]) == 0
+        assert "mem_a" not in deleted
+        assert len(result["queued"]) >= 1  # queued for human review instead
 
     def test_no_double_queue(self, conn):
         _add(conn, "mem_a", "short")
@@ -332,12 +350,16 @@ class TestPrunerReport:
         assert "recalibration_changes" in report
 
     def test_report_counts_auto_deleted(self, conn):
+        # stale_project_status still auto-executes (verbatim_subset is now
+        # review-only), so use it to produce an auto-deletion to count.
         conn.execute(
-            "UPDATE pruner_rules SET confidence=0.90 WHERE rule_name='verbatim_subset'"
+            "UPDATE pruner_rules SET confidence=0.90 WHERE rule_name='stale_project_status'"
         )
         conn.commit()
-        _add(conn, "mem_a", "short content here")
-        _add(conn, "mem_b", "short content here with more details")
+        _add(conn, "mem_old", "CAR site pre-launch",
+             category="project_status", project_id="car", days_ago=40)
+        _add(conn, "mem_new", "CAR site live",
+             category="project_status", project_id="car", days_ago=2)
         deleted = {}
         run_auto_prune(conn, "default", make_delete_fn(deleted))
         report = get_pruner_report(conn, since_days=7)
