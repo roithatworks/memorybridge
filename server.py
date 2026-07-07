@@ -19,6 +19,9 @@ import os
 import sys
 import signal
 import atexit
+import time
+import secrets
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -138,7 +141,7 @@ atexit.register(_cleanup_pid)
 # =============================================================================
 # STORE — SQLite singleton
 # =============================================================================
-from db.store import MemoryStore  # noqa: E402
+from db.store import MemoryStore, GuardrailRejection  # noqa: E402
 from db.entities import EntityExtractor  # noqa: E402
 
 # Entity config: DATA_DIR/entities.json overrides defaults
@@ -453,20 +456,35 @@ def add_memories(
         return json.dumps({"error": "facts list is empty"})
 
     changes = []
+    rejected = []
+    duplicates = 0
     total_tokens = 0
 
+    # Per-fact isolation: a single guardrail rejection must NOT abort the batch
+    # and silently drop the remaining facts. Catch it, record it, keep going, and
+    # report added/duplicate/rejected counts honestly so callers (e.g. the
+    # ingestion merger) never see a false "0 added" on a partial success.
     for fact in facts:
-        mid = _store.add_memory(profile, fact,
-                                category=category, importance=importance,
-                                project_id=project)
-        if mid is not None:
-            token_count = count_tokens(fact) + 20
-            total_tokens += token_count
-            changes.append({
-                "memory_id": mid,
-                "tokens": token_count,
+        try:
+            mid = _store.add_memory(profile, fact,
+                                    category=category, importance=importance,
+                                    project_id=project)
+        except GuardrailRejection as e:
+            rejected.append({
+                "reason": str(e),
                 "preview": fact[:60] + ("…" if len(fact) > 60 else "")
             })
+            continue
+        if mid is None:
+            duplicates += 1
+            continue
+        token_count = count_tokens(fact) + 20
+        total_tokens += token_count
+        changes.append({
+            "memory_id": mid,
+            "tokens": token_count,
+            "preview": fact[:60] + ("…" if len(fact) > 60 else "")
+        })
 
     # Auto-prune if over budget
     pruned = []
@@ -474,15 +492,20 @@ def add_memories(
     if stats["total_tokens"] > MAX_TOTAL_TOKENS:
         pruned = _store.auto_prune(profile, threshold=ARCHIVE_SCORE_THRESHOLD)
 
-    _store.log_access("add_memories", profile,
-                      f"added {len(changes)} memories, {total_tokens} tokens")
+    _store.log_access(
+        "add_memories", profile,
+        f"added {len(changes)}, duplicate {duplicates}, rejected {len(rejected)}, "
+        f"{total_tokens} tokens")
 
     return json.dumps({
         "status": "updated",
         "profile": profile,
         "count": len(changes),
+        "duplicate_count": duplicates,
+        "rejected_count": len(rejected),
         "total_tokens_added": total_tokens,
         "changes": changes,
+        "rejected": rejected if rejected else None,
         "auto_pruned": pruned if pruned else None,
         "timestamp": datetime.now().isoformat()
     }, indent=2)
@@ -1301,6 +1324,81 @@ def _gate_tools_for_remote() -> list[str]:
     return removed
 
 
+async def _send_plain(send, status: int, text: str) -> None:
+    """Emit a minimal ASGI plain-text response."""
+    body = text.encode()
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+class _RateLimitAuthMiddleware:
+    """ASGI middleware guarding the HTTP bridge (issue #69).
+
+    - Per-client-IP fixed-window rate limiting -> 429 when exceeded, so the
+      path-embedded capability token cannot be brute-forced without backoff.
+    - Constant-time comparison of the leading path segment against the expected
+      token (`secrets.compare_digest`); a mismatch returns a uniform 404 with no
+      timing signal and never reaches the MCP app.
+    Behind the Cloudflare tunnel the real client IP arrives in CF-Connecting-IP /
+    X-Forwarded-For, so those are honored before the transport peer address.
+    """
+
+    def __init__(self, app, expected_token: str, limit: int, window: int):
+        self.app = app
+        self.expected_token = expected_token
+        self.limit = limit
+        self.window = window
+        self._hits: dict[str, list] = {}
+        self._lock = threading.Lock()
+
+    def _client_ip(self, scope) -> str:
+        headers = {k.decode().lower(): v.decode()
+                   for k, v in scope.get("headers", [])}
+        for h in ("cf-connecting-ip", "x-forwarded-for"):
+            val = headers.get(h, "").strip()
+            if val:
+                return val.split(",")[0].strip()
+        client = scope.get("client")
+        return client[0] if client else "unknown"
+
+    def _rate_ok(self, ip: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            window_start, count = self._hits.get(ip, (now, 0))
+            if now - window_start >= self.window:
+                window_start, count = now, 0
+            count += 1
+            self._hits[ip] = [window_start, count]
+            if len(self._hits) > 4096:  # bound memory; drop stale windows
+                for k in [k for k, (s, _) in self._hits.items()
+                          if now - s >= self.window]:
+                    self._hits.pop(k, None)
+            return count <= self.limit
+
+    def _token_ok(self, scope) -> bool:
+        segment = scope.get("path", "").lstrip("/").split("/", 1)[0]
+        return secrets.compare_digest(segment, self.expected_token)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        if not self._rate_ok(self._client_ip(scope)):
+            await _send_plain(send, 429, "rate limit exceeded")
+            return
+        if not self._token_ok(scope):
+            await _send_plain(send, 404, "not found")
+            return
+        await self.app(scope, receive, send)
+
+
 def _run_http() -> None:
     """Serve over streamable HTTP for remote MCP clients.
 
@@ -1331,13 +1429,46 @@ def _run_http() -> None:
     # uvicorn access logger records the full path on every request, which would
     # write the secret to stdout/stderr and any tunnel/proxy log. Disable it so
     # the token never lands in a log. Never print even a prefix of the token.
+    import logging
     logging.getLogger("uvicorn.access").disabled = True
 
-    print(f"[memorybridge] HTTP bridge on 127.0.0.1:{port} "
-          f"path=/<redacted>/mcp | tools gated: removed {len(removed)} "
-          f"({', '.join(sorted(removed))})", file=sys.stderr)
-    mcp.run(transport="http", host="127.0.0.1", port=port,
-            path=f"/{token}/mcp")
+    rate_limit = int(os.environ.get("MEMORYBRIDGE_RATE_LIMIT", "120"))
+    rate_window = int(os.environ.get("MEMORYBRIDGE_RATE_WINDOW", "60"))
+
+    # Wrap the FastMCP ASGI app with rate-limiting + constant-time token auth
+    # (issue #69). Only take this path if we can build the app at the SAME
+    # capability path clients expect; otherwise fall back to mcp.run so a
+    # FastMCP API change can never leave the bridge serving on the wrong path.
+    mcp_path = f"/{token}/mcp"
+    # FastMCP 2.x exposes http_app(path=...); older builds used streamable_http_app.
+    app_factory = getattr(mcp, "http_app", None) or getattr(mcp, "streamable_http_app", None)
+    app = None
+    if callable(app_factory):
+        try:
+            app = app_factory(path=mcp_path)
+        except TypeError:
+            app = None  # can't pin the path safely -> fall back
+
+    if app is not None:
+        import uvicorn
+        wrapped = _RateLimitAuthMiddleware(app, token, rate_limit, rate_window)
+        print(f"[memorybridge] HTTP bridge on 127.0.0.1:{port} "
+              f"path=/<redacted>/mcp | tools gated: removed {len(removed)} "
+              f"({', '.join(sorted(removed))}) | rate limit {rate_limit}/{rate_window}s per IP",
+              file=sys.stderr)
+        # lifespan="on": the streamable-HTTP session manager is started by the
+        # Starlette lifespan; the ASGI wrapper forwards lifespan scopes, and
+        # forcing it on (vs "auto") makes a lifespan failure loud instead of
+        # degrading every request to a 500.
+        uvicorn.run(wrapped, host="127.0.0.1", port=port,
+                    access_log=False, log_level="warning", lifespan="on")
+    else:
+        print(f"[memorybridge] WARNING: could not attach rate-limiting middleware "
+              f"(FastMCP app factory unavailable); serving without per-IP rate "
+              f"limiting. HTTP bridge on 127.0.0.1:{port} path=/<redacted>/mcp | "
+              f"tools gated: removed {len(removed)} ({', '.join(sorted(removed))})",
+              file=sys.stderr)
+        mcp.run(transport="http", host="127.0.0.1", port=port, path=mcp_path)
 
 
 if __name__ == "__main__":
