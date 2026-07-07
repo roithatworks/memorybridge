@@ -216,42 +216,51 @@ def main():
     print(f"  Found {conv_count} conversations")
 
     # 1b. Idempotency (#45): skip conversations already ingested in a prior run
-    # so a re-dropped export doesn't re-pay extraction or double-write. Record
-    # (below) only after a successful run. MEMORYBRIDGE_FORCE_REINGEST=1 bypasses.
+    # so a re-dropped export doesn't re-pay extraction or double-write. The set
+    # actually processed is recorded after success — on exactly what extract()
+    # reports it ran on (no duplicated cap logic). FORCE_REINGEST=1 bypasses.
     force_reingest = os.environ.get("MEMORYBRIDGE_FORCE_REINGEST", "").lower() \
         in ("1", "true", "yes")
-    _max_conv = int(os.environ.get("MEMORYBRIDGE_MAX_CONVERSATIONS", "500"))
-
-    def _cap(seq):
-        return seq[:_max_conv] if (_max_conv > 0 and len(seq) > _max_conv) else seq
-
-    convs_to_record = []
-    if not args.preview:
+    if not args.preview and not force_reingest:
+        ledger = _load_ledger()
         all_convs = normalized.get("conversations", [])
-        if force_reingest:
-            convs_to_record = _cap(all_convs)
-        else:
-            ledger = _load_ledger()
-            unseen = [c for c in all_convs
-                      if _conv_hash(args.source, c) not in ledger]
-            already = len(all_convs) - len(unseen)
-            if already:
-                print(f"  Skipping {already} already-ingested conversations "
-                      f"(idempotency; set MEMORYBRIDGE_FORCE_REINGEST=1 to reprocess)")
-            normalized["conversations"] = unseen
-            conv_count = len(unseen)
-            # Record only what extraction will actually process (mirrors the
-            # #44 cost cap, which truncates to the first _max_conv).
-            convs_to_record = _cap(unseen)
+        unseen = [c for c in all_convs if _conv_hash(args.source, c) not in ledger]
+        already = len(all_convs) - len(unseen)
+        if already:
+            print(f"  Skipping {already} already-ingested conversations "
+                  f"(idempotency; set MEMORYBRIDGE_FORCE_REINGEST=1 to reprocess)")
+        normalized["conversations"] = unseen
+        conv_count = len(unseen)
 
     if conv_count == 0:
         print("No conversations to process.")
         return
 
+    # 1c. Embedding pre-flight (#43): semantic dedup needs the embedding model.
+    # If it can't load, FAIL-FAST rather than pollute the store with duplicates
+    # that keyword-only dedup would miss — unless the operator explicitly opts
+    # into degraded (keyword-only) ingestion.
+    allow_degraded = os.environ.get("MEMORYBRIDGE_ALLOW_DEGRADED", "").lower() \
+        in ("1", "true", "yes")
+    degraded = False
+    if not args.preview:
+        from server import _store
+        if not _store.embeddings_available():
+            if not allow_degraded:
+                print("ERROR: embedding model unavailable — semantic dedup is off, "
+                      "which risks duplicate pollution. Aborting. Install/repair "
+                      "fastembed, or set MEMORYBRIDGE_ALLOW_DEGRADED=1 to ingest "
+                      "with keyword-only dedup.", file=sys.stderr)
+                sys.exit(2)
+            degraded = True
+            print("WARNING: embeddings unavailable — proceeding with keyword-only "
+                  "dedup (MEMORYBRIDGE_ALLOW_DEGRADED). New memories will lack "
+                  "embeddings until build_embeddings is re-run.", file=sys.stderr)
+
     # 2. Extract
     print("Extracting facts via DeepSeek R1...")
     try:
-        facts = extract(normalized)
+        facts, processed_convs = extract(normalized)
     except ExtractionError as e:
         print(f"Extraction failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -259,6 +268,10 @@ def main():
 
     if not facts:
         print("No facts extracted.")
+        # Still record: extraction ran successfully, these conversations just
+        # yielded no durable facts — no need to re-extract them next time.
+        if not args.preview:
+            _record_ingested(args.source, processed_convs)
         return
 
     # 3. Route
@@ -335,9 +348,17 @@ def main():
                   f"treating as failure.", file=sys.stderr)
             sys.exit(1)
 
-        # Success — record processed conversations in the idempotency ledger.
-        # Placed AFTER the failure exit above so a failed run can be retried.
-        _record_ingested(args.source, convs_to_record)
+        # Success — record exactly the conversations extract() processed, in the
+        # idempotency ledger. Placed AFTER the failure exit so a failed run can
+        # be retried.
+        _record_ingested(args.source, processed_convs)
+
+        # Degraded run: surface the un-embedded backlog so it doesn't rot.
+        if degraded:
+            missing = _store.count_unembedded(args.profile)
+            print(f"  NOTE: {missing} memories in profile '{args.profile}' now lack "
+                  f"embeddings (degraded ingest). Restore fastembed and run "
+                  f"build_embeddings to re-enable semantic search.", file=sys.stderr)
 
 
 if __name__ == "__main__":

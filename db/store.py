@@ -953,6 +953,28 @@ class MemoryStore:
                   file=sys.stderr)
             return 0
 
+    def embeddings_available(self) -> bool:
+        """True if the embedding model can actually embed text. Used as an
+        ingestion pre-flight: if this is False, semantic dedup is unavailable
+        and the pipeline should fail-fast (rather than pollute the store with
+        duplicates) unless the caller explicitly opts into degraded mode."""
+        try:
+            self._embed_texts(["probe"])
+            return True
+        except Exception as e:
+            logger.error("Embedding model unavailable: %s", e)
+            return False
+
+    def count_unembedded(self, profile: str) -> int:
+        """Number of active memories in a profile that have no stored embedding
+        (e.g. added during an embedding-model outage). These need a
+        build_embeddings() sweep to restore semantic search."""
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM memories m WHERE m.profile=? AND m.archived=0 "
+            "AND NOT EXISTS (SELECT 1 FROM memory_embeddings e WHERE e.id=m.id)",
+            (profile,),
+        ).fetchone()[0]
+
     def build_embeddings(self, profile: str) -> int:
         """
         Compute and persist embeddings for all active memories in a profile.
