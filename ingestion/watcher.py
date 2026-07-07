@@ -87,6 +87,20 @@ def detect_source(file_path: Path) -> str | None:
 # File movement helpers
 # ---------------------------------------------------------------------------
 
+def _is_stable(file_path: Path, wait: float = 1.5) -> bool:
+    """Two-sample size check: True only if the file size is unchanged over a
+    short interval. A file mid-copy (Finder drag, browser download) is still
+    growing; processing it would parse truncated JSON and wrongly condemn the
+    completed file to failed/. Unstable files are left for the next run."""
+    try:
+        s1 = file_path.stat().st_size
+        time.sleep(wait)
+        s2 = file_path.stat().st_size
+    except OSError:
+        return False
+    return s1 == s2
+
+
 def _unique_dest(dest_dir: Path, filename: str) -> Path:
     """Return a path in dest_dir that doesn't already exist."""
     candidate = dest_dir / filename
@@ -138,7 +152,21 @@ def run_ingestion(source: str, file_path: Path, profile: str,
         cmd.append("--preview")
 
     logger.info("Running: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    # A large history can legitimately run long, so the timeout is generous and
+    # tunable. Critically, TimeoutExpired/OSError must be CAUGHT: if it escaped,
+    # scan_inbox would crash mid-loop, the file would never leave the inbox, and
+    # launchd's WatchPaths would re-fire it forever — re-paying the extraction
+    # API on every cycle. On timeout we return False so the file goes to failed/.
+    timeout = int(os.environ.get("MEMORYBRIDGE_INGEST_TIMEOUT", "1800"))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.error("Ingestion timed out after %ds for %s — marking failed",
+                     timeout, file_path.name)
+        return False
+    except OSError as e:
+        logger.error("Ingestion subprocess could not run for %s: %s", file_path.name, e)
+        return False
     if result.stdout:
         for line in result.stdout.strip().splitlines():
             logger.info("[run.py] %s", line)
@@ -181,6 +209,13 @@ def scan_inbox(inbox: Path, profile: str = "default", preview: bool = False,
     skipped = 0
 
     for f in files:
+        # Skip files that are still being written (leave them for the next run)
+        # rather than parsing a truncated copy and dumping it into failed/.
+        if not _dry_run and not _is_stable(f):
+            logger.info("Skipping %s — still being written (size changing)", f.name)
+            skipped += 1
+            continue
+
         source = detect_source(f)
         if source is None:
             logger.warning("Cannot detect source for %s — moving to failed/", f.name)
@@ -228,10 +263,34 @@ def main():
     )
     args = parser.parse_args()
 
+    import fcntl
+
     inbox = Path(args.inbox).expanduser()
-    start = time.time()
-    summary = scan_inbox(inbox, profile=args.profile, preview=args.preview)
-    elapsed = time.time() - start
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    # Single-instance lock: launchd WatchPaths fires on every inbox mutation
+    # (including our own processed/ renames), so a second watcher can start
+    # while one is mid-ingestion and process the same file twice (double API
+    # cost + duplicate writes, then a FileNotFoundError when the loser's rename
+    # finds the file gone). Hold an exclusive lock for the run; if another
+    # instance holds it, exit cleanly.
+    lock_file = open(inbox / ".watcher.lock", "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        logger.info("Another watcher instance is running — exiting.")
+        print(json.dumps({"processed": 0, "failed": 0, "skipped": 0,
+                          "status": "locked"}))
+        lock_file.close()
+        return
+
+    try:
+        start = time.time()
+        summary = scan_inbox(inbox, profile=args.profile, preview=args.preview)
+        elapsed = time.time() - start
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
     print(json.dumps(summary))
     logger.info(

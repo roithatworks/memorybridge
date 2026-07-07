@@ -21,9 +21,16 @@ def _extract_messages_from_mapping(mapping: dict) -> list:
         root_id = next(iter(mapping))
 
     messages = []
+    # Track visited nodes: a truncated/corrupted export can contain a parent
+    # cycle (A->B->A with no true root), and without this the DFS would loop
+    # forever, hanging the run until the watcher's timeout.
+    visited = set()
     stack = [root_id] if root_id else []
     while stack:
         node_id = stack.pop()
+        if node_id in visited:
+            continue
+        visited.add(node_id)
         node = mapping.get(node_id, {})
         msg = node.get("message")
         if msg:
