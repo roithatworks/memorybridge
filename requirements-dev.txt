@@ -1,0 +1,5 @@
+# Test-only dependencies. Kept separate from the runtime requirements.txt so a
+# production install stays lean. Install both in CI / for local test runs:
+#   pip install -r requirements.txt -r requirements-dev.txt
+pytest>=8.0
+pytest-mock>=3.12
