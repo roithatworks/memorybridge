@@ -204,12 +204,18 @@ def find_stale_project_status(conn, profile: str) -> list[dict]:
 # Core runner
 # ---------------------------------------------------------------------------
 
-def run_auto_prune(conn, profile: str, delete_fn) -> dict:
+def run_auto_prune(conn, profile: str, delete_fn, allow_auto_delete: bool = True) -> dict:
     """
     Main entry point. Called after every add_memory.
 
     delete_fn: callable(profile, memory_id) -> int (tokens_freed)
                 This is MemoryStore.delete_memory — passed in to avoid circular import.
+
+    allow_auto_delete: when False (e.g. a remote-origin write over the HTTP
+                bridge), candidates that meet the auto-execute confidence bar are
+                routed to the human-review queue instead of being deleted. This
+                keeps a prompt-injected/confused remote model from destroying
+                memories while still surfacing the candidate for local approval.
 
     Returns summary dict with auto_executed and queued counts.
     """
@@ -256,7 +262,7 @@ def run_auto_prune(conn, profile: str, delete_fn) -> dict:
         if already_logged:
             continue
 
-        if confidence >= AUTO_EXECUTE_THRESHOLD:
+        if confidence >= AUTO_EXECUTE_THRESHOLD and allow_auto_delete:
             # Auto-execute
             tokens_freed = delete_fn(profile, cand["candidate_id"])
             _log_decision(conn, profile, rule_name, "delete", cand,

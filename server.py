@@ -59,6 +59,10 @@ except (ImportError, OSError):
 MEMORY_DB              = DATA_DIR / "memory.db"
 DEFAULT_PROFILE        = "default"
 _current_profile       = DEFAULT_PROFILE
+# True only while serving over the HTTP bridge (remote clients). Gates the
+# auto-pruner's delete path so a remote-origin write can never destroy a
+# memory — candidates are routed to the review queue instead. See #37.
+_REMOTE_MODE           = False
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
@@ -391,8 +395,10 @@ def add_memory(
     if stats["total_tokens"] > MAX_TOTAL_TOKENS:
         budget_pruned = _store.auto_prune(profile, threshold=ARCHIVE_SCORE_THRESHOLD)
 
-    # Adaptive dedup/staleness prune
-    prune_result = run_auto_prune(_store._conn, profile, _store.delete_memory)
+    # Adaptive dedup/staleness prune. Over the remote bridge, never auto-delete:
+    # route candidates to the review queue so a remote write can't destroy data.
+    prune_result = run_auto_prune(_store._conn, profile, _store.delete_memory,
+                                  allow_auto_delete=not _REMOTE_MODE)
 
     _store.log_access("add_memory", profile, f"id={mid}, tokens={token_count}")
 
@@ -1246,22 +1252,43 @@ def _start_parent_watchdog() -> None:
 # REMOTE BRIDGE (HTTP transport) — ChatGPT / Perplexity / Gemini CLI
 # =============================================================================
 # Remote clients get read + add only. A prompt-injected or confused remote
-# model must not be able to destroy memories; destructive and subprocess-
-# spawning tools stay stdio/Claude-local.
+# model must not be able to destroy or overwrite memories; destructive and
+# subprocess-spawning tools stay stdio/Claude-local.
+#   - edit_memory: removed — it overwrites arbitrary memory content by id
+#     (destruction-equivalent for a confused/hostile remote model).
+#   - add_memories: removed — it is a batch wrapper over add_memory with no
+#     added remote value and the same side effects.
+#   - add_memory: kept (remote clients need to write), but its auto-prune
+#     delete path is disabled for remote writes via _REMOTE_MODE — candidates
+#     are routed to the review queue instead of deleted (issue #37).
 REMOTE_ALLOWED_TOOLS = {
-    "get_memory", "search_memory", "reflect", "add_memory", "add_memories", "edit_memory",
+    "get_memory", "search_memory", "reflect", "add_memory",
     "list_projects", "export_passport",
 }
 
 
 def _gate_tools_for_remote() -> list[str]:
-    """Remove non-allowlisted tools from the MCP server. Returns removed names."""
-    removed = []
+    """Remove non-allowlisted tools from the MCP server. Returns removed names.
+
+    Fails CLOSED: if the tool set cannot be enumerated (or comes back empty),
+    the process exits rather than risk serving destructive tools remotely.
+    """
     try:
         import asyncio
         tool_names = list(asyncio.run(mcp.get_tools()).keys())
-    except Exception:
-        tool_names = list(getattr(mcp._tool_manager, "_tools", {}).keys())
+    except Exception as e:
+        # Do NOT fall back to a private FastMCP attribute — a rename there
+        # would silently yield an empty set and serve every tool (fail-open).
+        print(f"[memorybridge] FATAL: could not enumerate tools for remote "
+              f"gating ({e}). Refusing to serve HTTP.", file=sys.stderr)
+        os._exit(1)
+
+    if not tool_names:
+        print("[memorybridge] FATAL: tool enumeration returned empty; refusing "
+              "to serve HTTP (fail-closed).", file=sys.stderr)
+        os._exit(1)
+
+    removed = []
     for name in tool_names:
         if name not in REMOTE_ALLOWED_TOOLS:
             try:
@@ -1285,6 +1312,11 @@ def _run_http() -> None:
     - Parent watchdog is NOT started: under launchd our PPID is legitimately
       1, and the watchdog would kill the server 5s after boot.
     """
+    # Mark remote mode so the auto-pruner's delete path is disabled for
+    # writes that arrive over this bridge (see add_memory / issue #37).
+    global _REMOTE_MODE
+    _REMOTE_MODE = True
+
     token = os.environ.get("MEMORYBRIDGE_TOKEN", "").strip()
     if len(token) < 32:
         print("[memorybridge] FATAL: MEMORYBRIDGE_TOKEN missing or under 32 chars "
@@ -1294,8 +1326,15 @@ def _run_http() -> None:
 
     removed = _gate_tools_for_remote()
     port = int(os.environ.get("MEMORYBRIDGE_PORT", "8484"))
+
+    # The secret token is embedded in the request path (capability URL). The
+    # uvicorn access logger records the full path on every request, which would
+    # write the secret to stdout/stderr and any tunnel/proxy log. Disable it so
+    # the token never lands in a log. Never print even a prefix of the token.
+    logging.getLogger("uvicorn.access").disabled = True
+
     print(f"[memorybridge] HTTP bridge on 127.0.0.1:{port} "
-          f"path=/{token[:4]}…/mcp | tools gated: removed {len(removed)} "
+          f"path=/<redacted>/mcp | tools gated: removed {len(removed)} "
           f"({', '.join(sorted(removed))})", file=sys.stderr)
     mcp.run(transport="http", host="127.0.0.1", port=port,
             path=f"/{token}/mcp")
