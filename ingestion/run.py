@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -61,6 +62,46 @@ PARSERS = {
 MEMORYBRIDGE_DIR = _DATA_DIR
 LOGS_DIR = MEMORYBRIDGE_DIR / "logs"
 FLAGGED_QUEUE = MEMORYBRIDGE_DIR / "flagged_queue.json"
+# Idempotency ledger (#45): sha256 of every conversation already ingested, so
+# re-dropping the same export doesn't re-pay extraction or double-write.
+INGESTED_LEDGER = MEMORYBRIDGE_DIR / "ingested_conversations.json"
+
+
+def _conv_hash(source: str, conv: dict) -> str:
+    """Stable content hash of a conversation for the idempotency ledger."""
+    payload = json.dumps(
+        {"source": source, "id": conv.get("id", ""),
+         "messages": conv.get("messages", [])},
+        sort_keys=True, ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_ledger() -> dict:
+    """Load the ingested-conversation ledger ({hash: iso_ts}). Tolerant of a
+    missing or corrupt file (treated as empty)."""
+    if not INGESTED_LEDGER.exists():
+        return {}
+    try:
+        data = json.loads(INGESTED_LEDGER.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("ingested_conversations.json unreadable — treating as empty")
+        return {}
+
+
+def _record_ingested(source: str, convs: list) -> None:
+    """Atomically add the given conversations' hashes to the ledger."""
+    if not convs:
+        return
+    ledger = _load_ledger()
+    now = datetime.now().isoformat()
+    for c in convs:
+        ledger[_conv_hash(source, c)] = now
+    INGESTED_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    tmp = INGESTED_LEDGER.with_name(f"{INGESTED_LEDGER.name}.tmp")
+    tmp.write_text(json.dumps(ledger, indent=0))
+    os.replace(tmp, INGESTED_LEDGER)
 
 
 def _write_flagged(flagged: list, source: str, profile: str) -> None:
@@ -174,14 +215,52 @@ def main():
     conv_count = len(normalized.get("conversations", []))
     print(f"  Found {conv_count} conversations")
 
+    # 1b. Idempotency (#45): skip conversations already ingested in a prior run
+    # so a re-dropped export doesn't re-pay extraction or double-write. The set
+    # actually processed is recorded after success — on exactly what extract()
+    # reports it ran on (no duplicated cap logic). FORCE_REINGEST=1 bypasses.
+    force_reingest = os.environ.get("MEMORYBRIDGE_FORCE_REINGEST", "").lower() \
+        in ("1", "true", "yes")
+    if not args.preview and not force_reingest:
+        ledger = _load_ledger()
+        all_convs = normalized.get("conversations", [])
+        unseen = [c for c in all_convs if _conv_hash(args.source, c) not in ledger]
+        already = len(all_convs) - len(unseen)
+        if already:
+            print(f"  Skipping {already} already-ingested conversations "
+                  f"(idempotency; set MEMORYBRIDGE_FORCE_REINGEST=1 to reprocess)")
+        normalized["conversations"] = unseen
+        conv_count = len(unseen)
+
     if conv_count == 0:
         print("No conversations to process.")
         return
 
+    # 1c. Embedding pre-flight (#43): semantic dedup needs the embedding model.
+    # If it can't load, FAIL-FAST rather than pollute the store with duplicates
+    # that keyword-only dedup would miss — unless the operator explicitly opts
+    # into degraded (keyword-only) ingestion.
+    allow_degraded = os.environ.get("MEMORYBRIDGE_ALLOW_DEGRADED", "").lower() \
+        in ("1", "true", "yes")
+    degraded = False
+    if not args.preview:
+        from server import _store
+        if not _store.embeddings_available():
+            if not allow_degraded:
+                print("ERROR: embedding model unavailable — semantic dedup is off, "
+                      "which risks duplicate pollution. Aborting. Install/repair "
+                      "fastembed, or set MEMORYBRIDGE_ALLOW_DEGRADED=1 to ingest "
+                      "with keyword-only dedup.", file=sys.stderr)
+                sys.exit(2)
+            degraded = True
+            print("WARNING: embeddings unavailable — proceeding with keyword-only "
+                  "dedup (MEMORYBRIDGE_ALLOW_DEGRADED). New memories will lack "
+                  "embeddings until build_embeddings is re-run.", file=sys.stderr)
+
     # 2. Extract
     print("Extracting facts via DeepSeek R1...")
     try:
-        facts = extract(normalized)
+        facts, processed_convs = extract(normalized)
     except ExtractionError as e:
         print(f"Extraction failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -189,6 +268,10 @@ def main():
 
     if not facts:
         print("No facts extracted.")
+        # Still record: extraction ran successfully, these conversations just
+        # yielded no durable facts — no need to re-extract them next time.
+        if not args.preview:
+            _record_ingested(args.source, processed_convs)
         return
 
     # 3. Route
@@ -264,6 +347,18 @@ def main():
             print(f"Ingestion accounted for none of {intended} intended facts — "
                   f"treating as failure.", file=sys.stderr)
             sys.exit(1)
+
+        # Success — record exactly the conversations extract() processed, in the
+        # idempotency ledger. Placed AFTER the failure exit so a failed run can
+        # be retried.
+        _record_ingested(args.source, processed_convs)
+
+        # Degraded run: surface the un-embedded backlog so it doesn't rot.
+        if degraded:
+            missing = _store.count_unembedded(args.profile)
+            print(f"  NOTE: {missing} memories in profile '{args.profile}' now lack "
+                  f"embeddings (degraded ingest). Restore fastembed and run "
+                  f"build_embeddings to re-enable semantic search.", file=sys.stderr)
 
 
 if __name__ == "__main__":

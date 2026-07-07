@@ -229,18 +229,23 @@ def _sanitize_fact(fact: dict) -> Optional[dict]:
     return clean
 
 
-def extract(normalized: dict) -> list:
+def extract(normalized: dict) -> tuple[list, list]:
     """
     Extract facts from all conversations in a normalized export.
 
     Args:
         normalized: Output from any parse_*.py parser
     Returns:
-        Flat list of extracted fact dicts, each tagged with source_conversation_id
+        (facts, processed_conversations)
+        - facts: flat list of extracted fact dicts, each tagged with
+          source_conversation_id
+        - processed_conversations: the exact conversations extraction ran on
+          (after the cost cap), so the caller records precisely those in the
+          idempotency ledger — no duplicated cap logic.
     """
     conversations = normalized.get("conversations", [])
     if not conversations:
-        return []
+        return [], []
 
     try:
         client = _get_client()
@@ -295,4 +300,5 @@ def extract(normalized: dict) -> list:
                 fact["source_conversation_id"] = batch[0].get("id", "")
             all_facts.append(fact)
 
-    return all_facts
+    # `conversations` here is the (possibly capped) list we actually processed.
+    return all_facts, conversations
