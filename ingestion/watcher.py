@@ -197,8 +197,12 @@ def scan_inbox(inbox: Path, profile: str = "default", preview: bool = False,
         Summary dict with "processed", "failed", "skipped" counts.
     """
     inbox.mkdir(parents=True, exist_ok=True)
+    # Reject symlinks (#85): is_file() follows them, so a `foo.json -> ~/.ssh/id`
+    # symlink dropped in the inbox would be read and shipped inside an extraction
+    # API prompt — arbitrary local file exfiltration. Only process regular files.
     files = sorted(f for f in inbox.iterdir()
-                   if f.is_file() and f.suffix.lower() == ".json")
+                   if f.is_file() and not f.is_symlink()
+                   and f.suffix.lower() == ".json")
 
     if not files:
         logger.info("Inbox empty — nothing to process.")
