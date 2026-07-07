@@ -149,7 +149,7 @@ def render():
                 if st.button("🔍 Preview extraction", use_container_width=True):
                     try:
                         with st.spinner("Running extraction preview…"):
-                             result = run_ingestion(source, tmp_path, profile, preview=True, days=days)
+                            result = run_ingestion(source, tmp_path, profile, preview=True, days=days)
                     except ValueError as e:
                         st.error(str(e))
                     else:
@@ -160,12 +160,18 @@ def render():
                         else:
                             st.error("Preview failed")
                             st.code(result["stderr"], language="text")
+                    finally:
+                        # Clean up the uploaded temp file to avoid accumulating files
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
             with col_run:
                 if st.button("✓ Run ingestion", type="primary", use_container_width=True):
                     try:
                         with st.spinner("Ingesting memories…"):
-                             result = run_ingestion(source, tmp_path, profile, preview=False, days=days)
+                            result = run_ingestion(source, tmp_path, profile, preview=False, days=days)
                     except ValueError as e:
                         st.error(str(e))
                     else:
@@ -176,6 +182,12 @@ def render():
                         else:
                             st.error("Ingestion failed")
                             st.code(result["stderr"], language="text")
+                    finally:
+                        # Clean up the uploaded temp file to avoid accumulating files
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
     # =========================================================================
     # EXPORT TAB
