@@ -71,8 +71,12 @@ def parse(file_path: str, days: int = None) -> dict:
 
     conversations = []
     for item in raw:
-        create_time = item.get("create_time") or 0
-        if cutoff and create_time < cutoff:
+        create_time = item.get("create_time")
+        # Only drop a conversation for age when we actually KNOW its age. A
+        # missing/unparseable timestamp used to become 0 (1970) and get silently
+        # excluded by any --days filter — include it instead (#79).
+        if cutoff and isinstance(create_time, (int, float)) and create_time > 0 \
+                and create_time < cutoff:
             continue
 
         try:

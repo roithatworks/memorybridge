@@ -32,10 +32,11 @@ def parse(file_path: str, days: int = None) -> dict:
             created_ts = created_dt.timestamp()
             date_str = created_dt.strftime("%Y-%m-%d")
         except Exception:
-            created_ts = 0
+            created_ts = None  # unknown age — don't let a --days filter drop it
             date_str = "unknown"
 
-        if cutoff and created_ts < cutoff:
+        # Only exclude by age when the timestamp is known (#79).
+        if cutoff and created_ts is not None and created_ts < cutoff:
             continue
 
         messages = []
