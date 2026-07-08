@@ -15,6 +15,11 @@ INGESTION_SCRIPT = Path(__file__).parent.parent.parent / "ingestion" / "run.py"
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _PROFILE_ALLOWED_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_.-")
 _ALLOWED_SOURCES = {"claude", "chatgpt", "gemini"}
+_ALLOWED_PROFILES = {
+    "default": "default",
+    "work": "work",
+    "personal": "personal",
+}
 
 
 def _validate_profile_name(profile: str) -> str:
@@ -25,12 +30,12 @@ def _validate_profile_name(profile: str) -> str:
         )
     if profile.startswith((".", "-")):
         raise ValueError("Invalid profile name. Must not start with '.' or '-'.")
-    # Canonicalize through an explicit character allowlist so only approved
-    # literals flow into subprocess arguments.
+    # Canonicalize through an explicit character allowlist.
     canonical = "".join(ch for ch in profile if ch in _PROFILE_ALLOWED_CHARS)
-    if not canonical:
-        raise ValueError("Invalid profile name.")
-    return canonical
+    if canonical not in _ALLOWED_PROFILES:
+        raise ValueError("Invalid profile name. Must be one of: default, work, personal.")
+    # Return explicit matching literals to break taint tracking.
+    return _ALLOWED_PROFILES[canonical]
 
 
 def _validate_source(source: str) -> str:
@@ -128,7 +133,7 @@ def render():
         )
 
         source = st.selectbox("Source", ["claude", "chatgpt", "gemini"])
-        profile = st.text_input("Target profile", value="default")
+        profile = st.selectbox("Target profile", list(_ALLOWED_PROFILES.keys()), index=0)
         days = st.number_input("Limit to last N days (0 = all)", min_value=0, value=30)
 
         uploaded = st.file_uploader(
