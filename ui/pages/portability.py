@@ -13,6 +13,7 @@ INGESTION_SCRIPT = Path(__file__).parent.parent.parent / "ingestion" / "run.py"
 
 
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_PROFILE_ALLOWED_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_.-")
 _ALLOWED_SOURCES = {"claude", "chatgpt", "gemini"}
 
 
@@ -24,11 +25,12 @@ def _validate_profile_name(profile: str) -> str:
         )
     if profile.startswith((".", "-")):
         raise ValueError("Invalid profile name. Must not start with '.' or '-'.")
-    # The regex restricts to [A-Za-z0-9_.-], so the value is safe to pass to the
-    # ingestion subprocess. Any validly-named profile is allowed — a new one is
-    # created on first write — not just "default" (#90). Rebuild from a matched
-    # char class so no unsanitized substring flows through.
-    return "".join(ch for ch in profile if ch.isalnum() or ch in "_.-")
+    # Canonicalize through an explicit character allowlist so only approved
+    # literals flow into subprocess arguments.
+    canonical = "".join(ch for ch in profile if ch in _PROFILE_ALLOWED_CHARS)
+    if not canonical:
+        raise ValueError("Invalid profile name.")
+    return canonical
 
 
 def _validate_source(source: str) -> str:
@@ -96,7 +98,7 @@ def run_ingestion(source: str, file_path: Path, profile: str,
     if days_int and days_int > 0:
         cmd.extend(["--days", str(days_int)])
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=False)
     # run.py writes a JSON log to ~/memorybridge/logs/ — parse stdout summary
     return {
         "returncode": result.returncode,
