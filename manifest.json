@@ -33,7 +33,9 @@
     { "name": "switch_profile",   "description": "Switch active memory profile" },
     { "name": "get_access_log",   "description": "Retrieve access log with token usage history" },
     { "name": "get_prune_queue",  "description": "Get pending prune candidates awaiting review" },
-    { "name": "resolve_prune_queue", "description": "Approve or reject a queued prune candidate" }
+    { "name": "resolve_prune_queue", "description": "Approve or reject a queued prune candidate" },
+    { "name": "reflect",          "description": "Synthesize a reasoned answer from relevant memories" },
+    { "name": "ingest_from_inbox", "description": "Ingest export files dropped in the data-dir inbox" }
   ],
   "compatibility": {
     "platforms": ["darwin", "linux", "win32"],
