@@ -199,11 +199,22 @@ def _is_infra_trivia(fact_text: str, project_id) -> bool:
 
 
 def _is_noise(fact_text: str) -> bool:
-    """True if the fact is ephemeral operational telemetry, not durable memory."""
+    """True if the fact is ephemeral operational telemetry, not durable memory.
+
+    The built-in generic patterns are always applied; any patterns from the
+    user's config (`noise_patterns`) are appended, so users can drop their own
+    agent/cron output without editing code (#7).
+    """
     global _NOISE_RE
     if _NOISE_RE is None:
         import re
-        _NOISE_RE = re.compile("|".join(_NOISE_PATTERNS), re.IGNORECASE)
+        patterns = list(_NOISE_PATTERNS)
+        try:
+            import config
+            patterns += [p for p in config.noise_patterns() if p]
+        except Exception:
+            pass  # config optional; generic patterns still apply
+        _NOISE_RE = re.compile("|".join(patterns), re.IGNORECASE)
     return bool(_NOISE_RE.search(fact_text or ""))
 
 
