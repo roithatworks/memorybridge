@@ -16,7 +16,7 @@ Your memory database lives in SQLite on your machine — the store and stdio ser
 - **Decay scoring** — memories fade naturally over time unless accessed frequently or marked important
 - **Multiple profiles** — separate memory contexts for work, personal, research, etc.
 - **Ingestion pipeline** — import conversation history from Claude, ChatGPT, or Gemini; DeepSeek R1 extracts facts, Claude resolves conflicts
-- **Inbox watcher** — drop an export file into `~/memorybridge/inbox/` and launchd ingests it automatically; zero CLI required
+- **Inbox watcher** — drop an export file into `<data dir>/inbox/` and it's ingested automatically on the next scan; zero CLI required
 - **Cross-model export** — Memory Passport (plain text, any AI) or model-specific formats (ChatGPT, Gemini, Ollama)
 - **Streamlit UI** — review flagged memories, browse/delete, see analytics, run imports and exports
 
@@ -24,54 +24,75 @@ Your memory database lives in SQLite on your machine — the store and stdio ser
 
 ## Requirements
 
-- Python 3.10+
-- Claude desktop app
-- macOS (launchd inbox watcher is macOS-only; everything else works on Linux/WSL)
-- API keys: `DEEPSEEK_API_KEY` (extraction) and `ANTHROPIC_API_KEY` (conflict resolution)
+- Python 3.11+
+- An MCP client (Claude Desktop, or any MCP-compatible tool)
+- Works on macOS, Linux, and Windows. The core memory server needs **no API keys**.
+- API keys are only needed for the **optional** ingestion pipeline: `DEEPSEEK_API_KEY` (fact extraction) and `ANTHROPIC_API_KEY` (conflict resolution).
 
 ---
 
-## Installation
-
-### 1. Clone and install dependencies
+## Install
 
 ```bash
-git clone https://github.com/your-username/memorybridge.git
-cd memorybridge
-pip3 install -r requirements.txt
+pip install memorybridge          # or: git clone … && pip install -e .
+mb init                           # creates the data dir, config, empty store
 ```
 
-### 2. Add API keys
-
-Create `~/memorybridge/.env`:
-
-```properties
-DEEPSEEK_API_KEY=your_key_here
-ANTHROPIC_API_KEY=your_key_here
-```
-
-### 3. Register with Claude desktop
-
-Open `~/Library/Application Support/Claude/claude_desktop_config.json` (create it if missing) and add:
+`mb init` prints a ready-to-paste Claude Desktop snippet. Open **Settings →
+Developer → Edit Config** and add it:
 
 ```json
 {
   "mcpServers": {
     "memorybridge": {
-      "command": "python3",
-      "args": ["/path/to/memorybridge/server.py"]
+      "command": "mb",
+      "args": ["serve"],
+      "env": { "MEMORYBRIDGE_DATA": "/Users/you/memorybridge" }
     }
   }
 }
 ```
 
-Use the absolute path to `server.py` in your clone. Run `pwd` inside the repo to get it.
+Restart your MCP client and ask: *"Can you check if MemoryBridge is connected?"*
 
-### 4. Restart Claude
+To expose the server to other MCP clients over HTTP, run `mb serve --http` (see
+[docs/DEPLOY.md](docs/DEPLOY.md) for running it as a background service on
+macOS/Linux/Windows/Docker).
 
-Fully quit Claude (⌘Q) and relaunch. Ask it: *"Can you check if MemoryBridge is connected?"*
+### API keys (optional)
 
-Full walkthrough in [SETUP_GUIDE.md](SETUP_GUIDE.md).
+Only needed for ingestion. `mb init` writes a `.env` template in your data dir —
+fill in the keys you use:
+
+```properties
+DEEPSEEK_API_KEY=your_key_here     # fact extraction
+ANTHROPIC_API_KEY=your_key_here    # conflict resolution
+```
+
+---
+
+## Configuration
+
+Everything works with zero config. To customize, edit `memorybridge.yaml` in
+your data dir (`mb init` writes a starter; full documented schema in
+[memorybridge.example.yaml](memorybridge.example.yaml)).
+
+| Setting | What it does |
+| --- | --- |
+| `max_total_tokens` | Token ceiling the store serves/holds (default 50000). Also `MEMORYBRIDGE_MAX_TOKENS`. |
+| `routing.domains` | Split memory by area. Each fact is scored against your keyword sets; best match wins, else `default`. **Off by default** — everything goes to `default` until you add domains. |
+| `routing.default_keywords` | Facts matching these are forced to `default` (cross-cutting identity/voice). |
+| `routing.anchors` | Pull a `default`-signal fact into a specific domain when it also mentions an anchor term. |
+| `routing.custom_router` | Escape hatch: path to a Python file exporting `route_profile(fact, base_profile)` for logic that isn't keyword-expressible. |
+| `noise_patterns` | Extra regex whose matching lines are dropped at ingestion as ephemeral noise (added to the built-in set). |
+
+**Entities.** Drop an `entities.json` in your data dir to tag your own projects,
+people, and concepts (`{"entities": [{"tag": "acme", "names": ["Acme Corp"], "type": "project"}]}`).
+It merges with a small generic built-in seed.
+
+**Key environment variables:** `MEMORYBRIDGE_DATA` (data dir, default `~/memorybridge`),
+`MEMORYBRIDGE_MAX_TOKENS`, `MEMORYBRIDGE_PORT` (HTTP bridge), `MEMORYBRIDGE_TOKEN`
+(HTTP bridge auth), `MEMORYBRIDGE_NO_EMBED` (skip the embedding model).
 
 ---
 
@@ -103,13 +124,13 @@ Export your history from any AI provider, then run:
 
 ```bash
 # Claude — import last 30 days
-python ingestion/run.py --source claude --file ~/Downloads/conversations.json --days 30
+mb ingest --source claude --file ~/Downloads/conversations.json --days 30
 
 # ChatGPT — import all history into the "work" profile
-python ingestion/run.py --source chatgpt --file ~/Downloads/conversations.json --profile work
+mb ingest --source chatgpt --file ~/Downloads/conversations.json --profile work
 
 # Gemini — dry run first to see what would be extracted
-python ingestion/run.py --source gemini --file ~/Downloads/MyActivity.json --preview
+mb ingest --source gemini --file ~/Downloads/MyActivity.json --preview
 ```
 
 The pipeline:
@@ -125,21 +146,21 @@ Export file → parse → DeepSeek R1 extraction → confidence routing → conf
 
 ### Inbox watcher (zero-CLI ingestion)
 
-Drop any export file into `~/memorybridge/inbox/` and launchd detects it, auto-identifies the source (Claude/ChatGPT/Gemini), and runs ingestion automatically. Processed files move to `inbox/processed/`, failed ones to `inbox/failed/`.
+Drop any export file into `<data dir>/inbox/` and the watcher auto-identifies
+the source (Claude/ChatGPT/Gemini) and runs ingestion. Processed files move to
+`inbox/processed/`, failed ones to `inbox/failed/`; unrecognized files are left
+in place and logged.
 
-Install the launchd agent once:
-
-```bash
-cp launchd/com.memorybridge.inbox.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.memorybridge.inbox.plist
-```
+Run the watcher on a schedule with your OS's scheduler — launchd on macOS
+(templates in `launchd/`), a systemd timer or cron on Linux. See
+[docs/DEPLOY.md](docs/DEPLOY.md).
 
 ---
 
 ## Streamlit UI
 
 ```bash
-streamlit run ui/app.py
+mb ui
 ```
 
 Four pages:
@@ -160,20 +181,19 @@ A portable plain-text snapshot of your memory — paste it into any AI's system 
 ```markdown
 # Memory Passport
 Profile: default
-Generated: 2026-05-10
-
-## Constraints
-! Cannot scrape LinkedIn via automated tools
+Generated: 2026-07-08
 
 ## Preferences
-! No em dashes in writing
-! Tone: direct, sardonic, Gen X peer-to-peer
+! Tone: direct and concise
 - Prefers dark mode in all apps
 - Prefers bullet-point answers
 
 ## Skills
-! PMP certified
-! Has $126M in documented program impact
+! Ships production Python daily
+- Comfortable with SQL and data modeling
+
+## Projects
+- Building an internal analytics dashboard
 ...
 ```
 
@@ -251,9 +271,10 @@ ingestion/
   passport.py          — Memory Passport builder
 ui/
   app.py               — Streamlit entry point
-  pages/               — flagged_queue, memory_browser, analytics, portability
-launchd/
-  com.memorybridge.inbox.plist  — WatchPaths agent
+  views/               — flagged_queue, memory_browser, analytics, portability
+cli.py                 — the `mb` command (init / serve / ingest / ui)
+config.py              — central config loader (memorybridge.yaml)
+launchd/               — optional macOS service templates
 tests/
   integration/         — MCP tool integration tests
   unit/                — Store, search quality, parsers, passport, watcher
@@ -267,10 +288,11 @@ tests/
 ## Tests
 
 ```bash
-python -m pytest tests/ -v
+pip install -e ".[dev]"
+python -m pytest tests/unit -q
 ```
 
-86 tests, 0 failures.
+The gating unit suite runs in CI on Python 3.11 and 3.12.
 
 ---
 
@@ -278,20 +300,20 @@ python -m pytest tests/ -v
 
 ### Claude doesn't see memory tools
 
-- Fully quit and relaunch Claude (⌘Q — closing the window isn't enough)
-- Verify the path in `claude_desktop_config.json` is the absolute path to `server.py`
-- Run `python3 server.py` in Terminal directly — fix any errors before restarting Claude
+- Fully quit and relaunch your MCP client (on Claude Desktop, ⌘Q — closing the window isn't enough)
+- Verify the config snippet uses `"command": "mb"` and that `mb` is on your PATH (`which mb`)
+- Run `mb serve` in a terminal directly — fix any errors before restarting the client
 
-### "Module not found" error
+### "Command not found: mb" or "Module not found"
 
-- Run `pip3 install -r requirements.txt` from the repo root
-- If you have multiple Python versions, confirm which one Claude's config points to: `which python3`
+- Reinstall: `pip install -e .` from the repo root (or `pip install memorybridge`)
+- If you use multiple Python versions, confirm `mb` resolves to the same interpreter you installed into
 
 ### Inbox watcher isn't firing
 
-- Check `launchctl list | grep memorybridge` — `com.memorybridge.inbox` should appear
-- Inspect `~/memorybridge/logs/watcher_err.log` for errors
-- Verify the plist paths match your actual username: `plutil -lint ~/Library/LaunchAgents/com.memorybridge.inbox.plist`
+- Confirm your scheduler (launchd/systemd/cron) is actually invoking the watcher — see [docs/DEPLOY.md](docs/DEPLOY.md)
+- Inspect `<data dir>/logs/` for errors
+- Unrecognized (non-`.json`) files are skipped and logged, not processed
 
 ---
 
