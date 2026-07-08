@@ -237,6 +237,12 @@ def scan_inbox(inbox: Path, profile: str = "default", preview: bool = False,
             continue
 
         success = run_ingestion(source, f, profile=profile, preview=preview)
+        if preview:
+            # A preview is a dry run — it must NOT move the file out of the inbox,
+            # or the subsequent real run finds an empty inbox (#84).
+            logger.info("Preview complete — leaving %s in inbox", f.name)
+            skipped += 1
+            continue
         if success:
             dest = move_to_processed(f)
             logger.info("Processed → %s", dest)

@@ -22,11 +22,12 @@ from pathlib import Path
 # Allow importing local ingestion modules when run from other directories
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Skip the FastEmbed model load/backfill at store construction. This subprocess
-# writes via add_memory (which embeds each new memory on its own thread); paying
-# the one-time model download just to START UP would stall the run with no
-# output. Must be set BEFORE importing router/merger (which import server ->
-# constructs _store).
+# MEMORYBRIDGE_NO_EMBED only skips the one-time embedding BACKFILL thread at
+# store construction, so importing server -> constructing _store doesn't stall
+# on a model download. It does NOT disable embedding: the embed pre-flight
+# below and add_memory still load the model lazily (that's intended — we want
+# semantic dedup during ingestion). Must be set BEFORE importing router/merger
+# (which import server -> constructs _store). (#83)
 os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
 
 # Data dir: mutable state (db, logs, .env, inbox) — defaults to ~/memorybridge,
