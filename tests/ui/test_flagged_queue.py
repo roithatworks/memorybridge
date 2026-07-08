@@ -74,8 +74,9 @@ def test_accept_passes_correct_fields(tmp_path):
     with patch("ui.pages.flagged_queue._get_store", return_value=mock_store):
         accept_item("item-1", queue_path)
 
-    call_kwargs = mock_store.add_memory.call_args[1]
-    assert call_kwargs["content"] == "Cale volunteers for Hopeful Fridays"
+    args, call_kwargs = mock_store.add_memory.call_args
+    # accept_item passes (profile, fact) positionally and metadata as kwargs.
+    assert args[1] == "Cale volunteers for Hopeful Fridays"
     assert call_kwargs["category"] == "fact"
     assert call_kwargs["importance"] == "medium"
 
