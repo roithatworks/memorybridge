@@ -96,7 +96,8 @@ def main():
     print(f"ℹ MemoryBridge DB: {db_path}")
     print(f"ℹ Profile: {args.profile}")
     print(f"ℹ Total memories: {row_count}")
-    print(f"ℹ Min tags threshold: {args.min_tags} (skip if tags > {args.min_tags})")
+    print(f"ℹ Min tags threshold: {args.min_tags} "
+          f"({'process all' if args.min_tags == 0 else f'skip memories with >= {args.min_tags} tags'})")
     print(f"ℹ Dry run: {args.dry_run}")
     print()
 
@@ -127,8 +128,10 @@ def main():
             except (json.JSONDecodeError, TypeError):
                 stored_tags = []
 
-            # Skip if already well-tagged
-            if len(stored_tags) > args.min_tags:
+            # Skip if already well-tagged. --min-tags 0 = process everything;
+            # --min-tags N = skip memories that already have >= N tags (#106,
+            # matching the documented semantics — the old `>` was off by one).
+            if args.min_tags and len(stored_tags) >= args.min_tags:
                 skipped += 1
                 continue
 
