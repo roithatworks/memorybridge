@@ -1,0 +1,65 @@
+# MemoryBridge configuration (optional).
+#
+# Copy this to `memorybridge.yaml` in your data dir ($MEMORYBRIDGE_DATA, default
+# ~/memorybridge) and edit. Everything here is optional — MemoryBridge runs with
+# zero config. Prefer JSON? Use `memorybridge.json` with the same structure.
+
+# Hard ceiling on total tokens the store serves/holds. Also settable via the
+# MEMORYBRIDGE_MAX_TOKENS environment variable (which wins over this file).
+max_total_tokens: 50000
+
+# ---------------------------------------------------------------------------
+# Domain auto-routing.
+#
+# By default routing is OFF and every ingested fact goes to the "default"
+# profile. Define domains to split your memory by area. Each fact is scored
+# against every domain's keywords (a hit in the fact's `project` field counts
+# double); the best match wins if its score is >= 1, otherwise the fact lands in
+# "default". Keep keywords specific — generic words cause misrouting.
+# ---------------------------------------------------------------------------
+routing:
+  domains:
+    work:
+      - deadline
+      - sprint
+      - roadmap
+      - stakeholder
+      - incident
+    personal:
+      - family
+      - home
+      - health
+      - vacation
+      - hobby
+
+  # Facts matching these are forced to "default" so EVERY domain sees them —
+  # use for identity / voice / cross-cutting tooling preferences.
+  default_keywords:
+    - my name is
+    - i prefer
+    - writing style
+    - tone
+    - always
+    - never
+
+  # Optional: if a "default_keywords" fact ALSO mentions one of these, pull it
+  # into the named domain instead of default (e.g. a voice preference that is
+  # specific to your work brand). Shape: { domain: [keywords] }.
+  anchors: {}
+    # work:
+    #   - acme corp
+
+  # Optional escape hatch for bespoke routing logic that can't be expressed as
+  # keyword lists. Point at a Python file exporting
+  # `route_profile(fact, base_profile) -> str`. Overrides everything above.
+  custom_router: null
+  # custom_router: ~/memorybridge/my_router.py
+
+# ---------------------------------------------------------------------------
+# Extra ingestion noise patterns (case-insensitive regex). Matching lines are
+# dropped at extraction as ephemeral ops telemetry. The built-in generic set
+# (load averages, disk usage, "no commits today", etc.) is always applied; this
+# only ADDS to it — useful if your own cron/agent output leaks into exports.
+# ---------------------------------------------------------------------------
+noise_patterns: []
+  # - "nightly backup (succeeded|completed)"
