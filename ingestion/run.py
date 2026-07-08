@@ -205,10 +205,14 @@ def _print_summary(report: dict, conv_count: int, flagged_count: int, elapsed: f
 def main():
     parser = argparse.ArgumentParser(description="MemoryBridge ingestion pipeline")
     parser.add_argument("--source", required=True,
-                        choices=["hermes", "claude", "chatgpt", "gemini"])
+                        choices=["claude", "chatgpt", "gemini", "hermes"],
+                        help="Export source. claude/chatgpt/gemini are the "
+                             "standard exports; 'hermes' is an optional parser "
+                             "for the local Hermes agent DB.")
     parser.add_argument("--file", default=None,
-                        help="Path to export file (optional for hermes; "
-                             "defaults to ~/.hermes/state.db)")
+                        help="Path to the export file. Required for all sources "
+                             "except 'hermes' (which defaults to "
+                             "~/.hermes/state.db if --file is omitted).")
     parser.add_argument("--days", type=int, default=None, help="Only process last N days")
     parser.add_argument("--profile", default="default", help="Memory profile to write to")
     parser.add_argument("--preview", action="store_true", help="Dry run — no writes")
