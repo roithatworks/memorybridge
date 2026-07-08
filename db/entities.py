@@ -1,8 +1,9 @@
 """Entity extraction for MemoryBridge — lightweight, regex-based, zero deps.
 
 Extracts known entities from memory content and attaches them as
-``entity:<canonical_name>`` tags. Seed list covers Cale's known
-projects, tools, people, and concepts. Overridable via custom JSON file.
+``entity:<canonical_name>`` tags. The built-in seed is a small, generic set of
+widely-used tools/platforms; add your own projects, people, and concepts via an
+``entities.json`` file in your data dir (see the config format below).
 
 Heuristic for acronym false-positive avoidance: any alias that is all-uppercase
 and ≤4 characters (e.g. "CAR", "ROI", "IMS") is matched case-sensitively.
@@ -24,68 +25,30 @@ logger = logging.getLogger(__name__)
 # Entry format: (canonical_tag, [aliases], type)
 # ---------------------------------------------------------------------------
 
+# A small, generic seed of widely-used tools/platforms. This is intentionally
+# NOT personal — add your own projects/people/concepts via entities.json.
 _SEED_ENTITIES: list[tuple[str, list[str], str]] = [
-    # -- Projects --
-    ("roi", ["ROI That Works", "ROI That Works - Autopilot", "ROI", "roithatworks.com"], "project"),
-    ("car", ["Control Alt Recover", "controlaltrecover.com",  "CAR"], "project"),
-    ("sap", ["Strategic Alignment Playbook", "SAP"], "project"),
-    ("canvas-grader", ["Canvas Grader", "Canvas Grader Web"], "tool"),
-    ("mentiondesk", ["MentionDesk", "MentionDesk Clone", "mds"], "project"),
-    ("crypto-momentum", ["Crypto Momentum Bot", "Crypto Momentum"], "project"),
-    ("customer-journey", ["Customer Journey Simulator"], "project"),
-    ("audio-trial", ["Audio Trial Jam"], "project"),
-    ("ai-daily-brief", ["AI Daily Briefing", "Daily Briefing", "ai-daily-briefing"], "project"),
-    ("expensive-mistake", ["Expensive Mistake Framework"], "project"),
-
-    # -- People --
-    ("chris", ["Chris"], "person"),
-    ("rebecca", ["Rebecca"], "person"),
-    ("mark-graban", ["Mark Graban"], "person"),
-
-    # -- Tools & Platforms --
-    ("notion", ["Notion"], "tool"),
+    # -- AI / LLM tools --
+    ("chatgpt", ["ChatGPT", "OpenAI"], "tool"),
+    ("claude", ["Claude", "Anthropic"], "tool"),
+    ("gemini", ["Gemini", "Google Gemini"], "tool"),
     ("memorybridge", ["MemoryBridge", "memorybridge"], "tool"),
-    ("hermes", ["Hermes Agent", "Hermes"], "tool"),
-    ("monday", ["Monday.com", "Monday"], "tool"),
-    ("telegram", ["Telegram"], "tool"),
+    ("mcp", ["Model Context Protocol", "FastMCP", "MCP Server"], "tool"),
+
+    # -- Dev / collaboration tools --
     ("github", ["GitHub", "GitHub CLI"], "tool"),
-    ("gojiberry", ["Gojiberry"], "tool"),
+    ("gitlab", ["GitLab"], "tool"),
+    ("notion", ["Notion"], "tool"),
+    ("slack", ["Slack"], "tool"),
+    ("jira", ["Jira"], "tool"),
     ("linear", ["Linear"], "tool"),
-    ("spotify", ["Spotify"], "tool"),
-    ("deepseek", ["DeepSeek"], "tool"),
-    ("openrouter", ["OpenRouter"], "tool"),
-    ("cloudflare", ["Cloudflare", "Cloudflare Workers", "Cloudflare Pages", "Cloudflare Turnstile"], "tool"),
-    ("streamlit", ["Streamlit"], "tool"),
-    ("fastmcp", ["FastMCP", "MCP Server", "fastmcp"], "tool"),
-    ("qdrant", ["Qdrant"], "tool"),
-    ("hindsight", ["Hindsight"], "tool"),
-    ("mem0", ["Mem0"], "tool"),
-
-    # -- Teaching --
-    ("uno", ["UNO", "University of Nebraska Omaha", "UNO CIST", "UNO ISQA"], "concept"),
-    ("cist3110", ["CIST3110", "CIST 3110"], "concept"),
-    ("isqa3420", ["ISQA3420", "ISQA 3420"], "concept"),
-    ("isqa3910", ["ISQA3910", "ISQA 3910"], "concept"),
-    ("ai-discussion", ["AI Discussion", "AI discussion grading"], "concept"),
-
-    # -- Concepts --
-    ("revops", ["RevOps", "Revenue Operations"], "concept"),
-    ("lean", ["Lean", "Toyota Production System", "TPS"], "concept"),
-    ("rcm", ["RCM", "Revenue Cycle Management"], "concept"),
-    ("healthcare-rcm", ["Healthcare RCM", "Healthcare Revenue Cycle"], "concept"),
-    ("volume-to-value", ["Volume to Value"], "concept"),
-    ("podcast", ["podcast", "AHF", "Accountability Hopeful Fridays"], "concept"),
-
-    # -- Career --
-    ("ims", ["IMS", "McKesson"], "concept"),
-    ("paladina", ["Paladina", "Paladina Health"], "concept"),
-    ("ctp", ["CTP", "Google Cloud CTP", "Google Pinpoint", "Cloud Technology Partnerships"], "concept"),
-
-    # -- Infrastructure --
-    ("launchd", ["launchd", "LaunchDaemon"], "concept"),
-    ("s6-overlay", ["s6-overlay", "s6"], "concept"),
     ("docker", ["Docker", "Docker Compose"], "concept"),
-    ("homebrew", ["Homebrew", "brew"], "concept"),
+
+    # -- Cloud / infra --
+    ("aws", ["AWS", "Amazon Web Services"], "tool"),
+    ("cloudflare", ["Cloudflare", "Cloudflare Workers", "Cloudflare Pages"], "tool"),
+    ("postgres", ["Postgres", "PostgreSQL"], "tool"),
+    ("sqlite", ["SQLite"], "tool"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -178,7 +141,7 @@ class EntityExtractor:
     Usage::
 
         extractor = EntityExtractor()
-        tags = extractor.extract("Cale teaches UNO courses")  # ["entity:uno"]
+        tags = extractor.extract("We deploy on Cloudflare")  # ["entity:cloudflare"]
     """
 
     def __init__(self, config_path: Path | None = None):

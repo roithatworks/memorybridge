@@ -86,7 +86,7 @@ class Reflector:
             search_fn=lambda q: store.search_hybrid('default', q, limit=15, max_tokens=3000),
             llm_synthesize=None,  # uses keyword fallback
         )
-        result = reflector.reflect("What does Cale prefer for project management?")
+        result = reflector.reflect("What does the user prefer for project management?")
     """
 
     def __init__(

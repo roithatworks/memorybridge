@@ -277,26 +277,10 @@ def _looks_like_code(content: str) -> bool:
 
 # --- Project name normalization ---------------------------------------------
 
-_PROJECT_NORMALIZE: dict[str, str] = {
-    # Hermes Agent variants
-    "hermes agent": "hermes-agent",
-    "hermes-agent": "hermes-agent",
-    "hermes": "hermes-agent",
-    # Ops Radar variants
-    "ops_radar": "ops-radar",
-    "ops-radar": "ops-radar",
-    "ops radar": "ops-radar",
-    # Control Alt Recover
-    "controlaltrecover": "car",
-    "car": "car",
-    # ROI That Works
-    "roithatworks": "roi",
-    "roithatworks.com": "roi",
-    "roi": "roi",
-    # Strategic Alignment Playbook
-    "strategic alignment playbook": "sap",
-    "sap": "sap",
-}
+# Canonical project-name aliases. Empty by default (unknown project IDs pass
+# through unchanged); populate this with your own project aliases if you want
+# variant spellings collapsed to one canonical id.
+_PROJECT_NORMALIZE: dict[str, str] = {}
 
 
 def _normalize_project(project_id: str | None) -> str | None:

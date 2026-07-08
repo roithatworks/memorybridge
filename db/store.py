@@ -165,7 +165,7 @@ class MemoryStore:
     Usage:
         store = MemoryStore(Path.home() / "memorybridge" / "memory.db")
         store.ensure_profile("default")
-        mid = store.add_memory("default", "Cale prefers dark mode", category="preference")
+        mid = store.add_memory("default", "The user prefers dark mode", category="preference")
     """
 
     def __init__(self, db_path: Path, entity_extractor: EntityExtractor | None = None,
