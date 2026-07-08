@@ -55,6 +55,15 @@ def slugify(text: str, max_len: int = 48) -> str:
     return text or "untitled"
 
 
+def safe_project_dir(proj: str) -> str:
+    """Filesystem-safe directory name for a project. project_id comes from
+    LLM-extracted ingestion, so a value like '../../etc' must not escape the
+    output directory (#105). slugify() strips '/', '.', etc."""
+    if proj == "_unassigned":
+        return "_unassigned"
+    return slugify(proj) or "_unassigned"
+
+
 def wrap_text(text: str, width: int = 80) -> str:
     """Wrap text at width, preserving existing paragraphs."""
     paragraphs = text.split("\n")
@@ -318,7 +327,7 @@ class OKFExporter:
             total = sum(len(v) for v in grouped[proj].values())
             display_name = proj.replace("_unassigned", "Uncategorized")
             project_entries.append(
-                (f"{proj}/index.md", "Index",
+                (f"{safe_project_dir(proj)}/index.md", "Index",
                  f"{total} concepts across {cat_count} categories")
             )
         self.write_index(out_root, "MemoryBridge Knowledge",
@@ -328,7 +337,11 @@ class OKFExporter:
 
         # Write each project
         for proj, categories in sorted(grouped.items()):
-            proj_dir = out_root / (proj if proj != "_unassigned" else "_unassigned")
+            proj_dir = out_root / safe_project_dir(proj)
+            # Defense in depth — should be impossible after slugify.
+            if not proj_dir.resolve().is_relative_to(out_root.resolve()):
+                print(f"  Skipping project with unsafe path: {proj!r}", file=sys.stderr)
+                continue
             proj_total = sum(len(v) for v in categories.values())
 
             # Project index
@@ -438,8 +451,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Export MemoryBridge to Open Knowledge Format (.okf)"
     )
-    parser.add_argument("--db", default="~/memorybridge/memory.db",
-                        help="Path to MemoryBridge SQLite DB")
+    parser.add_argument(
+        "--db",
+        default=os.path.join(
+            os.environ.get("MEMORYBRIDGE_DATA", os.path.expanduser("~/memorybridge")),
+            "memory.db"),
+        help="Path to MemoryBridge SQLite DB (default honors MEMORYBRIDGE_DATA)")
     parser.add_argument("--out", default="./memorybridge.okf",
                         help="Output .okf/ directory")
     parser.add_argument("--profile", default="default",
