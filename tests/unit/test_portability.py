@@ -1,18 +1,20 @@
 """
-Unit tests for ui/pages/portability.py validation and ingestion helper.
+Unit tests for ui/views/portability.py validation and ingestion helper.
 """
 import pytest
 import tempfile
 import sys
 from pathlib import Path
 
-# Add root directory to sys.path so we can import ui.pages.portability
+# Add root directory to sys.path so we can import ui.views.portability
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from ui.pages.portability import (
+from ui.views import portability
+from ui.views.portability import (
     _validate_source,
     _validate_profile_name,
-    _validate_input_file_path
+    _validate_input_file_path,
+    run_ingestion,
 )
 
 
@@ -66,3 +68,20 @@ def test_validate_input_file_path():
     outside_path = Path(__file__).resolve() # Current test file (not in tempdir)
     with pytest.raises(ValueError, match="File must be located in the temporary directory"):
         _validate_input_file_path(outside_path)
+
+
+def test_run_ingestion_handles_subprocess_timeout(monkeypatch):
+    """A subprocess timeout must be returned as a failed-run result, not raised
+    as an uncaught TimeoutExpired the callers don't guard (#113)."""
+    import subprocess
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+        tmp = Path(tf.name)
+    try:
+        def boom(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="ingest", timeout=300)
+        monkeypatch.setattr(portability.subprocess, "run", boom)
+        res = run_ingestion("claude", tmp, "default", preview=True, days=0)
+        assert res["returncode"] == -1
+        assert "timed out" in res["stderr"].lower()
+    finally:
+        tmp.unlink(missing_ok=True)
