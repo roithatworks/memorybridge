@@ -319,6 +319,11 @@ class MemoryStore:
                 (json.dumps(identity), name)
             )
         if projects is not None:
+            # Validate shape on write so list_projects (and other readers) can
+            # rely on every element being a dict (#124). Reject early with a
+            # clear error rather than persisting a bare string that 500s later.
+            if not isinstance(projects, list) or not all(isinstance(p, dict) for p in projects):
+                raise ValueError("projects must be a list of objects (dicts)")
             self._conn.execute(
                 "UPDATE profiles SET projects=? WHERE name=?",
                 (json.dumps(projects), name)
@@ -684,26 +689,12 @@ class MemoryStore:
                 break
         return results
 
-    def boost_on_access(self, profile: str, memory_id: str,
-                        boost: float = 0.1) -> None:
-        """Increment access_count and boost relevance_score (capped at 1.0)."""
-        today = datetime.now().isoformat()
-        self._conn.execute(
-            """UPDATE memories
-               SET access_count = access_count + 1,
-                   last_accessed = ?,
-                   relevance_score = MIN(relevance_score + ?, 1.0)
-               WHERE id = ? AND profile = ?""",
-            (today, boost, memory_id, profile)
-        )
-        self._conn.commit()
-
     def boost_batch(self, profile: str, ids: list,
                     boost: float = 0.1) -> None:
         """Boost relevance_score for multiple memories in a single commit.
 
-        Replaces calling boost_on_access once per result (issue #12): uses
-        executemany + a single conn.commit() instead of N commits.
+        Boosts all accessed memories at once (issue #12): executemany + a single
+        conn.commit() instead of one UPDATE+commit per result.
         """
         if not ids:
             return
