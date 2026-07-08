@@ -28,12 +28,14 @@ def test_validate_source():
 def test_validate_profile_name():
     assert _validate_profile_name("default") == "default"
     assert _validate_profile_name(" DEFAULT ") == "default"
+    # Any validly-named profile is allowed now, not just "default" (#90).
+    assert _validate_profile_name("work") == "work"
+    assert _validate_profile_name("job_search") == "job_search"
 
-    with pytest.raises(ValueError, match="Invalid profile name"):
-        _validate_profile_name("work")  # Must be in _ALLOWED_PROFILES (default)
-
-    with pytest.raises(ValueError, match="Invalid profile name"):
-        _validate_profile_name("-invalid")
+    # Format-invalid names are still rejected.
+    for bad in ("-invalid", "bad/name", "has space", "x" * 65):
+        with pytest.raises(ValueError, match="Invalid profile name"):
+            _validate_profile_name(bad)
 
 
 def test_validate_input_file_path():

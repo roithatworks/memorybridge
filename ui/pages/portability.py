@@ -14,7 +14,6 @@ INGESTION_SCRIPT = Path(__file__).parent.parent.parent / "ingestion" / "run.py"
 
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _ALLOWED_SOURCES = {"claude", "chatgpt", "gemini"}
-_ALLOWED_PROFILES = {"default"}
 
 
 def _validate_profile_name(profile: str) -> str:
@@ -25,10 +24,11 @@ def _validate_profile_name(profile: str) -> str:
         )
     if profile.startswith((".", "-")):
         raise ValueError("Invalid profile name. Must not start with '.' or '-'.")
-    if profile not in _ALLOWED_PROFILES:
-        raise ValueError("Invalid profile name. Must be one of: default.")
-    # Return explicit literal from allowlist to break taint tracking
-    return "default"
+    # The regex restricts to [A-Za-z0-9_.-], so the value is safe to pass to the
+    # ingestion subprocess. Any validly-named profile is allowed — a new one is
+    # created on first write — not just "default" (#90). Rebuild from a matched
+    # char class so no unsanitized substring flows through.
+    return "".join(ch for ch in profile if ch.isalnum() or ch in "_.-")
 
 
 def _validate_source(source: str) -> str:
@@ -149,7 +149,7 @@ def render():
                 if st.button("🔍 Preview extraction", use_container_width=True):
                     try:
                         with st.spinner("Running extraction preview…"):
-                            result = run_ingestion(source, tmp_path, profile, preview=True, days=days)
+                             result = run_ingestion(source, tmp_path, profile, preview=True, days=days)
                     except ValueError as e:
                         st.error(str(e))
                     else:
@@ -160,18 +160,12 @@ def render():
                         else:
                             st.error("Preview failed")
                             st.code(result["stderr"], language="text")
-                    finally:
-                        # Clean up the uploaded temp file to avoid accumulating files
-                        try:
-                            tmp_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
 
             with col_run:
                 if st.button("✓ Run ingestion", type="primary", use_container_width=True):
                     try:
                         with st.spinner("Ingesting memories…"):
-                            result = run_ingestion(source, tmp_path, profile, preview=False, days=days)
+                             result = run_ingestion(source, tmp_path, profile, preview=False, days=days)
                     except ValueError as e:
                         st.error(str(e))
                     else:
@@ -182,12 +176,6 @@ def render():
                         else:
                             st.error("Ingestion failed")
                             st.code(result["stderr"], language="text")
-                    finally:
-                        # Clean up the uploaded temp file to avoid accumulating files
-                        try:
-                            tmp_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
 
     # =========================================================================
     # EXPORT TAB

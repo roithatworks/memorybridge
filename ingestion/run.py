@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import logging
@@ -111,46 +112,56 @@ def _write_flagged(flagged: list, source: str, profile: str) -> None:
         return
 
     FLAGGED_QUEUE.parent.mkdir(parents=True, exist_ok=True)
-    existing = {"generated": datetime.now().isoformat(), "items": []}
-    if FLAGGED_QUEUE.exists():
-        try:
-            loaded = json.loads(FLAGGED_QUEUE.read_text())
-            if isinstance(loaded, dict) and isinstance(loaded.get("items"), list):
-                existing = loaded
-            else:
-                raise ValueError("unexpected queue shape")
-        except Exception as e:
-            # Do NOT silently overwrite an unreadable queue — that would drop
-            # every pending review item. Preserve it as a .corrupt backup first.
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            bak = FLAGGED_QUEUE.with_name(f"{FLAGGED_QUEUE.name}.corrupt-{ts}")
+
+    # Hold an exclusive lock across the read-modify-write so a concurrent
+    # Streamlit UI accept/reject can't clobber our append (and vice-versa). The
+    # UI takes the same lock on <queue>.lock (#88).
+    lock_f = open(FLAGGED_QUEUE.with_name(FLAGGED_QUEUE.name + ".lock"), "w")
+    fcntl.flock(lock_f, fcntl.LOCK_EX)
+    try:
+        existing = {"generated": datetime.now().isoformat(), "items": []}
+        if FLAGGED_QUEUE.exists():
             try:
-                FLAGGED_QUEUE.replace(bak)
-                logger.error("flagged_queue.json unreadable (%s) — backed up to %s",
-                             e, bak)
-            except Exception:
-                logger.error("flagged_queue.json unreadable (%s) and backup failed", e)
+                loaded = json.loads(FLAGGED_QUEUE.read_text())
+                if isinstance(loaded, dict) and isinstance(loaded.get("items"), list):
+                    existing = loaded
+                else:
+                    raise ValueError("unexpected queue shape")
+            except Exception as e:
+                # Do NOT silently overwrite an unreadable queue — that would drop
+                # every pending review item. Preserve it as a .corrupt backup first.
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                bak = FLAGGED_QUEUE.with_name(f"{FLAGGED_QUEUE.name}.corrupt-{ts}")
+                try:
+                    FLAGGED_QUEUE.replace(bak)
+                    logger.error("flagged_queue.json unreadable (%s) — backed up to %s",
+                                 e, bak)
+                except Exception:
+                    logger.error("flagged_queue.json unreadable (%s) and backup failed", e)
 
-    for fact in flagged:
-        existing["items"].append({
-            "id": str(uuid.uuid4()),
-            "fact": fact.get("fact", ""),
-            "confidence": fact.get("confidence", 0.0),
-            "reason": fact.get("reason", ""),
-            "category": fact.get("category", "fact"),
-            "importance": fact.get("importance", "medium"),
-            "project": fact.get("project"),
-            "source_conversation_id": fact.get("source_conversation_id", ""),
-            "source": source,
-            "profile": profile,
-            "status": "pending",
-        })
+        for fact in flagged:
+            existing["items"].append({
+                "id": str(uuid.uuid4()),
+                "fact": fact.get("fact", ""),
+                "confidence": fact.get("confidence", 0.0),
+                "reason": fact.get("reason", ""),
+                "category": fact.get("category", "fact"),
+                "importance": fact.get("importance", "medium"),
+                "project": fact.get("project"),
+                "source_conversation_id": fact.get("source_conversation_id", ""),
+                "source": source,
+                "profile": profile,
+                "status": "pending",
+            })
 
-    existing["generated"] = datetime.now().isoformat()
-    # Atomic write: a crash mid-write must not corrupt the queue.
-    tmp = FLAGGED_QUEUE.with_name(f"{FLAGGED_QUEUE.name}.tmp")
-    tmp.write_text(json.dumps(existing, indent=2))
-    os.replace(tmp, FLAGGED_QUEUE)
+        existing["generated"] = datetime.now().isoformat()
+        # Atomic write: a crash mid-write must not corrupt the queue.
+        tmp = FLAGGED_QUEUE.with_name(f"{FLAGGED_QUEUE.name}.tmp")
+        tmp.write_text(json.dumps(existing, indent=2))
+        os.replace(tmp, FLAGGED_QUEUE)
+    finally:
+        fcntl.flock(lock_f, fcntl.LOCK_UN)
+        lock_f.close()
 
 
 def _write_log(report: dict, flagged_count: int, escalated_count: int) -> Path:
