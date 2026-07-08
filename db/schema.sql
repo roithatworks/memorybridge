@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS access_log (
     details       TEXT,
     tokens_served INTEGER DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_access_profile ON access_log(profile);
+CREATE INDEX IF NOT EXISTS idx_access_ts ON access_log(ts);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -98,3 +100,4 @@ CREATE TABLE IF NOT EXISTS analytics_events (
 );
 CREATE INDEX IF NOT EXISTS idx_analytics_date ON analytics_events(session_date);
 CREATE INDEX IF NOT EXISTS idx_analytics_op   ON analytics_events(operation);
+CREATE INDEX IF NOT EXISTS idx_analytics_model ON analytics_events(model);

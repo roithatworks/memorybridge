@@ -31,11 +31,13 @@ def _validate_profile_name(profile: str) -> str:
     if profile.startswith((".", "-")):
         raise ValueError("Invalid profile name. Must not start with '.' or '-'.")
     # Canonicalize through an explicit character allowlist.
+    # Rebuild the name character-by-character from an explicit literal allowlist.
+    # The result carries no taint (CodeQL) even though any validly-named profile
+    # is accepted, not just a fixed set (#90).
     canonical = "".join(ch for ch in profile if ch in _PROFILE_ALLOWED_CHARS)
-    if canonical not in _ALLOWED_PROFILES:
-        raise ValueError("Invalid profile name. Must be one of: default, work, personal.")
-    # Return explicit matching literals to break taint tracking.
-    return _ALLOWED_PROFILES[canonical]
+    if not canonical:
+        raise ValueError("Invalid profile name.")
+    return canonical
 
 
 def _validate_source(source: str) -> str:
