@@ -1,19 +1,23 @@
 """
 Memory Browser page — filter, sort, search, and delete memories across profiles.
 """
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 MAX_TOTAL_TOKENS = 50_000
+# Honor MEMORYBRIDGE_DATA so the browser reads/deletes from the SAME DB the
+# server uses, not a hardcoded ~/memorybridge (#89).
+_DATA_DIR = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
 
 
 def render():
     import streamlit as st
     from db.store import MemoryStore
 
-    MEMORY_DB = Path.home() / "memorybridge" / "memory.db"
+    MEMORY_DB = _DATA_DIR / "memory.db"
     store = MemoryStore(MEMORY_DB)
 
     st.header("🧠 Memory Browser")
@@ -72,9 +76,12 @@ def render():
         with st.container():
             col_text, col_del = st.columns([8, 1])
             with col_text:
-                badge_cat = f"`{mem.get('category', '')}`"
-                badge_imp = f"`{mem.get('importance', '')}`"
-                st.markdown(f"{mem['content']}  {badge_cat} {badge_imp}")
+                # Memory content is untrusted (LLM-extracted / user-written) —
+                # render as plain text to avoid markdown image/link injection
+                # (e.g. a beacon image firing on page load) (#86). Badges are
+                # our own trusted strings.
+                st.text(mem["content"])
+                st.markdown(f"`{mem.get('category', '')}` `{mem.get('importance', '')}`")
                 st.caption(
                     f"ID: {mem['id']} · "
                     f"Score: {mem.get('relevance_score', 0):.2f} · "
