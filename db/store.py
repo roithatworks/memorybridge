@@ -513,8 +513,15 @@ class MemoryStore:
                         best_id, best_sim)
             return best_id
         except Exception:
+            # A match WAS found and we intended to merge into it, but the write
+            # failed (lock timeout, disk full, constraint). Returning None here
+            # would make add_memory fall through to a normal INSERT and create a
+            # NEW duplicate of the very content it meant to merge — inverting the
+            # anti-duplication guarantee under load. Re-raise so the failure
+            # surfaces (and a retry can merge correctly) instead of double-writing
+            # (#94).
             logger.exception("Merge UPDATE failed for best_id=%s", best_id)
-            return None
+            raise
 
     def add_memories(self, profile: str, facts: list[str], *,
                      category: str = "fact", importance: str = "medium",
