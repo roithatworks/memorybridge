@@ -95,7 +95,18 @@ def guardrail_check(content: str) -> tuple[bool, str]:
 
 
 def _content_hash(content: str) -> str:
-    """SHA256 of normalized content — same normalization across all callers."""
+    """SHA256 of normalized content — same normalization across all callers.
+
+    Normalization is intentionally case- and surrounding-whitespace-insensitive
+    (``strip().lower()``): the dedup key backs a UNIQUE index on
+    ``(profile, content_hash)``, and for a personal memory store two facts that
+    differ only by case or padding ("Ship it." vs "ship it") are treated as the
+    same fact on purpose, to keep near-duplicate noise out of the store. This is
+    a deliberate design choice, not an oversight (#107). Do NOT change it to
+    case-sensitive without a migration: every existing row's hash was computed
+    lowercased, so a change would silently stop de-duplicating re-adds until the
+    whole table is re-hashed.
+    """
     return hashlib.sha256(content.strip().lower().encode()).hexdigest()
 
 

@@ -840,6 +840,9 @@ def list_projects(profile: str = None) -> str:
         return json.dumps({"error": f"Profile '{profile}' not found"})
 
     projects = profile_data.get("projects", [])
+    # Guard against malformed project entries: the projects column is free-form
+    # JSON, so a bare string would make p.get(...) raise AttributeError and 500
+    # the whole tool. Skip non-dict entries instead (#124).
     summary = [
         {
             "id": p.get("id"),
@@ -849,6 +852,7 @@ def list_projects(profile: str = None) -> str:
             "last_updated": p.get("last_updated")
         }
         for p in projects
+        if isinstance(p, dict)
     ]
     _store.log_access("list_projects", profile, "")
     return json.dumps({
@@ -1141,6 +1145,10 @@ def export_passport(
         identity=identity,
         profile=profile,
         max_tokens=max_tokens,
+        # Budget against the SAME real (tiktoken) counter used to measure the
+        # result below, so max_tokens is actually the ceiling the caller gets
+        # rather than a 4-char-heuristic under-count (#126).
+        token_counter=count_tokens,
     )
 
     final_tokens = count_tokens(passport)
