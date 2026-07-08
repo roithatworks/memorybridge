@@ -13,6 +13,7 @@ Environment:
 """
 
 import argparse
+import json
 import logging
 import os
 import sqlite3
@@ -55,16 +56,23 @@ def _load_memories(profile: str, db_path: Path) -> list:
 
 
 def _load_identity(profile: str, db_path: Path) -> dict:
-    """Load identity fields from the profiles table. Returns {} if not found."""
+    """Load the identity dict for a profile. Returns {} if not found.
+
+    The `identity` column holds a JSON object (name/role/...). The old code
+    returned the raw profiles ROW instead, whose `name` key is the *profile
+    name* — so the passport rendered "Name: default" and never showed the real
+    identity (#81). Parse the identity JSON column and return that.
+    """
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
-            "SELECT * FROM profiles WHERE name = ? LIMIT 1", (profile,)
+            "SELECT identity FROM profiles WHERE name = ? LIMIT 1", (profile,)
         ).fetchone()
-        if row is None:
+        if row is None or not row["identity"]:
             return {}
-        return {k: row[k] for k in row.keys() if row[k] is not None}
+        parsed = json.loads(row["identity"])
+        return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
     finally:
@@ -125,35 +133,37 @@ def _passport_to_blocks(passport_text: str) -> list:
     return blocks
 
 
-def _clear_page_blocks(client, page_id: str) -> int:
-    """Delete all child blocks from a Notion page. Returns count deleted."""
-    deleted = 0
-    cursor = None
+def _list_block_ids(client, page_id: str) -> list:
+    """Return all child block IDs of a Notion page (paginated)."""
     all_block_ids = []
-
-    # 1. Fetch all child block IDs paginatively
+    cursor = None
     while True:
         kwargs = {"block_id": page_id, "page_size": 100}
         if cursor:
             kwargs["start_cursor"] = cursor
-
         response = client.blocks.children.list(**kwargs)
-        block_ids = [b["id"] for b in response.get("results", [])]
-        all_block_ids.extend(block_ids)
-
+        all_block_ids.extend(b["id"] for b in response.get("results", []))
         if not response.get("has_more"):
             break
         cursor = response["next_cursor"]
+    return all_block_ids
 
-    # 2. Delete the retrieved blocks in a separate loop
-    for bid in all_block_ids:
+
+def _delete_block_ids(client, block_ids: list) -> int:
+    """Delete the given blocks. Returns count deleted."""
+    deleted = 0
+    for bid in block_ids:
         try:
             client.blocks.delete(block_id=bid)
             deleted += 1
         except Exception as exc:
             logger.warning("Could not delete block %s: %s", bid, exc)
-
     return deleted
+
+
+def _clear_page_blocks(client, page_id: str) -> int:
+    """Delete all child blocks from a Notion page. Returns count deleted."""
+    return _delete_block_ids(client, _list_block_ids(client, page_id))
 
 
 def _append_blocks(client, page_id: str, blocks: list) -> int:
@@ -235,12 +245,16 @@ def refresh_context_page(
 
     client = Client(auth=token)
 
-    # Clear and rewrite page content
-    deleted = _clear_page_blocks(client, page_id)
-    logger.info("Cleared %d old blocks", deleted)
-
+    # Append the NEW blocks first, then delete the OLD ones (#80). The old code
+    # cleared the page and then wrote, so any failure between the two left the
+    # page empty until the next successful run. Capture the pre-existing block
+    # ids, append the new content, and only then remove the old blocks — so a
+    # failure leaves the previous content intact.
+    old_block_ids = _list_block_ids(client, page_id)
     written = _append_blocks(client, page_id, blocks)
     logger.info("Wrote %d blocks to page %s", written, page_id)
+    deleted = _delete_block_ids(client, old_block_ids)
+    logger.info("Removed %d old blocks", deleted)
 
     return {
         "memories_loaded": len(memories),

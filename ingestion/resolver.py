@@ -49,22 +49,35 @@ def _pick_model(client: anthropic.Anthropic) -> str:
     if _RESOLVED_MODEL:
         return _RESOLVED_MODEL
 
-    # 1. Try the configured model with a 1-token ping.
+    # 1. Try the configured model with a 1-token ping. Only fall back on a real
+    #    404 (model retired) — a transient error (rate limit / overloaded /
+    #    network) must NOT switch us to a different model for the whole run.
     try:
         client.messages.create(model=RESOLVER_MODEL, max_tokens=1,
                                messages=[{"role": "user", "content": "hi"}])
         _RESOLVED_MODEL = RESOLVER_MODEL
         return _RESOLVED_MODEL
-    except Exception as e:
-        logger.warning("Configured RESOLVER_MODEL '%s' unavailable (%s) — "
+    except anthropic.NotFoundError as e:
+        logger.warning("Configured RESOLVER_MODEL '%s' not found (%s) — "
                        "auto-selecting newest Sonnet", RESOLVER_MODEL, str(e)[:60])
+    except Exception as e:
+        # Transient — keep the configured model rather than switching on a blip.
+        logger.warning("RESOLVER_MODEL ping failed transiently (%s) — keeping "
+                       "configured model", str(e)[:60])
+        _RESOLVED_MODEL = RESOLVER_MODEL
+        return _RESOLVED_MODEL
 
-    # 2. Ask the Models API for the newest Sonnet (models list is newest-first).
+    # 2. Ask the Models API for the newest Sonnet. Sort by created_at rather than
+    #    trusting the list order (which is not a documented guarantee).
     try:
         models = client.models.list(limit=50)
-        sonnets = [m.id for m in models.data if "sonnet" in m.id.lower()]
+        sonnets = sorted(
+            (m for m in models.data if "sonnet" in m.id.lower()),
+            key=lambda m: getattr(m, "created_at", "") or "",
+            reverse=True,
+        )
         if sonnets:
-            _RESOLVED_MODEL = sonnets[0]
+            _RESOLVED_MODEL = sonnets[0].id
             logger.warning("Resolver now using auto-selected model: %s", _RESOLVED_MODEL)
             return _RESOLVED_MODEL
     except Exception as e:
