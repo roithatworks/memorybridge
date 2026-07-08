@@ -22,9 +22,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load repo .env first, then production .env (without overwriting)
-load_dotenv(Path(__file__).parent.parent / ".env")
-load_dotenv(Path.home() / "memorybridge" / ".env", override=False)
+# Data-dir .env is canonical; repo-local .env is the dev fallback. This matches
+# ingestion/run.py's precedence — previously this file loaded them in the
+# opposite order, so the same var could resolve differently depending on which
+# script ran (#118).
+_DATA_DIR = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
+load_dotenv(_DATA_DIR / ".env")
+load_dotenv(Path(__file__).parent.parent / ".env", override=False)
 
 logger = logging.getLogger("notion_context")
 

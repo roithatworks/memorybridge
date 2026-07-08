@@ -32,7 +32,6 @@ os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
 
 # Data dir: mutable state (db, logs, .env, inbox) — defaults to ~/memorybridge,
 # override with MEMORYBRIDGE_DATA. Code stays in the repo.
-import os
 _DATA_DIR = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
 
 # Load .env before any module imports that need env vars.
@@ -166,9 +165,11 @@ def _write_flagged(flagged: list, source: str, profile: str) -> None:
 
 
 def _write_log(report: dict, flagged_count: int, escalated_count: int) -> Path:
-    """Write diff report to logs/ingest_YYYY-MM-DD_HH-MM.json."""
+    """Write diff report to logs/ingest_YYYY-MM-DD_HH-MM-SS.json."""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = LOGS_DIR / f"ingest_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.json"
+    # Include seconds so two runs in the same minute don't overwrite each
+    # other's diff report (#118).
+    filename = LOGS_DIR / f"ingest_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
     full_report = {
         **report,
         "flagged_count": flagged_count,
