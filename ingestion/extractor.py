@@ -297,7 +297,13 @@ def extract(normalized: dict) -> tuple[list, list]:
             if _is_infra_trivia(fact.get("fact", ""), fact.get("project")):
                 continue
             if "source_conversation_id" not in fact:
-                fact["source_conversation_id"] = batch[0].get("id", "")
+                # The whole batch is extracted in a single call, so a fact can't
+                # be attributed to one conversation — record every conversation
+                # id in the batch instead of mislabeling it with just the first
+                # (#76). Per-conversation precision would require 1 API call per
+                # conversation (higher cost).
+                fact["source_conversation_id"] = ",".join(
+                    str(c.get("id", "")) for c in batch if c.get("id"))
             all_facts.append(fact)
 
     # `conversations` here is the (possibly capped) list we actually processed.
