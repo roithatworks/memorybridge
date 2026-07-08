@@ -28,17 +28,14 @@ from typing import Optional
 from fastmcp import FastMCP
 from db.pruner import run_auto_prune, record_outcome, get_pruner_report
 from db.constants import VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score  # noqa: F401
-
-try:
-    import tiktoken
-    _enc = tiktoken.get_encoding("cl100k_base")
-    def _count_tokens_impl(text: str) -> int:
-        return len(_enc.encode(text))
-except ImportError:
-    def _count_tokens_impl(text: str) -> int:
-        words = len(re.findall(r'\b\w+\b', text))
-        punctuation = len(re.findall(r'[^\w\s]', text))
-        return int(words * 1.3 + punctuation * 0.5) or 1
+# Token counting, recency decay, and the model-export logic live in a
+# store-free module so the UI can reuse them without importing this server
+# module (which would build a second store + register atexit) — see #91.
+from exports import (  # noqa: E402
+    count_tokens, apply_decay, DECAY_CONFIG,
+    export_for_model as _export_for_model_impl,
+    export_passport as _export_passport_impl,
+)
 
 # Initialize MCP server
 mcp = FastMCP("MemoryBridge")
@@ -87,12 +84,7 @@ SEARCH_MAX_TOKENS_DEFAULT = 800
 MAX_TOTAL_TOKENS       = 50000
 ARCHIVE_SCORE_THRESHOLD = 0.15
 
-DECAY_CONFIG = {
-    "enabled": True,
-    "half_life_days": 30,
-    "min_score": 0.1,
-    "boost_on_access": 0.1
-}
+# DECAY_CONFIG, count_tokens, and apply_decay are imported from exports.py (#91).
 # PID file for duplicate-instance awareness
 PID_DIR = DATA_DIR
 _PID_FILE = PID_DIR / "instance.pid"
@@ -190,12 +182,6 @@ def log_to_analytics(tokens_served: int, memories_returned: int,
 # TOKEN MANAGEMENT
 # =============================================================================
 
-def count_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return _count_tokens_impl(text) or 1
-
-
 def count_memory_tokens(mem: dict) -> int:
     content = mem.get("content", "")
     tags = " ".join(mem.get("tags", []))
@@ -233,15 +219,6 @@ def compress_memory(mem: dict, target_tokens: int = 50) -> dict:
     # Fix #1: recompute content_hash so round-trips don't create duplicates
     compressed["content_hash"] = _content_hash(new_content)
     return compressed
-
-
-def apply_decay(memories: list, decay_config: dict) -> list:
-    if not decay_config.get("enabled", True):
-        return memories
-    today = datetime.now()
-    for mem in memories:
-        mem["effective_score"] = effective_score(mem, today)
-    return memories
 
 
 # =============================================================================
@@ -966,149 +943,10 @@ def export_for_model(
         max_tokens: Token budget for export (default 2000)
     """
     profile = profile or _active_profile()
-    _store.ensure_profile(profile)
-    profile_data = _store.get_profile(profile)
-    if profile_data is None:
-        return json.dumps({"error": f"Profile '{profile}' not found"})
-
-    identity = profile_data["identity"]
-    projects = profile_data["projects"]
-    memories = _store.get_memories(profile)
-    prefs = profile_data.get("model_preferences", {}).get(model, {})
-
-    memories = apply_decay([m.copy() for m in memories], DECAY_CONFIG)
-    memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
-
-    budgets = {"full": max_tokens, "summary": max_tokens // 2, "minimal": max_tokens // 4}
-    budget = budgets.get(depth, max_tokens)
-    tokens_used = 0
-
-    # --- Build shared base data (Issue #20: all models draw from the same pool) ---
-    # Collect exported memories in a list so we can count what was actually included.
-    exported_memories: list = []
-
-    # Shared memory-iteration helper used by all three model branches.
-    def _collect_memories(lines_or_parts, append_fn, fmt_fn):
-        """Iterate memories within budget; populate exported_memories side-effect."""
-        nonlocal tokens_used
-        for m in memories:
-            if tokens_used >= budget - 50:
-                break
-            content = m.get("content", "")
-            mem_tokens = count_tokens(content)
-            if tokens_used + mem_tokens > budget - 50:
-                remaining = budget - tokens_used - 50
-                content = content[:remaining * 3] + "…"
-            append_fn(fmt_fn(content))
-            tokens_used += count_tokens(content) + 2
-            exported_memories.append(m)
-
-    if model == "chatgpt":
-        lines = [
-            "# Memory Chip",
-            f"*Exported: {datetime.now().strftime('%Y-%m-%d %H:%M')}*",
-            "",
-            "## Identity",
-            f"**Name:** {identity.get('name', 'Unknown')}",
-            f"**Role:** {identity.get('role', 'Unknown')}",
-            ""
-        ]
-        tokens_used = count_tokens("\n".join(lines))
-
-        if identity.get("communication_style") and tokens_used < budget - 100:
-            style = identity["communication_style"]
-            style_lines = [
-                "## Communication Style",
-                f"**Tone:** {style.get('tone', '')}",
-            ]
-            if style.get("preferences"):
-                for pref in style["preferences"][:3]:
-                    style_lines.append(f"- {pref}")
-            style_lines.append("")
-            style_text = "\n".join(style_lines)
-            if tokens_used + count_tokens(style_text) < budget:
-                lines.extend(style_lines)
-                tokens_used += count_tokens(style_text)
-
-        if memories and depth in ("full", "summary") and tokens_used < budget - 100:
-            lines.append("## Key Memories")
-            _collect_memories(lines, lines.append, lambda c: f"- {c}")
-            lines.append("")
-
-        if projects and depth == "full" and tokens_used < budget - 100:
-            lines.append("## Active Projects")
-            for p in projects:
-                if p.get("status") == "active" and tokens_used < budget - 50:
-                    proj_line = f"- **{p.get('name', p.get('id'))}**: {p.get('description', '')[:50]}"
-                    lines.append(proj_line)
-                    tokens_used += count_tokens(proj_line)
-            lines.append("")
-
-        export_text = "\n".join(lines)
-
-    elif model == "gemini":
-        # Gemini: pipe-separated compact format, but includes ALL memories within
-        # budget — not just 3 preference snippets (Issue #20 fix).
-        parts = [f"User: {identity.get('name', 'Unknown')} - {identity.get('role', 'Unknown')}"]
-        tokens_used = count_tokens(parts[0])
-
-        if identity.get("communication_style", {}).get("tone"):
-            tone_part = f"Style: {identity['communication_style']['tone'][:50]}"
-            if tokens_used + count_tokens(tone_part) < budget:
-                parts.append(tone_part)
-                tokens_used += count_tokens(tone_part)
-
-        if memories and depth in ("full", "summary") and tokens_used < budget - 100:
-            _collect_memories(parts, parts.append, lambda c: f"Mem: {c}")
-
-        if projects and depth == "full" and tokens_used < budget - 100:
-            active = [p.get("name", p["id"]) for p in projects if p.get("status") == "active"]
-            if active:
-                proj_part = f"Projects: {', '.join(active)}"
-                if tokens_used + count_tokens(proj_part) < budget:
-                    parts.append(proj_part)
-                    tokens_used += count_tokens(proj_part)
-
-        export_text = " | ".join(parts)
-
-    elif model == "ollama":
-        # Ollama: semicolon-separated terse format, but includes ALL memories
-        # within budget — not just name/role/project ids (Issue #20 fix).
-        parts = [
-            f"User={identity.get('name', 'Unknown')}",
-            f"Role={identity.get('role', 'Unknown')[:30]}"
-        ]
-        tokens_used = sum(count_tokens(p) for p in parts)
-
-        if memories and depth in ("full", "summary") and tokens_used < budget - 100:
-            _collect_memories(parts, parts.append, lambda c: f"Mem={c[:80]}")
-
-        if projects and depth in ("full", "summary") and tokens_used < budget - 100:
-            active = [p["id"] for p in projects if p.get("status") == "active"]
-            if active:
-                proj_part = f"Projects={','.join(active)}"
-                if tokens_used + count_tokens(proj_part) < budget:
-                    parts.append(proj_part)
-                    tokens_used += count_tokens(proj_part)
-
-        export_text = ";".join(parts)
-
-    else:
-        return json.dumps({"error": f"Unknown model: {model}. Supported: chatgpt, gemini, ollama"})
-
-    final_tokens = count_tokens(export_text)
-    _store.log_access("export_for_model", profile,
-                      f"model={model}, tokens={final_tokens}", final_tokens)
-    log_to_analytics(
-        tokens_served=final_tokens,
-        # Fix Issue #20: count memories actually included in the export,
-        # not memories that merely have effective_score > 0.3.
-        memories_returned=len(exported_memories),
-        model=model,
-        profile=profile,
-        operation="export_for_model"
+    return _export_for_model_impl(
+        _store, model, profile, depth=depth, max_tokens=max_tokens,
+        log_analytics=log_to_analytics,
     )
-    return export_text
 
 
 @mcp.tool()
@@ -1130,38 +968,9 @@ def export_passport(
         Plain-text Memory Passport string.
     """
     profile = profile or _active_profile()
-    from ingestion.passport import build_passport
-
-    _store.ensure_profile(profile)
-    profile_data = _store.get_profile(profile)
-    if profile_data is None:
-        return f"# Memory Passport\nProfile: {profile}\nGenerated: {__import__('datetime').datetime.now().strftime('%Y-%m-%d')}\n\nError: profile not found."
-
-    memories = _store.get_memories(profile)
-    identity = profile_data.get("identity", {})
-
-    passport = build_passport(
-        memories=memories,
-        identity=identity,
-        profile=profile,
-        max_tokens=max_tokens,
-        # Budget against the SAME real (tiktoken) counter used to measure the
-        # result below, so max_tokens is actually the ceiling the caller gets
-        # rather than a 4-char-heuristic under-count (#126).
-        token_counter=count_tokens,
+    return _export_passport_impl(
+        _store, profile, max_tokens=max_tokens, log_analytics=log_to_analytics,
     )
-
-    final_tokens = count_tokens(passport)
-    _store.log_access("export_passport", profile,
-                      f"tokens={final_tokens}", final_tokens)
-    log_to_analytics(
-        tokens_served=final_tokens,
-        memories_returned=len(memories),
-        model="passport",
-        profile=profile,
-        operation="export_passport",
-    )
-    return passport
 
 
 @mcp.tool()

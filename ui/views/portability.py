@@ -124,10 +124,20 @@ def run_ingestion(source: str, file_path: Path, profile: str,
 
 
 def render():
+    import os
     import streamlit as st
-    from server import export_for_model as _export_tool, export_passport as _passport_tool
-    export_for_model = _export_tool.fn
-    export_passport = _passport_tool.fn
+    from db.store import MemoryStore
+    from exports import export_for_model, export_passport
+
+    # Use a store-free exports module + this process's own store, instead of
+    # importing the whole `server` module (which would build a second store +
+    # register an atexit hook just to unwrap FastMCP `.fn` internals) — see #91.
+    # Exports only read memories and never need embeddings, so skip the backfill.
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    if "_mb_store" not in st.session_state:
+        data_dir = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
+        st.session_state["_mb_store"] = MemoryStore(data_dir / "memory.db")
+    store = st.session_state["_mb_store"]
 
     st.header("🔄 Portability")
 
@@ -237,10 +247,8 @@ def render():
             with st.spinner("Formatting…"):
                 try:
                     text = export_for_model(
-                        model=model,
-                        profile=export_profile,
-                        depth=depth,
-                        max_tokens=max_tokens,
+                        store, model, export_profile,
+                        depth=depth, max_tokens=max_tokens,
                     )
                     st.success("Export ready — copy or download below.")
                     st.text_area("Export text", value=text, height=300)
@@ -274,8 +282,7 @@ def render():
             with st.spinner("Building passport…"):
                 try:
                     text = export_passport(
-                        profile=passport_profile,
-                        max_tokens=passport_tokens,
+                        store, passport_profile, max_tokens=passport_tokens,
                     )
                     st.success("Passport ready.")
                     st.text_area("Passport text", value=text, height=400, key="pp_text")
