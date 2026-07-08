@@ -18,3 +18,5 @@ numpy>=1.24.0,<3.0.0
 # fresh install on a version that still supports it.
 streamlit>=1.37.0,<2.0.0
 pandas>=2.0.0,<3.0.0
+# Human-editable config file (memorybridge.yaml). JSON config works without it.
+pyyaml>=6.0,<7.0

@@ -81,7 +81,10 @@ def _active_profile() -> str:
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
-MAX_TOTAL_TOKENS       = 50000
+# Total-token ceiling is now configurable (config file `max_total_tokens` or
+# MEMORYBRIDGE_MAX_TOKENS env); defaults to 50000 for a fresh install (#7).
+import config as _config  # noqa: E402
+MAX_TOTAL_TOKENS       = _config.max_total_tokens()
 ARCHIVE_SCORE_THRESHOLD = 0.15
 
 # DECAY_CONFIG, count_tokens, and apply_decay are imported from exports.py (#91).
