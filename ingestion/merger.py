@@ -51,26 +51,6 @@ def _search_existing(fact_text: str, profile: str) -> list:
         return []
 
 
-def _write_fact(fact: dict, profile: str, preview: bool) -> str:
-    """
-    Write a single fact via add_memory. Returns "added" or "error".
-    Safe to call during preview=False only.
-    """
-    try:
-        add_memory(
-            content=fact["fact"],
-            category=fact.get("category", "fact"),
-            importance=fact.get("importance", "medium"),
-            tags=[],
-            project_id=fact.get("project"),
-            profile=profile,
-        )
-        return "added"
-    except Exception as e:
-        logger.error("add_memory failed: %s", e)
-        return "error"
-
-
 def _batch_write(facts_by_category: dict, profile: str) -> dict:
     """
     Write groups of facts via add_memories (one call per category).

@@ -200,17 +200,28 @@ def scan_inbox(inbox: Path, profile: str = "default", preview: bool = False,
     # Reject symlinks (#85): is_file() follows them, so a `foo.json -> ~/.ssh/id`
     # symlink dropped in the inbox would be read and shipped inside an extraction
     # API prompt — arbitrary local file exfiltration. Only process regular files.
-    files = sorted(f for f in inbox.iterdir()
-                   if f.is_file() and not f.is_symlink()
-                   and f.suffix.lower() == ".json")
-
-    if not files:
-        logger.info("Inbox empty — nothing to process.")
-        return {"processed": 0, "failed": 0, "skipped": 0}
+    regular = [f for f in inbox.iterdir() if f.is_file() and not f.is_symlink()]
+    files = sorted(f for f in regular if f.suffix.lower() == ".json")
+    # Non-.json files (e.g. a ChatGPT export .zip) were silently filtered out —
+    # not processed, not failed, not logged — so a user could drop one and wait
+    # forever on an ingestion that never runs. Log-and-skip them explicitly (#117).
+    unknown = sorted(f for f in regular if f.suffix.lower() != ".json")
 
     processed = 0
     failed = 0
     skipped = 0
+
+    for f in unknown:
+        logger.warning(
+            "Ignoring %s — unsupported extension '%s'. Export your history as a "
+            "JSON file (unzip .zip archives to get conversations.json first).",
+            f.name, f.suffix or "(none)")
+        skipped += 1
+
+    if not files:
+        if not unknown:
+            logger.info("Inbox empty — nothing to process.")
+        return {"processed": 0, "failed": 0, "skipped": skipped}
 
     for f in files:
         # Skip files that are still being written (leave them for the next run)

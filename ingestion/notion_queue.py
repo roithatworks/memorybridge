@@ -8,13 +8,17 @@ Opt-in: only runs when NOTION_API_TOKEN and NOTION_FLAGGED_DB_ID are set
 in the environment. If either is missing, write_flagged_to_notion() is a
 no-op and the standard flagged_queue.json write still happens.
 
-Notion database: https://www.notion.so/dbf5ac1a599b4b9b800f07cf98e7ebc2
+The target database is configured via NOTION_FLAGGED_DB_ID; no URL is hardcoded.
 """
 
 import logging
 import os
+import time
 
 logger = logging.getLogger("notion_queue")
+
+# Retry budget for transient Notion 429 rate-limit responses (#127).
+_NOTION_MAX_RETRIES = 4
 
 try:
     from notion_client import Client
@@ -123,17 +127,56 @@ def write_flagged_to_notion(
         return 0
 
     written = 0
+    failed = 0
     for item in flagged:
-        try:
-            properties = _build_properties(item, source, profile)
-            client.pages.create(
-                parent={"database_id": database_id},
-                properties=properties,
-            )
+        properties = _build_properties(item, source, profile)
+        if _create_with_retry(client, database_id, properties, item):
             written += 1
-        except Exception as e:
-            fact_preview = item.get("fact", "")[:50]
-            logger.warning("Notion write failed for '%s': %s", fact_preview, e)
+        else:
+            failed += 1
 
+    if failed:
+        # These remain in the flagged_queue.json fallback, so the next sync can
+        # re-attempt them — but flag the incomplete sync loudly (#127).
+        logger.warning(
+            "%d/%d flagged items could not be written to Notion after retries; "
+            "they stay in the JSON fallback for the next sync.", failed, len(flagged))
     logger.info("Wrote %d/%d flagged items to Notion", written, len(flagged))
     return written
+
+
+def _is_rate_limited(e) -> bool:
+    """True if a Notion exception looks like an HTTP 429 rate-limit."""
+    status = getattr(e, "status", None) or getattr(e, "code", None)
+    if status in (429, "429", "rate_limited"):
+        return True
+    return "429" in str(e) or "rate_limited" in str(e).lower()
+
+
+def _retry_after_seconds(e, attempt: int) -> float:
+    """Honor a Retry-After header if present, else exponential backoff."""
+    headers = getattr(e, "headers", None) or {}
+    try:
+        delay = float(headers.get("Retry-After", 0))
+    except (TypeError, ValueError, AttributeError):
+        delay = 0.0
+    return delay or float(2 ** attempt)
+
+
+def _create_with_retry(client, database_id, properties, item) -> bool:
+    """Create one Notion page, retrying on 429 with backoff. Returns success."""
+    fact_preview = item.get("fact", "")[:50]
+    for attempt in range(_NOTION_MAX_RETRIES):
+        try:
+            client.pages.create(parent={"database_id": database_id}, properties=properties)
+            return True
+        except Exception as e:  # noqa: BLE001 — notion_client raises its own types
+            if _is_rate_limited(e) and attempt < _NOTION_MAX_RETRIES - 1:
+                delay = _retry_after_seconds(e, attempt)
+                logger.warning("Notion 429 for '%s' — backing off %.1fs (attempt %d/%d)",
+                               fact_preview, delay, attempt + 1, _NOTION_MAX_RETRIES)
+                time.sleep(delay)
+                continue
+            logger.warning("Notion write failed for '%s': %s", fact_preview, e)
+            return False
+    return False

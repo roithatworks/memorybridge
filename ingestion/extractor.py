@@ -93,6 +93,22 @@ def _truncate_conversation(conv: dict) -> dict:
         kept.append(msg)
         total += len(chunk)
     result = conv.copy()
+    if not kept and messages:
+        # The newest message alone exceeds the budget. Sending an empty
+        # conversation contributes nothing but still costs envelope tokens and
+        # is silent — instead keep that message with its text truncated to fit
+        # so it can still yield facts (#119).
+        newest = dict(messages[-1])
+        text = newest.get("content", "")
+        if isinstance(text, str) and text:
+            keep_chars = max(0, _MAX_CONV_CHARS - 200)  # headroom for JSON envelope
+            newest["content"] = text[:keep_chars] + "\n…[truncated]"
+        logger.warning(
+            "Conversation %s has a single message larger than the %d-char "
+            "budget — truncating that message instead of dropping the whole "
+            "conversation.",
+            conv.get("id") or conv.get("title") or "?", _MAX_CONV_CHARS)
+        kept = [newest]
     result["messages"] = list(reversed(kept))
     return result
 
