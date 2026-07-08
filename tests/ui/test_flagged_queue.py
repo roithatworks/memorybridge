@@ -34,14 +34,13 @@ def test_accept_moves_fact_to_memory(tmp_path):
     """Accepting a flagged fact should call add_memory and mark status=accepted."""
     queue_path = _make_queue(tmp_path)
 
-    from ui.pages.flagged_queue import accept_item
+    from ui.views.flagged_queue import accept_item
 
-    mock_store = MagicMock()
-    mock_store.add_memory.return_value = '{"status":"added","memory_id":"mem_abc"}'
-    with patch("ui.pages.flagged_queue._get_store", return_value=mock_store):
+    mock_add = MagicMock(return_value='{"status":"added","memory_id":"mem_abc"}')
+    with patch("ui.views.flagged_queue.add_memory", mock_add):
         accept_item("item-1", queue_path)
 
-    mock_store.add_memory.assert_called_once()
+    mock_add.assert_called_once()
     updated = json.loads(queue_path.read_text())
     item = next(i for i in updated["items"] if i["id"] == "item-1")
     assert item["status"] == "accepted"
@@ -51,13 +50,13 @@ def test_reject_marks_status_only(tmp_path):
     """Rejecting a flagged fact should NOT call add_memory."""
     queue_path = _make_queue(tmp_path)
 
-    from ui.pages.flagged_queue import reject_item
+    from ui.views.flagged_queue import reject_item
 
-    mock_store = MagicMock()
-    with patch("ui.pages.flagged_queue._get_store", return_value=mock_store):
+    mock_add = MagicMock()
+    with patch("ui.views.flagged_queue.add_memory", mock_add):
         reject_item("item-2", queue_path)
 
-    mock_store.add_memory.assert_not_called()
+    mock_add.assert_not_called()
     updated = json.loads(queue_path.read_text())
     item = next(i for i in updated["items"] if i["id"] == "item-2")
     assert item["status"] == "rejected"
@@ -67,16 +66,14 @@ def test_accept_passes_correct_fields(tmp_path):
     """accept_item should call add_memory with fact content, category, importance."""
     queue_path = _make_queue(tmp_path)
 
-    from ui.pages.flagged_queue import accept_item
+    from ui.views.flagged_queue import accept_item
 
-    mock_store = MagicMock()
-    mock_store.add_memory.return_value = '{"status":"added","memory_id":"mem_xyz"}'
-    with patch("ui.pages.flagged_queue._get_store", return_value=mock_store):
+    mock_add = MagicMock(return_value='{"status":"added","memory_id":"mem_xyz"}')
+    with patch("ui.views.flagged_queue.add_memory", mock_add):
         accept_item("item-1", queue_path)
 
-    args, call_kwargs = mock_store.add_memory.call_args
-    # accept_item passes (profile, fact) positionally and metadata as kwargs.
-    assert args[1] == "Cale volunteers for Hopeful Fridays"
+    call_kwargs = mock_add.call_args[1]
+    assert call_kwargs["content"] == "Cale volunteers for Hopeful Fridays"
     assert call_kwargs["category"] == "fact"
     assert call_kwargs["importance"] == "medium"
 
@@ -86,13 +83,13 @@ def test_accept_nonexistent_item_is_noop(tmp_path):
     queue_path = _make_queue(tmp_path)
     original = queue_path.read_text()
 
-    from ui.pages.flagged_queue import accept_item
+    from ui.views.flagged_queue import accept_item
 
-    mock_store = MagicMock()
-    with patch("ui.pages.flagged_queue._get_store", return_value=mock_store):
+    mock_add = MagicMock()
+    with patch("ui.views.flagged_queue.add_memory", mock_add):
         accept_item("item-999", queue_path)
 
-    mock_store.add_memory.assert_not_called()
+    mock_add.assert_not_called()
     assert queue_path.read_text() == original
 
 
@@ -100,15 +97,14 @@ def test_batch_accept_accepts_all_pending(tmp_path):
     """batch_accept should accept every item with status=pending."""
     queue_path = _make_queue(tmp_path)
 
-    from ui.pages.flagged_queue import batch_accept
+    from ui.views.flagged_queue import batch_accept
 
-    mock_store = MagicMock()
-    mock_store.add_memory.return_value = '{"status":"added","memory_id":"mem_x"}'
-    with patch("ui.pages.flagged_queue._get_store", return_value=mock_store):
+    mock_add = MagicMock(return_value='{"status":"added","memory_id":"mem_x"}')
+    with patch("ui.views.flagged_queue.add_memory", mock_add):
         count = batch_accept(queue_path)
 
     assert count == 2  # both items were pending
-    assert mock_store.add_memory.call_count == 2
+    assert mock_add.call_count == 2
     updated = json.loads(queue_path.read_text())
     for item in updated["items"]:
         assert item["status"] == "accepted"
@@ -126,7 +122,7 @@ def test_queue_counts(tmp_path):
     ]
     queue_path = _make_queue(tmp_path, items=items)
 
-    from ui.pages.flagged_queue import get_counts
+    from ui.views.flagged_queue import get_counts
     counts = get_counts(queue_path)
 
     assert counts["pending"] == 1

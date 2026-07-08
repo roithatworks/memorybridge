@@ -11,14 +11,16 @@ BASELINE_TOKENS_PER_SEARCH = 1_740  # pre-v1.4 average
 
 
 def load_analytics() -> dict:
-    """Return analytics summary from SQLite via MemoryStore.get_analytics_summary()."""
-    try:
-        from db.store import MemoryStore
-        data_dir = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
-        store = MemoryStore(data_dir / "memory.db")
-        return store.get_analytics_summary(since_days=90)
-    except Exception:
-        return {}
+    """Return analytics summary from SQLite via MemoryStore.get_analytics_summary().
+
+    Raises on failure (locked/corrupt DB, schema drift, import error) so the
+    caller can distinguish a real error from a genuinely empty table (#112) —
+    swallowing it here made both look like "no data".
+    """
+    from db.store import MemoryStore
+    data_dir = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
+    store = MemoryStore(data_dir / "memory.db")
+    return store.get_analytics_summary(since_days=90)
 
 
 def render():
@@ -26,7 +28,11 @@ def render():
 
     st.header("📊 Analytics")
 
-    data = load_analytics()
+    try:
+        data = load_analytics()
+    except Exception as e:  # noqa: BLE001 — surface, don't hide
+        st.warning(f"Couldn't load analytics: {e}")
+        return
     if not data or not any(data.get(k) for k in ("daily_stats", "by_model", "by_operation")):
         st.info("No analytics data yet. Use MemoryBridge tools to generate events.")
         return

@@ -105,7 +105,16 @@ def run_ingestion(source: str, file_path: Path, profile: str,
     if days_int and days_int > 0:
         cmd.extend(["--days", str(days_int)])
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=False)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=False)
+    except subprocess.TimeoutExpired:
+        # Don't let TimeoutExpired escape as an uncaught 500 — the callers only
+        # guard ValueError. Return it as a normal failed-run result (#113).
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "Ingestion timed out after 300s and was terminated.",
+        }
     # run.py writes a JSON log to ~/memorybridge/logs/ — parse stdout summary
     return {
         "returncode": result.returncode,
@@ -145,10 +154,24 @@ def render():
         )
 
         if uploaded is not None:
-            # Save to temp file so ingestion script can read it
-            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
-                tf.write(uploaded.read())
-                tmp_path = Path(tf.name)
+            # Save to temp file so ingestion script can read it. Cache one temp
+            # file per unique upload in session_state and reuse it across reruns
+            # instead of writing a fresh copy every rerun (#113). When a new file
+            # is uploaded, delete the previous temp file first.
+            upload_key = (uploaded.name, uploaded.size)
+            cached = st.session_state.get("_mb_upload")
+            if not cached or cached.get("key") != upload_key:
+                if cached:
+                    try:
+                        Path(cached["path"]).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+                    tf.write(uploaded.read())
+                    tmp_path = Path(tf.name)
+                st.session_state["_mb_upload"] = {"key": upload_key, "path": str(tmp_path)}
+            else:
+                tmp_path = Path(cached["path"])
 
             st.info(f"File: `{uploaded.name}` ({uploaded.size:,} bytes)")
 
@@ -185,6 +208,14 @@ def render():
                         else:
                             st.error("Ingestion failed")
                             st.code(result["stderr"], language="text")
+                    finally:
+                        # Ingestion consumed the upload — remove the temp file so
+                        # it doesn't linger in the system temp dir (#113).
+                        try:
+                            Path(tmp_path).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        st.session_state.pop("_mb_upload", None)
 
     # =========================================================================
     # EXPORT TAB

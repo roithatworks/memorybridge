@@ -83,12 +83,12 @@ with st.sidebar:
 module_name = PAGES[selection]
 
 if module_name == "flagged_queue":
-    from ui.pages.flagged_queue import render
+    from ui.views.flagged_queue import render
 elif module_name == "memory_browser":
-    from ui.pages.memory_browser import render
+    from ui.views.memory_browser import render
 elif module_name == "analytics":
-    from ui.pages.analytics import render
+    from ui.views.analytics import render
 elif module_name == "portability":
-    from ui.pages.portability import render
+    from ui.views.portability import render
 
 render()

@@ -61,9 +61,13 @@ def render():
         q = search_query.lower()
         memories = [m for m in memories if q in m.get("content", "").lower()]
 
-    # Sort
-    reverse = sort_by in ("relevance_score", "access_count")
-    memories = sorted(memories, key=lambda m: m.get(sort_by, 0), reverse=reverse)
+    # Sort. Use a type-matched default so a row missing the field doesn't mix
+    # str and int and raise TypeError (#114): numeric fields default to 0,
+    # string date fields to "".
+    numeric_sort = sort_by in ("relevance_score", "access_count")
+    reverse = numeric_sort
+    default = 0 if numeric_sort else ""
+    memories = sorted(memories, key=lambda m: m.get(sort_by, default), reverse=reverse)
 
     st.caption(f"{len(memories)} memories shown")
     st.divider()
