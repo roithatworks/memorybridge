@@ -43,6 +43,55 @@ class DuplicateContentError(ValueError):
 SCHEMA_SQL = Path(__file__).parent / "schema.sql"
 
 
+class _LockedCursor:
+    """Wraps a sqlite cursor so its fetches re-acquire the connection lock.
+
+    Locking ``execute()`` alone is not enough: ``execute`` runs the statement
+    and returns a cursor, but the caller's subsequent ``fetchone()``/
+    ``fetchall()``/iteration runs *outside* the lock. A concurrent statement on
+    the same connection (the embed-on-write background thread is a real second
+    writer) can step the shared connection mid-fetch and corrupt the result —
+    surfacing as ``NoneType``/``IndexError`` on the fetched rows. Serializing
+    fetches too closes that window (#96).
+    """
+
+    __slots__ = ("_cur", "_lock")
+
+    def __init__(self, cur, lock):
+        self._cur = cur
+        self._lock = lock
+
+    def fetchone(self):
+        with self._lock:
+            return self._cur.fetchone()
+
+    def fetchall(self):
+        with self._lock:
+            return self._cur.fetchall()
+
+    def fetchmany(self, size=None):
+        with self._lock:
+            return self._cur.fetchmany() if size is None else self._cur.fetchmany(size)
+
+    def __iter__(self):
+        # Materialize under the lock, then iterate the snapshot lock-free.
+        with self._lock:
+            rows = self._cur.fetchall()
+        return iter(rows)
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+    @property
+    def lastrowid(self):
+        return self._cur.lastrowid
+
+    @property
+    def description(self):
+        return self._cur.description
+
+
 class _LockedConnection:
     """Serialize all access to a shared sqlite3.Connection (issue #6).
 
@@ -58,8 +107,11 @@ class _LockedConnection:
     sequences hold the lock across statements.
     """
 
-    _PASSTHROUGH = ("execute", "executemany", "executescript", "commit",
-                    "rollback", "close")
+    # execute/executemany return a cursor whose fetches must also be locked,
+    # so they are wrapped in _LockedCursor. The rest just need the call itself
+    # serialized.
+    _CURSOR_RETURNING = ("execute", "executemany")
+    _PASSTHROUGH = ("executescript", "commit", "rollback", "close")
 
     def __init__(self, conn: sqlite3.Connection):
         self._raw = conn
@@ -67,6 +119,12 @@ class _LockedConnection:
 
     def __getattr__(self, name):
         attr = getattr(self._raw, name)
+        if name in self._CURSOR_RETURNING:
+            def locked_cursor(*args, **kwargs):
+                with self._lock:
+                    cur = attr(*args, **kwargs)
+                return _LockedCursor(cur, self._lock)
+            return locked_cursor
         if name in self._PASSTHROUGH:
             def locked(*args, **kwargs):
                 with self._lock:
