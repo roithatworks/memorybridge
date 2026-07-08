@@ -8,23 +8,32 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/python3</string>
-        <string>{{HOME}}/memorybridge/ingestion/watcher.py</string>
+        <string>{{PYTHON}}</string>
+        <string>{{CODE_DIR}}/ingestion/watcher.py</string>
         <string>--profile</string>
         <string>default</string>
     </array>
 
-    <!-- Fire whenever ~/memorybridge/inbox changes (file added or removed) -->
+    <!-- Fire whenever the inbox changes (file added or removed) -->
     <key>WatchPaths</key>
     <array>
-        <string>{{HOME}}/memorybridge/inbox</string>
+        <string>{{DATA_DIR}}/inbox</string>
     </array>
 
+    <!-- Pass the data dir + a PATH containing the chosen python -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MEMORYBRIDGE_DATA</key>
+        <string>{{DATA_DIR}}</string>
+        <key>PATH</key>
+        <string>{{PYTHON_DIR}}:/usr/bin:/bin</string>
+    </dict>
+
     <key>StandardOutPath</key>
-    <string>{{HOME}}/memorybridge/logs/watcher.log</string>
+    <string>{{DATA_DIR}}/logs/watcher.log</string>
 
     <key>StandardErrorPath</key>
-    <string>{{HOME}}/memorybridge/logs/watcher_err.log</string>
+    <string>{{DATA_DIR}}/logs/watcher_err.log</string>
 
     <!-- Do not run at login — only on file change events -->
     <key>RunAtLoad</key>
