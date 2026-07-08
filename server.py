@@ -358,7 +358,8 @@ def add_memory(
     importance: str = "medium",
     tags: list[str] = None,
     project_id: Optional[str] = None,
-    profile: str = None
+    profile: str = None,
+    supersedes: list[str] = None
 ) -> str:
     """
     Add a new memory with automatic token counting and content-hash dedup.
@@ -370,6 +371,10 @@ def add_memory(
         tags: Optional tags
         project_id: Optional project association
         profile: Memory profile
+        supersedes: Memory IDs this new fact REPLACES because the underlying
+            fact changed (e.g. a job change, a moved deadline). Each is archived
+            and stamped with a valid_until timestamp so it leaves normal recall
+            but remains as history. Use for facts that changed, not rewordings.
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
@@ -382,7 +387,8 @@ def add_memory(
     try:
         mid = _store.add_memory(profile, content,
                                 category=category, importance=importance,
-                                tags=tags, project_id=project_id)
+                                tags=tags, project_id=project_id,
+                                supersedes=supersedes)
     except GuardrailRejection as e:
         # Document-shaped content: return the structured error contract every
         # other validation path uses, instead of surfacing an unhandled MCP error.

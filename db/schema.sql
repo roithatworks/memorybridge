@@ -27,7 +27,12 @@ CREATE TABLE IF NOT EXISTS memories (
     token_count    INTEGER NOT NULL,
     archived       INTEGER NOT NULL DEFAULT 0,
     archived_at    TEXT,
-    archive_reason TEXT
+    archive_reason TEXT,
+    -- Temporal validity (supersession, #temporal). valid_until is set when a
+    -- newer fact replaces this one; superseded_by points at that newer memory.
+    -- A NULL valid_until means the fact is still current.
+    valid_until    TEXT,
+    superseded_by  TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_content_hash

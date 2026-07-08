@@ -347,7 +347,8 @@ class MemoryStore:
                    category: str = "fact", importance: str = "medium",
                    tags: list = None, project_id: str = None,
                    enforce_guardrail: bool = True,
-                   skip_enrichment: bool = False) -> str | None:
+                   skip_enrichment: bool = False,
+                   supersedes: list[str] | None = None) -> str | None:
         """Returns memory ID on success, None if exact duplicate.
 
         Raises GuardrailRejection if content is document-shaped (too long, too
@@ -356,6 +357,12 @@ class MemoryStore:
 
         Pass skip_enrichment=True for internal auto-saves (conversation
         snippets, session summaries) that don't need full tag enrichment.
+
+        *supersedes* — memory IDs this new fact replaces (temporal supersession).
+        Each is stamped valid_until=now, superseded_by=<new id>, and archived, so
+        it drops out of default retrieval but stays queryable as history. Use
+        this when a fact CHANGES ("left the job", "moved cities") rather than
+        when it is merely reworded (which the fuzzy merge handles).
         """
         if enforce_guardrail:
             ok, reason = guardrail_check(content)
@@ -405,6 +412,15 @@ class MemoryStore:
                     (mid, profile, content, h, category, importance,
                      now, now, json.dumps(enriched_tags or []), project_id, tc)
                 )
+                # Supersession: invalidate the facts this one replaces, in the
+                # same transaction so the swap is atomic (#temporal).
+                for old_id in (supersedes or []):
+                    self._conn.execute(
+                        "UPDATE memories SET valid_until=?, superseded_by=?, "
+                        "archived=1, archived_at=?, archive_reason=? "
+                        "WHERE id=? AND profile=? AND archived=0",
+                        (now, mid, now, f"superseded by {mid}", old_id, profile),
+                    )
                 # FTS sync handled by memories_ai trigger (issue #3)
                 self._conn.commit()
             # Embed-on-write (issue #5): background thread so model load
@@ -1040,6 +1056,17 @@ class MemoryStore:
                 self._conn.execute(ddl)
             except Exception:
                 pass  # table may not exist on a very old DB — harmless
+
+        # Temporal-validity columns (supersession) for DBs created before they
+        # existed. SQLite has no ADD COLUMN IF NOT EXISTS, so check first.
+        try:
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+            if "valid_until" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN valid_until TEXT")
+            if "superseded_by" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT")
+        except Exception:
+            pass
         try:
             days = int(os.environ.get("MEMORYBRIDGE_LOG_RETENTION_DAYS", "90"))
         except ValueError:
