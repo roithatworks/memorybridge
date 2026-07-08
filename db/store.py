@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -207,6 +207,10 @@ class MemoryStore:
                     (datetime.now().isoformat(),)
                 )
                 self._conn.commit()
+
+        # Apply post-v4 indexes to already-initialized DBs and trim old logs
+        # so the log tables don't grow unbounded (#75/#125).
+        self._ensure_maintenance()
 
         # Phase 4: lazy-loaded FastEmbed model (cached per-process)
         self._embed_model = None
@@ -963,6 +967,44 @@ class MemoryStore:
                   file=sys.stderr)
             return 0
 
+    def _ensure_maintenance(self) -> None:
+        """Idempotent DB maintenance run at construction: add indexes that were
+        introduced after a DB was first created (#75/#125), and trim old log
+        rows so access_log/analytics_events/pruner_log/prune_queue don't grow
+        without bound (#75). Retention window: MEMORYBRIDGE_LOG_RETENTION_DAYS
+        (default 90; set 0 to keep everything)."""
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_access_profile ON access_log(profile)",
+            "CREATE INDEX IF NOT EXISTS idx_access_ts ON access_log(ts)",
+            "CREATE INDEX IF NOT EXISTS idx_analytics_model ON analytics_events(model)",
+            "CREATE INDEX IF NOT EXISTS idx_prune_queue_candidate ON prune_queue(candidate_id, resolved)",
+            "CREATE INDEX IF NOT EXISTS idx_pruner_log_candidate ON pruner_log(candidate_id)",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except Exception:
+                pass  # table may not exist on a very old DB — harmless
+        try:
+            days = int(os.environ.get("MEMORYBRIDGE_LOG_RETENTION_DAYS", "90"))
+        except ValueError:
+            days = 90
+        if days > 0:
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            for sql, params in (
+                ("DELETE FROM access_log WHERE ts < ?", (cutoff,)),
+                ("DELETE FROM analytics_events WHERE created_at < ?", (cutoff,)),
+                ("DELETE FROM pruner_log WHERE created_at < ?", (cutoff,)),
+                ("DELETE FROM prune_queue WHERE resolved=1 AND resolved_at IS NOT NULL AND resolved_at < ?", (cutoff,)),
+            ):
+                try:
+                    self._conn.execute(sql, params)
+                except Exception:
+                    pass
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+
     def embeddings_available(self) -> bool:
         """True if the embedding model can actually embed text. Used as an
         ingestion pre-flight: if this is False, semantic dedup is unavailable
@@ -1051,12 +1093,13 @@ class MemoryStore:
             (profile,)
         ).fetchall()
 
-        # Score by cosine similarity. Guard against stale/mismatched vectors:
-        # if the embedding model ever changes dimension, old rows would make
-        # numpy's dot product raise and take down every search. Skip any vector
-        # whose length differs from the current query vector (or won't parse),
-        # and fall back to keyword search if none are usable.
-        scored = []
+        # Score by cosine similarity. Collect usable same-dimension vectors into
+        # one matrix and score them with a single vectorized matmul instead of a
+        # Python-level cosine call per row (#54). Stale/unparseable vectors are
+        # skipped (dimension guard, #52) so a model change can't crash search.
+        import numpy as np
+        ids: list[str] = []
+        mat: list[list[float]] = []
         mismatched = 0
         for row in rows:
             try:
@@ -1067,7 +1110,20 @@ class MemoryStore:
             if not isinstance(vec, list) or len(vec) != q_len:
                 mismatched += 1
                 continue
-            scored.append((row["id"], self._cosine_similarity(q_vec, vec)))
+            ids.append(row["id"])
+            mat.append(vec)
+
+        scored = []
+        if mat:
+            q = np.asarray(q_vec, dtype=np.float32)
+            q_norm = float(np.linalg.norm(q))
+            if q_norm > 0:
+                M = np.asarray(mat, dtype=np.float32)          # (n, d)
+                denom = np.linalg.norm(M, axis=1) * q_norm
+                sims = np.divide(M @ q, denom,
+                                 out=np.zeros(len(mat), dtype=np.float32),
+                                 where=denom > 0)
+                scored = list(zip(ids, sims.tolist()))
 
         if mismatched:
             logger.warning(

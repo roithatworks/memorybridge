@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS pruner_log (
     triggered_by TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
+
+-- Indexes for the per-candidate lookups run on the add_memory write hot-path (#125).
+CREATE INDEX IF NOT EXISTS idx_prune_queue_candidate ON prune_queue(candidate_id, resolved);
+CREATE INDEX IF NOT EXISTS idx_pruner_log_candidate ON pruner_log(candidate_id);
 """
 
 
