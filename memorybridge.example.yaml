@@ -63,3 +63,12 @@ routing:
 # ---------------------------------------------------------------------------
 noise_patterns: []
   # - "nightly backup (succeeded|completed)"
+
+# ---------------------------------------------------------------------------
+# Project-name aliases: collapse variant spellings of a project into one
+# canonical id in `project:` tags. Keys are matched case-insensitively.
+# Unknown project ids pass through unchanged.
+# ---------------------------------------------------------------------------
+project_aliases: {}
+  # acme corp: acme
+  # acme-corp: acme

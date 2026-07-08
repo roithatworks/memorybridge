@@ -293,7 +293,17 @@ def _normalize_project(project_id: str | None) -> str | None:
     if not project_id:
         return project_id
     key = project_id.strip().lower()
-    return _PROJECT_NORMALIZE.get(key, project_id)
+    if key in _PROJECT_NORMALIZE:
+        return _PROJECT_NORMALIZE[key]
+    # User-defined aliases from config (memorybridge.yaml `project_aliases`).
+    try:
+        import config
+        aliases = config.project_aliases()
+        if key in aliases:
+            return aliases[key]
+    except Exception:
+        pass
+    return project_id
 
 
 # --- Tag cap to prevent unbounded compounding --------------------------------

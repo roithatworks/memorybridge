@@ -45,6 +45,17 @@ def test_env_wins_over_file(tmp_path, monkeypatch):
     assert config.max_total_tokens() == 999
 
 
+def test_project_aliases_normalize(tmp_path, monkeypatch):
+    (tmp_path / "memorybridge.json").write_text(json.dumps({
+        "project_aliases": {"ROI That Works": "roi", "roithatworks": "roi"}}))
+    config.reset_cache()
+    assert config.project_aliases()["roi that works"] == "roi"
+    from db.constants import _normalize_project
+    assert _normalize_project("ROI That Works") == "roi"
+    assert _normalize_project("roithatworks") == "roi"
+    assert _normalize_project("Something Else") == "Something Else"  # pass-through
+
+
 def test_yaml_config_if_pyyaml_available(tmp_path):
     pytest.importorskip("yaml")
     (tmp_path / "memorybridge.yaml").write_text(
