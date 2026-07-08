@@ -17,3 +17,9 @@ COMMIT_MSG.txt
 *.zip
 memory-health-report-*.md
 client-memory-*.md
+
+# Default-invocation outputs + runtime droppings (#120)
+memorybridge.okf/
+*.okf/
+instance.pid
+inbox/*.json
