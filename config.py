@@ -41,6 +41,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # matching lines are dropped at extraction as ephemeral ops telemetry. The
     # built-in generic set is always applied; this only ADDS to it.
     "noise_patterns": [],
+
+    # Project-name aliases: collapse variant spellings to one canonical id in
+    # `project:` tags. Shape: {"variant spelling": "canonical"} (keys are matched
+    # case-insensitively). Empty by default (unknown ids pass through unchanged).
+    "project_aliases": {},
 }
 
 
@@ -115,3 +120,9 @@ def routing() -> dict:
 
 def noise_patterns() -> list[str]:
     return list(load().get("noise_patterns", []))
+
+
+def project_aliases() -> dict:
+    """{variant_lower: canonical} project-name aliases from config."""
+    raw = load().get("project_aliases", {}) or {}
+    return {str(k).strip().lower(): v for k, v in raw.items()}
