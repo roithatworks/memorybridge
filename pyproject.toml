@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memorybridge"
+version = "0.1.0"
+description = "Local-first, cross-model memory server (MCP) — one memory across Claude, ChatGPT, Gemini, and any MCP client."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Cale Corbett" }]
+keywords = ["mcp", "memory", "llm", "claude", "sqlite", "fastmcp"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+# Core runtime. UI (streamlit/pandas) and ingestion providers are heavy but the
+# repo has always shipped them together; kept flat for a predictable install.
+# Upper bounds cap the next major so a fresh install can't pull a breaking release.
+dependencies = [
+    "fastmcp>=2.0.0,<3.0.0",
+    "tiktoken>=0.7.0,<1.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "openai>=1.0.0,<3.0.0",
+    "anthropic>=0.20.0,<1.0.0",
+    "notion-client>=2.2.0,<4.0.0",
+    "fastembed>=0.2.0,<1.0.0",
+    "numpy>=1.24.0,<3.0.0",
+    "streamlit>=1.37.0,<2.0.0",
+    "pandas>=2.0.0,<3.0.0",
+    "pyyaml>=6.0,<7.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-mock>=3.12"]
+
+[project.scripts]
+mb = "cli:main"
+
+[project.urls]
+Homepage = "https://github.com/roithatworks/memorybridge"
+Repository = "https://github.com/roithatworks/memorybridge"
+
+[tool.setuptools]
+# Flat layout: top-level modules + the package dirs.
+py-modules = ["server", "config", "exports", "cli"]
+
+[tool.setuptools.packages.find]
+include = ["db*", "ingestion*", "ui*"]
+
+[tool.setuptools.package-data]
+db = ["*.sql"]

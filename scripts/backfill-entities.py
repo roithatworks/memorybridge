@@ -10,7 +10,11 @@ Usage:
 """
 
 import argparse
+import json
+import os
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Ensure we can import from the repo root
@@ -20,9 +24,22 @@ sys.path.insert(0, str(REPO))
 from db.store import MemoryStore, EntityExtractor  # noqa: E402
 from db.constants import _merge_tags  # noqa: E402
 
-DATA_DIR = Path.home() / "memorybridge"
+DATA_DIR = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
 MEMORY_DB = DATA_DIR / "memory.db"
 ENTITY_CONFIG = DATA_DIR / "entities.json"
+
+
+def _backup_db(label: str) -> Path:
+    """Copy the DB (plus WAL/SHM sidecars) to a timestamped backup before a
+    bulk mutation, so a bad run is always recoverable."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = MEMORY_DB.with_name(f"{MEMORY_DB.name}.bak-{label}-{ts}")
+    shutil.copy2(MEMORY_DB, backup)
+    for ext in ("-wal", "-shm"):
+        side = MEMORY_DB.with_name(MEMORY_DB.name + ext)
+        if side.exists():
+            shutil.copy2(side, backup.with_name(backup.name + ext))
+    return backup
 
 
 def main():
@@ -47,6 +64,10 @@ def main():
 
     all_mems = store.get_memories(args.profile)
     print(f"Total active memories: {len(all_mems)}")
+
+    if not args.dry_run:
+        backup = _backup_db("backfill-entities")
+        print(f"Backup written: {backup}")
 
     scanned = 0
     updated = 0
@@ -95,7 +116,9 @@ def main():
         try:
             store._conn.execute(
                 "UPDATE memories SET tags=? WHERE id=? AND profile=?",
-                (str(merged_tags).replace("'", '"'), mid, args.profile),  # simple JSON
+                # Proper JSON — str(list).replace("'",'"') is NOT valid JSON and
+                # corrupts any tag containing an apostrophe or quote.
+                (json.dumps(merged_tags), mid, args.profile),
             )
             store._conn.commit()
             updated += 1

@@ -13,8 +13,13 @@ INGESTION_SCRIPT = Path(__file__).parent.parent.parent / "ingestion" / "run.py"
 
 
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_PROFILE_ALLOWED_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_.-")
 _ALLOWED_SOURCES = {"claude", "chatgpt", "gemini"}
-_ALLOWED_PROFILES = {"default"}
+_ALLOWED_PROFILES = {
+    "default": "default",
+    "work": "work",
+    "personal": "personal",
+}
 
 
 def _validate_profile_name(profile: str) -> str:
@@ -25,10 +30,14 @@ def _validate_profile_name(profile: str) -> str:
         )
     if profile.startswith((".", "-")):
         raise ValueError("Invalid profile name. Must not start with '.' or '-'.")
-    if profile not in _ALLOWED_PROFILES:
-        raise ValueError("Invalid profile name. Must be one of: default.")
-    # Return explicit literal from allowlist to break taint tracking
-    return "default"
+    # Canonicalize through an explicit character allowlist.
+    # Rebuild the name character-by-character from an explicit literal allowlist.
+    # The result carries no taint (CodeQL) even though any validly-named profile
+    # is accepted, not just a fixed set (#90).
+    canonical = "".join(ch for ch in profile if ch in _PROFILE_ALLOWED_CHARS)
+    if not canonical:
+        raise ValueError("Invalid profile name.")
+    return canonical
 
 
 def _validate_source(source: str) -> str:
@@ -96,7 +105,16 @@ def run_ingestion(source: str, file_path: Path, profile: str,
     if days_int and days_int > 0:
         cmd.extend(["--days", str(days_int)])
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=False)
+    except subprocess.TimeoutExpired:
+        # Don't let TimeoutExpired escape as an uncaught 500 — the callers only
+        # guard ValueError. Return it as a normal failed-run result (#113).
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "Ingestion timed out after 300s and was terminated.",
+        }
     # run.py writes a JSON log to ~/memorybridge/logs/ — parse stdout summary
     return {
         "returncode": result.returncode,
@@ -106,10 +124,20 @@ def run_ingestion(source: str, file_path: Path, profile: str,
 
 
 def render():
+    import os
     import streamlit as st
-    from server import export_for_model as _export_tool, export_passport as _passport_tool
-    export_for_model = _export_tool.fn
-    export_passport = _passport_tool.fn
+    from db.store import MemoryStore
+    from exports import export_for_model, export_passport
+
+    # Use a store-free exports module + this process's own store, instead of
+    # importing the whole `server` module (which would build a second store +
+    # register an atexit hook just to unwrap FastMCP `.fn` internals) — see #91.
+    # Exports only read memories and never need embeddings, so skip the backfill.
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    if "_mb_store" not in st.session_state:
+        data_dir = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge"))
+        st.session_state["_mb_store"] = MemoryStore(data_dir / "memory.db")
+    store = st.session_state["_mb_store"]
 
     st.header("🔄 Portability")
 
@@ -126,7 +154,7 @@ def render():
         )
 
         source = st.selectbox("Source", ["claude", "chatgpt", "gemini"])
-        profile = st.text_input("Target profile", value="default")
+        profile = st.selectbox("Target profile", list(_ALLOWED_PROFILES.keys()), index=0)
         days = st.number_input("Limit to last N days (0 = all)", min_value=0, value=30)
 
         uploaded = st.file_uploader(
@@ -136,10 +164,24 @@ def render():
         )
 
         if uploaded is not None:
-            # Save to temp file so ingestion script can read it
-            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
-                tf.write(uploaded.read())
-                tmp_path = Path(tf.name)
+            # Save to temp file so ingestion script can read it. Cache one temp
+            # file per unique upload in session_state and reuse it across reruns
+            # instead of writing a fresh copy every rerun (#113). When a new file
+            # is uploaded, delete the previous temp file first.
+            upload_key = (uploaded.name, uploaded.size)
+            cached = st.session_state.get("_mb_upload")
+            if not cached or cached.get("key") != upload_key:
+                if cached:
+                    try:
+                        Path(cached["path"]).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+                    tf.write(uploaded.read())
+                    tmp_path = Path(tf.name)
+                st.session_state["_mb_upload"] = {"key": upload_key, "path": str(tmp_path)}
+            else:
+                tmp_path = Path(cached["path"])
 
             st.info(f"File: `{uploaded.name}` ({uploaded.size:,} bytes)")
 
@@ -176,6 +218,14 @@ def render():
                         else:
                             st.error("Ingestion failed")
                             st.code(result["stderr"], language="text")
+                    finally:
+                        # Ingestion consumed the upload — remove the temp file so
+                        # it doesn't linger in the system temp dir (#113).
+                        try:
+                            Path(tmp_path).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        st.session_state.pop("_mb_upload", None)
 
     # =========================================================================
     # EXPORT TAB
@@ -197,10 +247,8 @@ def render():
             with st.spinner("Formatting…"):
                 try:
                     text = export_for_model(
-                        model=model,
-                        profile=export_profile,
-                        depth=depth,
-                        max_tokens=max_tokens,
+                        store, model, export_profile,
+                        depth=depth, max_tokens=max_tokens,
                     )
                     st.success("Export ready — copy or download below.")
                     st.text_area("Export text", value=text, height=300)
@@ -234,8 +282,7 @@ def render():
             with st.spinner("Building passport…"):
                 try:
                     text = export_passport(
-                        profile=passport_profile,
-                        max_tokens=passport_tokens,
+                        store, passport_profile, max_tokens=passport_tokens,
                     )
                     st.success("Passport ready.")
                     st.text_area("Passport text", value=text, height=400, key="pp_text")

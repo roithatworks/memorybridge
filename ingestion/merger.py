@@ -38,32 +38,17 @@ def _keyword_overlap(a: str, b: str) -> float:
 
 
 def _search_existing(fact_text: str, profile: str) -> list:
-    """Return search results for a fact string."""
+    """Return search results for a fact string.
+
+    Note: search_hybrid/search_semantic already degrade to keyword search when
+    the embedding model is unavailable, so reaching this handler means a real
+    query failure. Log at ERROR (not WARNING) — a swallowed failure here means
+    dedup is silently off and the store will fill with duplicates."""
     try:
         return _store.search_hybrid(profile=profile, query=fact_text, limit=5)
     except Exception as e:
-        logger.warning("search_hybrid failed: %s", e)
+        logger.error("search_hybrid failed for dedup (dedup DEGRADED): %s", e)
         return []
-
-
-def _write_fact(fact: dict, profile: str, preview: bool) -> str:
-    """
-    Write a single fact via add_memory. Returns "added" or "error".
-    Safe to call during preview=False only.
-    """
-    try:
-        add_memory(
-            content=fact["fact"],
-            category=fact.get("category", "fact"),
-            importance=fact.get("importance", "medium"),
-            tags=[],
-            project_id=fact.get("project"),
-            profile=profile,
-        )
-        return "added"
-    except Exception as e:
-        logger.error("add_memory failed: %s", e)
-        return "error"
 
 
 def _batch_write(facts_by_category: dict, profile: str) -> dict:
@@ -157,34 +142,38 @@ def merge(accepted: list, resolved: list, source: str, profile: str = "default",
 
     all_to_write = accepted + to_write_resolved
 
-    # Dedup: check each fact against existing memory before writing
+    # Dedup: check each fact against existing memory AND against facts already
+    # queued in THIS run before writing.
     write_queue: list[dict] = []
+    queued_texts: list[str] = []  # for intra-run dedup (#59)
     for fact in all_to_write:
         fact_text = fact.get("fact", "")
         if not fact_text:
             skipped_count += 1
             continue
 
+        # Intra-run dedup (#59): two rewordings of the same fact in one export
+        # both used to pass, because dedup only checked the store (neither was
+        # written yet). Also compare against what we've already queued.
+        if any(_keyword_overlap(fact_text, q) >= _KEYWORD_MERGE_THRESHOLD
+               for q in queued_texts):
+            skipped_count += 1
+            changes.append({"action": "skipped", "fact": fact_text[:80],
+                            "category": fact.get("category", "")})
+            continue
+
         existing = _search_existing(fact_text, profile)
 
-        # Check exact-ish match
+        # Check exact-ish match against the store. Near-duplicates are NOT
+        # special-cased here anymore: the old branch counted a "merge" but wrote
+        # a second copy and merged nothing (#58). Let near-dups flow to the write
+        # path — the store's add_memory does the real fuzzy merge on write.
         skip = False
         for mem in existing:
             score = mem.get("match_score", 0)
             if score >= _EXACT_MATCH_THRESHOLD:
-                # Already exists — skip
                 skipped_count += 1
                 changes.append({"action": "skipped", "fact": fact_text[:80], "category": fact.get("category", "")})
-                skip = True
-                break
-
-            # Keyword overlap check for near-duplicates
-            overlap = _keyword_overlap(fact_text, mem.get("content", ""))
-            if overlap >= _KEYWORD_MERGE_THRESHOLD:
-                # Keep the newer fact (the one being ingested)
-                merged_count += 1
-                changes.append({"action": "merged", "fact": fact_text[:80], "category": fact.get("category", "")})
-                write_queue.append(fact)
                 skip = True
                 break
 
@@ -197,6 +186,7 @@ def merge(accepted: list, resolved: list, source: str, profile: str = "default",
                 changes.append({"action": "skipped", "fact": fact_text[:80], "category": fact.get("category", "")})
             else:
                 write_queue.append(fact)
+                queued_texts.append(fact_text)
 
     # Domain routing: assign each fact to a profile (job_search/consulting/
     # teaching/personal/default) by content. Done for both preview and write so
@@ -209,14 +199,20 @@ def merge(accepted: list, resolved: list, source: str, profile: str = "default",
 
     guardrail_rejected = []
     if not preview:
-        # Group by (profile, category) so each group writes to its routed profile.
-        by_profile_category: dict[tuple, list] = defaultdict(list)
+        # Group by (profile, category, importance, project) so each group is
+        # homogeneous — otherwise the batch write collapsed every fact to the
+        # group's most-common importance and the first project it found, losing
+        # per-fact importance and smearing one project across unrelated facts
+        # (#57). With homogeneous groups, _batch_write's per-group values are the
+        # facts' real values.
+        by_group: dict[tuple, list] = defaultdict(list)
         for fact in write_queue:
-            key = (fact["_dest_profile"], fact.get("category", "fact"))
-            by_profile_category[key].append(fact)
+            key = (fact["_dest_profile"], fact.get("category", "fact"),
+                   fact.get("importance", "medium"), fact.get("project"))
+            by_group[key].append(fact)
 
         total_written = 0
-        for (dest_profile, category), group in by_profile_category.items():
+        for (dest_profile, category, _imp, _proj), group in by_group.items():
             batch = _batch_write({category: group}, dest_profile)
             total_written += batch["written"]
             guardrail_rejected.extend(batch["rejected"])

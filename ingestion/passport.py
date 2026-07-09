@@ -5,7 +5,7 @@ build_passport() is intentionally decoupled from the MCP server so it can be
 tested independently and reused by CLI tools or ingestion pipelines.
 """
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 
 # Category display order and human-readable labels
@@ -34,19 +34,27 @@ def build_passport(
     identity: Optional[dict] = None,
     profile: str = "default",
     max_tokens: int = 2000,
+    token_counter: Optional[Callable[[str], int]] = None,
 ) -> str:
     """
     Render a Memory Passport as plain text within the given token budget.
 
     Args:
-        memories:   List of memory dicts (content, category, importance, token_count).
-        identity:   Optional identity dict (name, role, etc.) from the profile.
-        profile:    Profile name — included in the header.
-        max_tokens: Token ceiling for the entire output.
+        memories:      List of memory dicts (content, category, importance, token_count).
+        identity:      Optional identity dict (name, role, etc.) from the profile.
+        profile:       Profile name — included in the header.
+        max_tokens:    Token ceiling for the entire output.
+        token_counter: Callable measuring tokens for a string. Defaults to the
+            fast 4-char heuristic. Pass the store's real (tiktoken) counter so
+            the budget assembled here matches the budget the caller enforces —
+            otherwise the heuristic under-counts many-short-token content and a
+            passport requested with max_tokens=N can emit materially more than N
+            real tokens (#126).
 
     Returns:
         Plain-text passport string.  Never JSON, never markdown code fences.
     """
+    count = token_counter or _approx_tokens
     identity = identity or {}
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -65,7 +73,7 @@ def build_passport(
     header_lines.append("")
 
     header_text = "\n".join(header_lines)
-    budget_remaining = max_tokens - _approx_tokens(header_text)
+    budget_remaining = max_tokens - count(header_text)
 
     # -----------------------------------------------------------------
     # Group memories by category, sorted by importance within each group
@@ -97,7 +105,7 @@ def build_passport(
         mems = by_category[cat]
         label = label_map.get(cat, cat.replace("_", " ").title())
         section_header = f"\n## {label}\n"
-        section_cost = _approx_tokens(section_header)
+        section_cost = count(section_header)
 
         if budget_remaining - section_cost < 10:
             break  # no room for even this section header
@@ -113,7 +121,7 @@ def build_passport(
             # Mark critical/high importance inline
             prefix = "! " if imp in ("critical", "high") else "- "
             line = f"{prefix}{content}"
-            cost = _approx_tokens(line) + 1  # +1 for newline
+            cost = count(line) + 1  # +1 for newline
             if budget_remaining - cost < 5:
                 break
             lines.append(line)

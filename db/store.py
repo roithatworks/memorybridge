@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +34,62 @@ class GuardrailRejection(ValueError):
         self.reason = reason
         super().__init__(reason)
 
+
+class DuplicateContentError(ValueError):
+    """Raised when an edit would make a memory's content identical to another
+    memory's (content_hash UNIQUE collision) — distinct from 'not found'."""
+
+
 SCHEMA_SQL = Path(__file__).parent / "schema.sql"
+
+
+class _LockedCursor:
+    """Wraps a sqlite cursor so its fetches re-acquire the connection lock.
+
+    Locking ``execute()`` alone is not enough: ``execute`` runs the statement
+    and returns a cursor, but the caller's subsequent ``fetchone()``/
+    ``fetchall()``/iteration runs *outside* the lock. A concurrent statement on
+    the same connection (the embed-on-write background thread is a real second
+    writer) can step the shared connection mid-fetch and corrupt the result —
+    surfacing as ``NoneType``/``IndexError`` on the fetched rows. Serializing
+    fetches too closes that window (#96).
+    """
+
+    __slots__ = ("_cur", "_lock")
+
+    def __init__(self, cur, lock):
+        self._cur = cur
+        self._lock = lock
+
+    def fetchone(self):
+        with self._lock:
+            return self._cur.fetchone()
+
+    def fetchall(self):
+        with self._lock:
+            return self._cur.fetchall()
+
+    def fetchmany(self, size=None):
+        with self._lock:
+            return self._cur.fetchmany() if size is None else self._cur.fetchmany(size)
+
+    def __iter__(self):
+        # Materialize under the lock, then iterate the snapshot lock-free.
+        with self._lock:
+            rows = self._cur.fetchall()
+        return iter(rows)
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+    @property
+    def lastrowid(self):
+        return self._cur.lastrowid
+
+    @property
+    def description(self):
+        return self._cur.description
 
 
 class _LockedConnection:
@@ -52,8 +107,11 @@ class _LockedConnection:
     sequences hold the lock across statements.
     """
 
-    _PASSTHROUGH = ("execute", "executemany", "executescript", "commit",
-                    "rollback", "close")
+    # execute/executemany return a cursor whose fetches must also be locked,
+    # so they are wrapped in _LockedCursor. The rest just need the call itself
+    # serialized.
+    _CURSOR_RETURNING = ("execute", "executemany")
+    _PASSTHROUGH = ("executescript", "commit", "rollback", "close")
 
     def __init__(self, conn: sqlite3.Connection):
         self._raw = conn
@@ -61,6 +119,12 @@ class _LockedConnection:
 
     def __getattr__(self, name):
         attr = getattr(self._raw, name)
+        if name in self._CURSOR_RETURNING:
+            def locked_cursor(*args, **kwargs):
+                with self._lock:
+                    cur = attr(*args, **kwargs)
+                return _LockedCursor(cur, self._lock)
+            return locked_cursor
         if name in self._PASSTHROUGH:
             def locked(*args, **kwargs):
                 with self._lock:
@@ -101,7 +165,7 @@ class MemoryStore:
     Usage:
         store = MemoryStore(Path.home() / "memorybridge" / "memory.db")
         store.ensure_profile("default")
-        mid = store.add_memory("default", "Cale prefers dark mode", category="preference")
+        mid = store.add_memory("default", "The user prefers dark mode", category="preference")
     """
 
     def __init__(self, db_path: Path, entity_extractor: EntityExtractor | None = None,
@@ -202,6 +266,10 @@ class MemoryStore:
                 )
                 self._conn.commit()
 
+        # Apply post-v4 indexes to already-initialized DBs and trim old logs
+        # so the log tables don't grow unbounded (#75/#125).
+        self._ensure_maintenance()
+
         # Phase 4: lazy-loaded FastEmbed model (cached per-process)
         self._embed_model = None
         self._embed_lock = threading.Lock()
@@ -251,6 +319,11 @@ class MemoryStore:
                 (json.dumps(identity), name)
             )
         if projects is not None:
+            # Validate shape on write so list_projects (and other readers) can
+            # rely on every element being a dict (#124). Reject early with a
+            # clear error rather than persisting a bare string that 500s later.
+            if not isinstance(projects, list) or not all(isinstance(p, dict) for p in projects):
+                raise ValueError("projects must be a list of objects (dicts)")
             self._conn.execute(
                 "UPDATE profiles SET projects=? WHERE name=?",
                 (json.dumps(projects), name)
@@ -274,7 +347,8 @@ class MemoryStore:
                    category: str = "fact", importance: str = "medium",
                    tags: list = None, project_id: str = None,
                    enforce_guardrail: bool = True,
-                   skip_enrichment: bool = False) -> str | None:
+                   skip_enrichment: bool = False,
+                   supersedes: list[str] | None = None) -> str | None:
         """Returns memory ID on success, None if exact duplicate.
 
         Raises GuardrailRejection if content is document-shaped (too long, too
@@ -283,6 +357,12 @@ class MemoryStore:
 
         Pass skip_enrichment=True for internal auto-saves (conversation
         snippets, session summaries) that don't need full tag enrichment.
+
+        *supersedes* — memory IDs this new fact replaces (temporal supersession).
+        Each is stamped valid_until=now, superseded_by=<new id>, and archived, so
+        it drops out of default retrieval but stays queryable as history. Use
+        this when a fact CHANGES ("left the job", "moved cities") rather than
+        when it is merely reworded (which the fuzzy merge handles).
         """
         if enforce_guardrail:
             ok, reason = guardrail_check(content)
@@ -332,6 +412,15 @@ class MemoryStore:
                     (mid, profile, content, h, category, importance,
                      now, now, json.dumps(enriched_tags or []), project_id, tc)
                 )
+                # Supersession: invalidate the facts this one replaces, in the
+                # same transaction so the swap is atomic (#temporal).
+                for old_id in (supersedes or []):
+                    self._conn.execute(
+                        "UPDATE memories SET valid_until=?, superseded_by=?, "
+                        "archived=1, archived_at=?, archive_reason=? "
+                        "WHERE id=? AND profile=? AND archived=0",
+                        (now, mid, now, f"superseded by {mid}", old_id, profile),
+                    )
                 # FTS sync handled by memories_ai trigger (issue #3)
                 self._conn.commit()
             # Embed-on-write (issue #5): background thread so model load
@@ -409,10 +498,16 @@ class MemoryStore:
         if best_sim < self._merge_threshold:
             return None
 
-        # Merge: append new info annotation, bump importance and timestamp
+        # Merge: append new info annotation, bump importance and timestamp.
+        # Recompute content_hash and token_count for the merged content — the
+        # old code left both stale, which under-counted the token budget and
+        # broke exact-dedup (content_hash no longer matched content).
         now = datetime.now().isoformat()
         date_str = datetime.now().strftime("%Y-%m-%d")
         merge_note = f"\n[merged: {date_str}] {content.strip()}"
+        new_content = (best_row["content"] or "") + merge_note
+        new_hash = _content_hash(new_content)
+        new_tokens = _count_tokens(new_content)
         # Keep the higher importance level
         final_imp = _max_importance(best_row["importance"], "medium")
 
@@ -420,20 +515,29 @@ class MemoryStore:
             with self._conn.transaction():
                 self._conn.execute(
                     """UPDATE memories
-                       SET content = content || ?,
+                       SET content = ?,
+                           content_hash = ?,
+                           token_count = ?,
                            importance = ?,
                            last_accessed = ?,
                            access_count = access_count + 1
                        WHERE id = ? AND profile = ?""",
-                    (merge_note, final_imp, now, best_id, profile),
+                    (new_content, new_hash, new_tokens, final_imp, now, best_id, profile),
                 )
                 self._conn.commit()
             logger.info("Merged new content into existing memory %s (sim=%.2f)",
                         best_id, best_sim)
             return best_id
         except Exception:
+            # A match WAS found and we intended to merge into it, but the write
+            # failed (lock timeout, disk full, constraint). Returning None here
+            # would make add_memory fall through to a normal INSERT and create a
+            # NEW duplicate of the very content it meant to merge — inverting the
+            # anti-duplication guarantee under load. Re-raise so the failure
+            # surfaces (and a retry can merge correctly) instead of double-writing
+            # (#94).
             logger.exception("Merge UPDATE failed for best_id=%s", best_id)
-            return None
+            raise
 
     def add_memories(self, profile: str, facts: list[str], *,
                      category: str = "fact", importance: str = "medium",
@@ -487,8 +591,12 @@ class MemoryStore:
                 self._conn.commit()
             updated = cur.rowcount > 0
         except sqlite3.IntegrityError:
+            # The new content collides with another memory's content_hash
+            # (UNIQUE idx). That's a DUPLICATE, not a missing memory — signal it
+            # distinctly so the caller doesn't report a misleading "not found".
             self._conn.rollback()
-            updated = False
+            raise DuplicateContentError(
+                "edit would duplicate the content of an existing memory")
 
         # Re-embed if content changed (fire-and-forget, fail-soft)
         if updated and "content" in fields:
@@ -604,26 +712,12 @@ class MemoryStore:
                 break
         return results
 
-    def boost_on_access(self, profile: str, memory_id: str,
-                        boost: float = 0.1) -> None:
-        """Increment access_count and boost relevance_score (capped at 1.0)."""
-        today = datetime.now().isoformat()
-        self._conn.execute(
-            """UPDATE memories
-               SET access_count = access_count + 1,
-                   last_accessed = ?,
-                   relevance_score = MIN(relevance_score + ?, 1.0)
-               WHERE id = ? AND profile = ?""",
-            (today, boost, memory_id, profile)
-        )
-        self._conn.commit()
-
     def boost_batch(self, profile: str, ids: list,
                     boost: float = 0.1) -> None:
         """Boost relevance_score for multiple memories in a single commit.
 
-        Replaces calling boost_on_access once per result (issue #12): uses
-        executemany + a single conn.commit() instead of N commits.
+        Boosts all accessed memories at once (issue #12): executemany + a single
+        conn.commit() instead of one UPDATE+commit per result.
         """
         if not ids:
             return
@@ -945,6 +1039,77 @@ class MemoryStore:
                   file=sys.stderr)
             return 0
 
+    def _ensure_maintenance(self) -> None:
+        """Idempotent DB maintenance run at construction: add indexes that were
+        introduced after a DB was first created (#75/#125), and trim old log
+        rows so access_log/analytics_events/pruner_log/prune_queue don't grow
+        without bound (#75). Retention window: MEMORYBRIDGE_LOG_RETENTION_DAYS
+        (default 90; set 0 to keep everything)."""
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_access_profile ON access_log(profile)",
+            "CREATE INDEX IF NOT EXISTS idx_access_ts ON access_log(ts)",
+            "CREATE INDEX IF NOT EXISTS idx_analytics_model ON analytics_events(model)",
+            "CREATE INDEX IF NOT EXISTS idx_prune_queue_candidate ON prune_queue(candidate_id, resolved)",
+            "CREATE INDEX IF NOT EXISTS idx_pruner_log_candidate ON pruner_log(candidate_id)",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except Exception:
+                pass  # table may not exist on a very old DB — harmless
+
+        # Temporal-validity columns (supersession) for DBs created before they
+        # existed. SQLite has no ADD COLUMN IF NOT EXISTS, so check first.
+        try:
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+            if "valid_until" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN valid_until TEXT")
+            if "superseded_by" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT")
+        except Exception:
+            pass
+        try:
+            days = int(os.environ.get("MEMORYBRIDGE_LOG_RETENTION_DAYS", "90"))
+        except ValueError:
+            days = 90
+        if days > 0:
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            for sql, params in (
+                ("DELETE FROM access_log WHERE ts < ?", (cutoff,)),
+                ("DELETE FROM analytics_events WHERE created_at < ?", (cutoff,)),
+                ("DELETE FROM pruner_log WHERE created_at < ?", (cutoff,)),
+                ("DELETE FROM prune_queue WHERE resolved=1 AND resolved_at IS NOT NULL AND resolved_at < ?", (cutoff,)),
+            ):
+                try:
+                    self._conn.execute(sql, params)
+                except Exception:
+                    pass
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def embeddings_available(self) -> bool:
+        """True if the embedding model can actually embed text. Used as an
+        ingestion pre-flight: if this is False, semantic dedup is unavailable
+        and the pipeline should fail-fast (rather than pollute the store with
+        duplicates) unless the caller explicitly opts into degraded mode."""
+        try:
+            self._embed_texts(["probe"])
+            return True
+        except Exception as e:
+            logger.error("Embedding model unavailable: %s", e)
+            return False
+
+    def count_unembedded(self, profile: str) -> int:
+        """Number of active memories in a profile that have no stored embedding
+        (e.g. added during an embedding-model outage). These need a
+        build_embeddings() sweep to restore semantic search."""
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM memories m WHERE m.profile=? AND m.archived=0 "
+            "AND NOT EXISTS (SELECT 1 FROM memory_embeddings e WHERE e.id=m.id)",
+            (profile,),
+        ).fetchone()[0]
+
     def build_embeddings(self, profile: str) -> int:
         """
         Compute and persist embeddings for all active memories in a profile.
@@ -970,7 +1135,10 @@ class MemoryStore:
         return len(ids)
 
     def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
-        """Fast cosine similarity using numpy."""
+        """Fast cosine similarity using numpy. Returns 0.0 on a shape mismatch
+        rather than raising, so a stale-dimension vector can't crash a search."""
+        if len(a) != len(b):
+            return 0.0
         import numpy as np
         va, vb = np.array(a, dtype=np.float32), np.array(b, dtype=np.float32)
         denom = np.linalg.norm(va) * np.linalg.norm(vb)
@@ -989,8 +1157,18 @@ class MemoryStore:
         if count == 0:
             return self.search(profile, query, limit=limit, max_tokens=max_tokens)
 
-        # Embed query
-        q_vec = self._embed_texts([query])[0]
+        # Embed query. If the embedding model can't load (fastembed missing,
+        # download failed), DON'T let the exception propagate — callers (merger,
+        # router) catch it and return [], which silently disables dedup and
+        # conflict detection and floods the store with duplicates. Degrade to
+        # keyword/FTS search instead: weaker, but still catches duplicates.
+        try:
+            q_vec = self._embed_texts([query])[0]
+        except Exception as e:
+            logger.error("Embedding model unavailable (%s) — falling back to "
+                         "keyword search; semantic dedup is degraded.", e)
+            return self.search(profile, query, limit=limit, max_tokens=max_tokens)
+        q_len = len(q_vec)
 
         # Fetch all embedding rows for profile
         rows = self._conn.execute(
@@ -998,12 +1176,47 @@ class MemoryStore:
             (profile,)
         ).fetchall()
 
-        # Score by cosine similarity
-        scored = []
+        # Score by cosine similarity. Collect usable same-dimension vectors into
+        # one matrix and score them with a single vectorized matmul instead of a
+        # Python-level cosine call per row (#54). Stale/unparseable vectors are
+        # skipped (dimension guard, #52) so a model change can't crash search.
+        import numpy as np
+        ids: list[str] = []
+        mat: list[list[float]] = []
+        mismatched = 0
         for row in rows:
-            vec = json.loads(row["vector"])
-            sim = self._cosine_similarity(q_vec, vec)
-            scored.append((row["id"], sim))
+            try:
+                vec = json.loads(row["vector"])
+            except (json.JSONDecodeError, TypeError):
+                mismatched += 1
+                continue
+            if not isinstance(vec, list) or len(vec) != q_len:
+                mismatched += 1
+                continue
+            ids.append(row["id"])
+            mat.append(vec)
+
+        scored = []
+        if mat:
+            q = np.asarray(q_vec, dtype=np.float32)
+            q_norm = float(np.linalg.norm(q))
+            if q_norm > 0:
+                M = np.asarray(mat, dtype=np.float32)          # (n, d)
+                denom = np.linalg.norm(M, axis=1) * q_norm
+                sims = np.divide(M @ q, denom,
+                                 out=np.zeros(len(mat), dtype=np.float32),
+                                 where=denom > 0)
+                scored = list(zip(ids, sims.tolist()))
+
+        if mismatched:
+            logger.warning(
+                "search_semantic: %d/%d embeddings for profile '%s' have a stale "
+                "dimension (current=%d) and were skipped — rebuild with "
+                "build_embeddings(profile).", mismatched, len(rows), profile, q_len)
+        if not scored:
+            # Every stored vector is unusable (e.g. model changed) — don't return
+            # an empty result set; degrade to keyword/FTS search.
+            return self.search(profile, query, limit=limit, max_tokens=max_tokens)
 
         # Sort descending by similarity
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -1039,7 +1252,7 @@ class MemoryStore:
                       category: str = None,
                       limit: int = 5, max_tokens: int = 800,
                       recency_boost: bool = True,
-                      include_related: bool = True) -> list[dict]:
+                      include_related: bool = False) -> list[dict]:
         """
         Reciprocal Rank Fusion of FTS5 BM25 + semantic cosine results.
         RRF score = sum(1 / (60 + rank)) across both lists.
@@ -1109,14 +1322,17 @@ class MemoryStore:
         """
         from db.reflect import Reflector
 
-        if self._reflector is None:
-            self._reflector = Reflector(
-                search_fn=lambda q: self.search_hybrid(
-                    profile, q, limit=limit, max_tokens=max_tokens
-                ),
-                llm_synthesize=self._llm_synthesize,
-            )
-        return self._reflector.reflect(question)
+        # Build the Reflector per call. Caching it on the instance froze the
+        # first call's profile/limit/max_tokens into the search closure, so a
+        # later reflect() for a different profile searched the first profile's
+        # memories — a cross-profile data leak. The Reflector is cheap to build.
+        reflector = Reflector(
+            search_fn=lambda q: self.search_hybrid(
+                profile, q, limit=limit, max_tokens=max_tokens
+            ),
+            llm_synthesize=self._llm_synthesize,
+        )
+        return reflector.reflect(question)
 
     # -------------------------------------------------------------------------
     # Internal helpers

@@ -35,7 +35,10 @@ def _detect_conflict(fact: dict, profile: str) -> str | None:
             if mem.get("match_score", 0) > _CONFLICT_SIMILARITY:
                 return mem.get("content", "")
     except Exception as e:
-        logger.warning("search_hybrid failed during conflict detection: %s", e)
+        # search degrades to keyword search on embed failure, so reaching here is
+        # a real failure — conflict detection is silently off. Make it visible.
+        logger.error("search_hybrid failed during conflict detection "
+                     "(conflict check DEGRADED): %s", e)
     return None
 
 
@@ -65,11 +68,10 @@ def route(facts: list, profile: str = "default") -> dict:
 
         has_conflict = bool(fact.get("conflicts_with"))
         always_escalate = category in _ALWAYS_ESCALATE_CATEGORIES
-        low_confidence_identity = (
-            category == "identity" and confidence < 0.90
-        )
+        # (Removed a dead `category == "identity"` escalation rule — the extractor
+        # schema never emits "identity", so it could never fire. #78)
 
-        if has_conflict or always_escalate or low_confidence_identity or confidence < FLAG_THRESHOLD:
+        if has_conflict or always_escalate or confidence < FLAG_THRESHOLD:
             escalated.append(fact)
         elif confidence < ACCEPT_THRESHOLD:
             flagged.append(fact)
