@@ -19,23 +19,23 @@ import os
 import sys
 import signal
 import atexit
+import time
+import secrets
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from fastmcp import FastMCP
 from db.pruner import run_auto_prune, record_outcome, get_pruner_report
-from db.constants import VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, effective_score  # noqa: F401
-
-try:
-    import tiktoken
-    _enc = tiktoken.get_encoding("cl100k_base")
-    def _count_tokens_impl(text: str) -> int:
-        return len(_enc.encode(text))
-except ImportError:
-    def _count_tokens_impl(text: str) -> int:
-        words = len(re.findall(r'\b\w+\b', text))
-        punctuation = len(re.findall(r'[^\w\s]', text))
-        return int(words * 1.3 + punctuation * 0.5) or 1
+from db.constants import VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score  # noqa: F401
+# Token counting, recency decay, and the model-export logic live in a
+# store-free module so the UI can reuse them without importing this server
+# module (which would build a second store + register atexit) — see #91.
+from exports import (  # noqa: E402
+    count_tokens, apply_decay, DECAY_CONFIG,
+    export_for_model as _export_for_model_impl,
+    export_passport as _export_passport_impl,
+)
 
 # Initialize MCP server
 mcp = FastMCP("MemoryBridge")
@@ -63,18 +63,31 @@ _current_profile       = DEFAULT_PROFILE
 # auto-pruner's delete path so a remote-origin write can never destroy a
 # memory — candidates are routed to the review queue instead. See #37.
 _REMOTE_MODE           = False
+
+
+def _active_profile() -> str:
+    """Resolve the profile for a call that omitted one.
+
+    Over the HTTP bridge (`_REMOTE_MODE`), NEVER resolve through the mutable
+    process-global `_current_profile`: it is shared across all concurrent
+    remote requests, so one client's `switch_profile` would silently retarget
+    every other client's reads/writes (#70). Remote requests default to
+    DEFAULT_PROFILE; a remote client that needs a specific profile passes it
+    explicitly. Local stdio (single session) keeps the switchable global.
+    """
+    return DEFAULT_PROFILE if _REMOTE_MODE else _current_profile
+
+
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
-MAX_TOTAL_TOKENS       = 50000
+# Total-token ceiling is now configurable (config file `max_total_tokens` or
+# MEMORYBRIDGE_MAX_TOKENS env); defaults to 50000 for a fresh install (#7).
+import config as _config  # noqa: E402
+MAX_TOTAL_TOKENS       = _config.max_total_tokens()
 ARCHIVE_SCORE_THRESHOLD = 0.15
 
-DECAY_CONFIG = {
-    "enabled": True,
-    "half_life_days": 30,
-    "min_score": 0.1,
-    "boost_on_access": 0.1
-}
+# DECAY_CONFIG, count_tokens, and apply_decay are imported from exports.py (#91).
 # PID file for duplicate-instance awareness
 PID_DIR = DATA_DIR
 _PID_FILE = PID_DIR / "instance.pid"
@@ -138,7 +151,7 @@ atexit.register(_cleanup_pid)
 # =============================================================================
 # STORE — SQLite singleton
 # =============================================================================
-from db.store import MemoryStore  # noqa: E402
+from db.store import MemoryStore, GuardrailRejection, DuplicateContentError  # noqa: E402
 from db.entities import EntityExtractor  # noqa: E402
 
 # Entity config: DATA_DIR/entities.json overrides defaults
@@ -171,12 +184,6 @@ def log_to_analytics(tokens_served: int, memories_returned: int,
 # =============================================================================
 # TOKEN MANAGEMENT
 # =============================================================================
-
-def count_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return _count_tokens_impl(text) or 1
-
 
 def count_memory_tokens(mem: dict) -> int:
     content = mem.get("content", "")
@@ -217,15 +224,6 @@ def compress_memory(mem: dict, target_tokens: int = 50) -> dict:
     return compressed
 
 
-def apply_decay(memories: list, decay_config: dict) -> list:
-    if not decay_config.get("enabled", True):
-        return memories
-    today = datetime.now()
-    for mem in memories:
-        mem["effective_score"] = effective_score(mem, today)
-    return memories
-
-
 # =============================================================================
 # RESULT CLEANING — Phase 2.5: strip internal scoring metadata
 # =============================================================================
@@ -263,7 +261,7 @@ def get_memory(
     Returns:
         JSON with memories, token stats, and budget info
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -326,7 +324,7 @@ def get_memory(
     response = {
         "profile": profile,
         "identity": identity,
-        "memories": selected_memories,
+        "memories": [_clean_result(m) for m in selected_memories],
         "projects": projects,
         "model_preferences": model_preferences,
         "token_stats": {
@@ -360,7 +358,8 @@ def add_memory(
     importance: str = "medium",
     tags: list[str] = None,
     project_id: Optional[str] = None,
-    profile: str = None
+    profile: str = None,
+    supersedes: list[str] = None
 ) -> str:
     """
     Add a new memory with automatic token counting and content-hash dedup.
@@ -372,22 +371,34 @@ def add_memory(
         tags: Optional tags
         project_id: Optional project association
         profile: Memory profile
+        supersedes: Memory IDs this new fact REPLACES because the underlying
+            fact changed (e.g. a job change, a moved deadline). Each is archived
+            and stamped with a valid_until timestamp so it leaves normal recall
+            but remains as history. Use for facts that changed, not rewordings.
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
         return json.dumps({"error": f"Invalid importance. Valid: {IMPORTANCE_LEVELS}"})
 
-    mid = _store.add_memory(profile, content,
-                            category=category, importance=importance,
-                            tags=tags, project_id=project_id)
+    try:
+        mid = _store.add_memory(profile, content,
+                                category=category, importance=importance,
+                                tags=tags, project_id=project_id,
+                                supersedes=supersedes)
+    except GuardrailRejection as e:
+        # Document-shaped content: return the structured error contract every
+        # other validation path uses, instead of surfacing an unhandled MCP error.
+        return json.dumps({"status": "rejected", "reason": str(e)})
     if mid is None:
         return json.dumps({"status": "duplicate", "reason": "identical content already exists"})
 
-    token_count = count_tokens(content) + count_tokens(" ".join(tags or [])) + 20
+    # Report exactly what the store persisted (db.constants._count_tokens on the
+    # content), not a different formula — the two used to diverge (#55).
+    token_count = _count_tokens(content)
 
     # Budget-based prune (existing behaviour)
     stats = _store.token_stats(profile)
@@ -444,7 +455,7 @@ def add_memories(
     Returns:
         Summary with all added memory IDs and total tokens
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
@@ -453,20 +464,35 @@ def add_memories(
         return json.dumps({"error": "facts list is empty"})
 
     changes = []
+    rejected = []
+    duplicates = 0
     total_tokens = 0
 
+    # Per-fact isolation: a single guardrail rejection must NOT abort the batch
+    # and silently drop the remaining facts. Catch it, record it, keep going, and
+    # report added/duplicate/rejected counts honestly so callers (e.g. the
+    # ingestion merger) never see a false "0 added" on a partial success.
     for fact in facts:
-        mid = _store.add_memory(profile, fact,
-                                category=category, importance=importance,
-                                project_id=project)
-        if mid is not None:
-            token_count = count_tokens(fact) + 20
-            total_tokens += token_count
-            changes.append({
-                "memory_id": mid,
-                "tokens": token_count,
+        try:
+            mid = _store.add_memory(profile, fact,
+                                    category=category, importance=importance,
+                                    project_id=project)
+        except GuardrailRejection as e:
+            rejected.append({
+                "reason": str(e),
                 "preview": fact[:60] + ("…" if len(fact) > 60 else "")
             })
+            continue
+        if mid is None:
+            duplicates += 1
+            continue
+        token_count = count_tokens(fact) + 20
+        total_tokens += token_count
+        changes.append({
+            "memory_id": mid,
+            "tokens": token_count,
+            "preview": fact[:60] + ("…" if len(fact) > 60 else "")
+        })
 
     # Auto-prune if over budget
     pruned = []
@@ -474,15 +500,20 @@ def add_memories(
     if stats["total_tokens"] > MAX_TOTAL_TOKENS:
         pruned = _store.auto_prune(profile, threshold=ARCHIVE_SCORE_THRESHOLD)
 
-    _store.log_access("add_memories", profile,
-                      f"added {len(changes)} memories, {total_tokens} tokens")
+    _store.log_access(
+        "add_memories", profile,
+        f"added {len(changes)}, duplicate {duplicates}, rejected {len(rejected)}, "
+        f"{total_tokens} tokens")
 
     return json.dumps({
         "status": "updated",
         "profile": profile,
         "count": len(changes),
+        "duplicate_count": duplicates,
+        "rejected_count": len(rejected),
         "total_tokens_added": total_tokens,
         "changes": changes,
+        "rejected": rejected if rejected else None,
         "auto_pruned": pruned if pruned else None,
         "timestamp": datetime.now().isoformat()
     }, indent=2)
@@ -513,7 +544,7 @@ def edit_memory(
     Returns:
         JSON confirmation, or {"error": ...} if memory_id not found / validation fails
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     if importance is not None and importance not in IMPORTANCE_LEVELS:
         return json.dumps({"error": f"Invalid importance. Valid: {IMPORTANCE_LEVELS}"})
     if category is not None and category not in VALID_CATEGORIES:
@@ -529,7 +560,10 @@ def edit_memory(
     if project is not None:
         kwargs["project_id"] = project
 
-    updated = _store.edit_memory(profile, memory_id, **kwargs)
+    try:
+        updated = _store.edit_memory(profile, memory_id, **kwargs)
+    except DuplicateContentError as e:
+        return json.dumps({"error": f"duplicate content: {e}"})
     if not updated:
         return json.dumps({"error": f"memory_id '{memory_id}' not found in profile '{profile}'"})
 
@@ -566,7 +600,7 @@ def search_memory(
     Returns:
         JSON with ranked results (internal fields stripped)
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
 
     if category and category not in VALID_CATEGORIES:
@@ -623,7 +657,7 @@ def reflect(
     Returns:
         JSON with structured synthesis
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
 
     result = _store.reflect(profile, question, limit=limit, max_tokens=max_tokens)
@@ -636,7 +670,7 @@ def delete_memory(
     profile: str = None
 ) -> str:
     """Delete a specific memory by ID."""
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     tokens_freed = _store.delete_memory(profile, memory_id)
     if tokens_freed == 0:
         # Check if profile even exists
@@ -725,7 +759,7 @@ def prune_memories(
     Returns:
         List of pruned/would-prune memories
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     threshold = threshold or ARCHIVE_SCORE_THRESHOLD
 
@@ -785,13 +819,16 @@ def switch_profile(profile_name: str) -> str:
 @mcp.tool()
 def list_projects(profile: str = None) -> str:
     """List all projects with status."""
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
         return json.dumps({"error": f"Profile '{profile}' not found"})
 
     projects = profile_data.get("projects", [])
+    # Guard against malformed project entries: the projects column is free-form
+    # JSON, so a bare string would make p.get(...) raise AttributeError and 500
+    # the whole tool. Skip non-dict entries instead (#124).
     summary = [
         {
             "id": p.get("id"),
@@ -801,6 +838,7 @@ def list_projects(profile: str = None) -> str:
             "last_updated": p.get("last_updated")
         }
         for p in projects
+        if isinstance(p, dict)
     ]
     _store.log_access("list_projects", profile, "")
     return json.dumps({
@@ -847,7 +885,7 @@ def get_prune_queue(
     Returns:
         JSON with pending queue items and optional pruner report
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     from db.pruner import get_pruner_report
     report = get_pruner_report(_store._conn, since_days=7) if include_report else {}
@@ -877,7 +915,7 @@ def resolve_prune_queue(
     Returns:
         Outcome with tokens freed and updated confidence info
     """
-    profile = profile or _current_profile
+    profile = profile or _active_profile()
     _store.ensure_profile(profile)
     result = record_outcome(_store._conn, queue_id, approved, _store.delete_memory)
 
@@ -913,150 +951,11 @@ def export_for_model(
         depth: Export depth (full, summary, minimal)
         max_tokens: Token budget for export (default 2000)
     """
-    profile = profile or _current_profile
-    _store.ensure_profile(profile)
-    profile_data = _store.get_profile(profile)
-    if profile_data is None:
-        return json.dumps({"error": f"Profile '{profile}' not found"})
-
-    identity = profile_data["identity"]
-    projects = profile_data["projects"]
-    memories = _store.get_memories(profile)
-    prefs = profile_data.get("model_preferences", {}).get(model, {})
-
-    memories = apply_decay([m.copy() for m in memories], DECAY_CONFIG)
-    memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
-
-    budgets = {"full": max_tokens, "summary": max_tokens // 2, "minimal": max_tokens // 4}
-    budget = budgets.get(depth, max_tokens)
-    tokens_used = 0
-
-    # --- Build shared base data (Issue #20: all models draw from the same pool) ---
-    # Collect exported memories in a list so we can count what was actually included.
-    exported_memories: list = []
-
-    # Shared memory-iteration helper used by all three model branches.
-    def _collect_memories(lines_or_parts, append_fn, fmt_fn):
-        """Iterate memories within budget; populate exported_memories side-effect."""
-        nonlocal tokens_used
-        for m in memories:
-            if tokens_used >= budget - 50:
-                break
-            content = m.get("content", "")
-            mem_tokens = count_tokens(content)
-            if tokens_used + mem_tokens > budget - 50:
-                remaining = budget - tokens_used - 50
-                content = content[:remaining * 3] + "…"
-            append_fn(fmt_fn(content))
-            tokens_used += count_tokens(content) + 2
-            exported_memories.append(m)
-
-    if model == "chatgpt":
-        lines = [
-            "# Memory Chip",
-            f"*Exported: {datetime.now().strftime('%Y-%m-%d %H:%M')}*",
-            "",
-            "## Identity",
-            f"**Name:** {identity.get('name', 'Unknown')}",
-            f"**Role:** {identity.get('role', 'Unknown')}",
-            ""
-        ]
-        tokens_used = count_tokens("\n".join(lines))
-
-        if identity.get("communication_style") and tokens_used < budget - 100:
-            style = identity["communication_style"]
-            style_lines = [
-                "## Communication Style",
-                f"**Tone:** {style.get('tone', '')}",
-            ]
-            if style.get("preferences"):
-                for pref in style["preferences"][:3]:
-                    style_lines.append(f"- {pref}")
-            style_lines.append("")
-            style_text = "\n".join(style_lines)
-            if tokens_used + count_tokens(style_text) < budget:
-                lines.extend(style_lines)
-                tokens_used += count_tokens(style_text)
-
-        if memories and depth in ("full", "summary") and tokens_used < budget - 100:
-            lines.append("## Key Memories")
-            _collect_memories(lines, lines.append, lambda c: f"- {c}")
-            lines.append("")
-
-        if projects and depth == "full" and tokens_used < budget - 100:
-            lines.append("## Active Projects")
-            for p in projects:
-                if p.get("status") == "active" and tokens_used < budget - 50:
-                    proj_line = f"- **{p.get('name', p.get('id'))}**: {p.get('description', '')[:50]}"
-                    lines.append(proj_line)
-                    tokens_used += count_tokens(proj_line)
-            lines.append("")
-
-        export_text = "\n".join(lines)
-
-    elif model == "gemini":
-        # Gemini: pipe-separated compact format, but includes ALL memories within
-        # budget — not just 3 preference snippets (Issue #20 fix).
-        parts = [f"User: {identity.get('name', 'Unknown')} - {identity.get('role', 'Unknown')}"]
-        tokens_used = count_tokens(parts[0])
-
-        if identity.get("communication_style", {}).get("tone"):
-            tone_part = f"Style: {identity['communication_style']['tone'][:50]}"
-            if tokens_used + count_tokens(tone_part) < budget:
-                parts.append(tone_part)
-                tokens_used += count_tokens(tone_part)
-
-        if memories and depth in ("full", "summary") and tokens_used < budget - 100:
-            _collect_memories(parts, parts.append, lambda c: f"Mem: {c}")
-
-        if projects and depth == "full" and tokens_used < budget - 100:
-            active = [p.get("name", p["id"]) for p in projects if p.get("status") == "active"]
-            if active:
-                proj_part = f"Projects: {', '.join(active)}"
-                if tokens_used + count_tokens(proj_part) < budget:
-                    parts.append(proj_part)
-                    tokens_used += count_tokens(proj_part)
-
-        export_text = " | ".join(parts)
-
-    elif model == "ollama":
-        # Ollama: semicolon-separated terse format, but includes ALL memories
-        # within budget — not just name/role/project ids (Issue #20 fix).
-        parts = [
-            f"User={identity.get('name', 'Unknown')}",
-            f"Role={identity.get('role', 'Unknown')[:30]}"
-        ]
-        tokens_used = sum(count_tokens(p) for p in parts)
-
-        if memories and depth in ("full", "summary") and tokens_used < budget - 100:
-            _collect_memories(parts, parts.append, lambda c: f"Mem={c[:80]}")
-
-        if projects and depth in ("full", "summary") and tokens_used < budget - 100:
-            active = [p["id"] for p in projects if p.get("status") == "active"]
-            if active:
-                proj_part = f"Projects={','.join(active)}"
-                if tokens_used + count_tokens(proj_part) < budget:
-                    parts.append(proj_part)
-                    tokens_used += count_tokens(proj_part)
-
-        export_text = ";".join(parts)
-
-    else:
-        return json.dumps({"error": f"Unknown model: {model}. Supported: chatgpt, gemini, ollama"})
-
-    final_tokens = count_tokens(export_text)
-    _store.log_access("export_for_model", profile,
-                      f"model={model}, tokens={final_tokens}", final_tokens)
-    log_to_analytics(
-        tokens_served=final_tokens,
-        # Fix Issue #20: count memories actually included in the export,
-        # not memories that merely have effective_score > 0.3.
-        memories_returned=len(exported_memories),
-        model=model,
-        profile=profile,
-        operation="export_for_model"
+    profile = profile or _active_profile()
+    return _export_for_model_impl(
+        _store, model, profile, depth=depth, max_tokens=max_tokens,
+        log_analytics=log_to_analytics,
     )
-    return export_text
 
 
 @mcp.tool()
@@ -1077,35 +976,10 @@ def export_passport(
     Returns:
         Plain-text Memory Passport string.
     """
-    profile = profile or _current_profile
-    from ingestion.passport import build_passport
-
-    _store.ensure_profile(profile)
-    profile_data = _store.get_profile(profile)
-    if profile_data is None:
-        return f"# Memory Passport\nProfile: {profile}\nGenerated: {__import__('datetime').datetime.now().strftime('%Y-%m-%d')}\n\nError: profile not found."
-
-    memories = _store.get_memories(profile)
-    identity = profile_data.get("identity", {})
-
-    passport = build_passport(
-        memories=memories,
-        identity=identity,
-        profile=profile,
-        max_tokens=max_tokens,
+    profile = profile or _active_profile()
+    return _export_passport_impl(
+        _store, profile, max_tokens=max_tokens, log_analytics=log_to_analytics,
     )
-
-    final_tokens = count_tokens(passport)
-    _store.log_access("export_passport", profile,
-                      f"tokens={final_tokens}", final_tokens)
-    log_to_analytics(
-        tokens_served=final_tokens,
-        memories_returned=len(memories),
-        model="passport",
-        profile=profile,
-        operation="export_passport",
-    )
-    return passport
 
 
 @mcp.tool()
@@ -1129,6 +1003,11 @@ def ingest_from_inbox(
     """
     import subprocess
     import sys
+
+    # Normalize like every other tool — otherwise a default call passes
+    # profile=None straight into the subprocess argv (TypeError / a profile
+    # literally named "None").
+    profile = profile or _active_profile()
 
     inbox = DATA_DIR / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
@@ -1301,6 +1180,81 @@ def _gate_tools_for_remote() -> list[str]:
     return removed
 
 
+async def _send_plain(send, status: int, text: str) -> None:
+    """Emit a minimal ASGI plain-text response."""
+    body = text.encode()
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+class _RateLimitAuthMiddleware:
+    """ASGI middleware guarding the HTTP bridge (issue #69).
+
+    - Per-client-IP fixed-window rate limiting -> 429 when exceeded, so the
+      path-embedded capability token cannot be brute-forced without backoff.
+    - Constant-time comparison of the leading path segment against the expected
+      token (`secrets.compare_digest`); a mismatch returns a uniform 404 with no
+      timing signal and never reaches the MCP app.
+    Behind the Cloudflare tunnel the real client IP arrives in CF-Connecting-IP /
+    X-Forwarded-For, so those are honored before the transport peer address.
+    """
+
+    def __init__(self, app, expected_token: str, limit: int, window: int):
+        self.app = app
+        self.expected_token = expected_token
+        self.limit = limit
+        self.window = window
+        self._hits: dict[str, list] = {}
+        self._lock = threading.Lock()
+
+    def _client_ip(self, scope) -> str:
+        headers = {k.decode().lower(): v.decode()
+                   for k, v in scope.get("headers", [])}
+        for h in ("cf-connecting-ip", "x-forwarded-for"):
+            val = headers.get(h, "").strip()
+            if val:
+                return val.split(",")[0].strip()
+        client = scope.get("client")
+        return client[0] if client else "unknown"
+
+    def _rate_ok(self, ip: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            window_start, count = self._hits.get(ip, (now, 0))
+            if now - window_start >= self.window:
+                window_start, count = now, 0
+            count += 1
+            self._hits[ip] = [window_start, count]
+            if len(self._hits) > 4096:  # bound memory; drop stale windows
+                for k in [k for k, (s, _) in self._hits.items()
+                          if now - s >= self.window]:
+                    self._hits.pop(k, None)
+            return count <= self.limit
+
+    def _token_ok(self, scope) -> bool:
+        segment = scope.get("path", "").lstrip("/").split("/", 1)[0]
+        return secrets.compare_digest(segment, self.expected_token)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        if not self._rate_ok(self._client_ip(scope)):
+            await _send_plain(send, 429, "rate limit exceeded")
+            return
+        if not self._token_ok(scope):
+            await _send_plain(send, 404, "not found")
+            return
+        await self.app(scope, receive, send)
+
+
 def _run_http() -> None:
     """Serve over streamable HTTP for remote MCP clients.
 
@@ -1331,13 +1285,46 @@ def _run_http() -> None:
     # uvicorn access logger records the full path on every request, which would
     # write the secret to stdout/stderr and any tunnel/proxy log. Disable it so
     # the token never lands in a log. Never print even a prefix of the token.
+    import logging
     logging.getLogger("uvicorn.access").disabled = True
 
-    print(f"[memorybridge] HTTP bridge on 127.0.0.1:{port} "
-          f"path=/<redacted>/mcp | tools gated: removed {len(removed)} "
-          f"({', '.join(sorted(removed))})", file=sys.stderr)
-    mcp.run(transport="http", host="127.0.0.1", port=port,
-            path=f"/{token}/mcp")
+    rate_limit = int(os.environ.get("MEMORYBRIDGE_RATE_LIMIT", "120"))
+    rate_window = int(os.environ.get("MEMORYBRIDGE_RATE_WINDOW", "60"))
+
+    # Wrap the FastMCP ASGI app with rate-limiting + constant-time token auth
+    # (issue #69). Only take this path if we can build the app at the SAME
+    # capability path clients expect; otherwise fall back to mcp.run so a
+    # FastMCP API change can never leave the bridge serving on the wrong path.
+    mcp_path = f"/{token}/mcp"
+    # FastMCP 2.x exposes http_app(path=...); older builds used streamable_http_app.
+    app_factory = getattr(mcp, "http_app", None) or getattr(mcp, "streamable_http_app", None)
+    app = None
+    if callable(app_factory):
+        try:
+            app = app_factory(path=mcp_path)
+        except TypeError:
+            app = None  # can't pin the path safely -> fall back
+
+    if app is not None:
+        import uvicorn
+        wrapped = _RateLimitAuthMiddleware(app, token, rate_limit, rate_window)
+        print(f"[memorybridge] HTTP bridge on 127.0.0.1:{port} "
+              f"path=/<redacted>/mcp | tools gated: removed {len(removed)} "
+              f"({', '.join(sorted(removed))}) | rate limit {rate_limit}/{rate_window}s per IP",
+              file=sys.stderr)
+        # lifespan="on": the streamable-HTTP session manager is started by the
+        # Starlette lifespan; the ASGI wrapper forwards lifespan scopes, and
+        # forcing it on (vs "auto") makes a lifespan failure loud instead of
+        # degrading every request to a 500.
+        uvicorn.run(wrapped, host="127.0.0.1", port=port,
+                    access_log=False, log_level="warning", lifespan="on")
+    else:
+        print(f"[memorybridge] WARNING: could not attach rate-limiting middleware "
+              f"(FastMCP app factory unavailable); serving without per-IP rate "
+              f"limiting. HTTP bridge on 127.0.0.1:{port} path=/<redacted>/mcp | "
+              f"tools gated: removed {len(removed)} ({', '.join(sorted(removed))})",
+              file=sys.stderr)
+        mcp.run(transport="http", host="127.0.0.1", port=port, path=mcp_path)
 
 
 if __name__ == "__main__":

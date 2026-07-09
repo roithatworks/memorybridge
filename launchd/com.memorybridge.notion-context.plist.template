@@ -17,29 +17,31 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/python3</string>
-        <string>{{HOME}}/memorybridge/ingestion/notion_context.py</string>
+        <string>{{PYTHON}}</string>
+        <string>{{CODE_DIR}}/ingestion/notion_context.py</string>
         <string>--profile</string>
         <string>default</string>
     </array>
 
-    <!-- Load .env from production directory -->
+    <!-- Data dir (for .env / db) + a PATH containing the chosen python -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
         <string>{{HOME}}</string>
+        <key>MEMORYBRIDGE_DATA</key>
+        <string>{{DATA_DIR}}</string>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <string>{{PYTHON_DIR}}:/usr/bin:/bin</string>
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>{{HOME}}/memorybridge</string>
+    <string>{{DATA_DIR}}</string>
 
     <key>StandardOutPath</key>
-    <string>{{HOME}}/memorybridge/logs/notion-context.log</string>
+    <string>{{DATA_DIR}}/logs/notion-context.log</string>
 
     <key>StandardErrorPath</key>
-    <string>{{HOME}}/memorybridge/logs/notion-context.error.log</string>
+    <string>{{DATA_DIR}}/logs/notion-context.error.log</string>
 
     <!-- Retry after failure -->
     <key>ThrottleInterval</key>

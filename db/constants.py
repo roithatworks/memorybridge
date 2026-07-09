@@ -95,7 +95,18 @@ def guardrail_check(content: str) -> tuple[bool, str]:
 
 
 def _content_hash(content: str) -> str:
-    """SHA256 of normalized content — same normalization across all callers."""
+    """SHA256 of normalized content — same normalization across all callers.
+
+    Normalization is intentionally case- and surrounding-whitespace-insensitive
+    (``strip().lower()``): the dedup key backs a UNIQUE index on
+    ``(profile, content_hash)``, and for a personal memory store two facts that
+    differ only by case or padding ("Ship it." vs "ship it") are treated as the
+    same fact on purpose, to keep near-duplicate noise out of the store. This is
+    a deliberate design choice, not an oversight (#107). Do NOT change it to
+    case-sensitive without a migration: every existing row's hash was computed
+    lowercased, so a change would silently stop de-duplicating re-adds until the
+    whole table is re-hashed.
+    """
     return hashlib.sha256(content.strip().lower().encode()).hexdigest()
 
 
@@ -266,26 +277,10 @@ def _looks_like_code(content: str) -> bool:
 
 # --- Project name normalization ---------------------------------------------
 
-_PROJECT_NORMALIZE: dict[str, str] = {
-    # Hermes Agent variants
-    "hermes agent": "hermes-agent",
-    "hermes-agent": "hermes-agent",
-    "hermes": "hermes-agent",
-    # Ops Radar variants
-    "ops_radar": "ops-radar",
-    "ops-radar": "ops-radar",
-    "ops radar": "ops-radar",
-    # Control Alt Recover
-    "controlaltrecover": "car",
-    "car": "car",
-    # ROI That Works
-    "roithatworks": "roi",
-    "roithatworks.com": "roi",
-    "roi": "roi",
-    # Strategic Alignment Playbook
-    "strategic alignment playbook": "sap",
-    "sap": "sap",
-}
+# Canonical project-name aliases. Empty by default (unknown project IDs pass
+# through unchanged); populate this with your own project aliases if you want
+# variant spellings collapsed to one canonical id.
+_PROJECT_NORMALIZE: dict[str, str] = {}
 
 
 def _normalize_project(project_id: str | None) -> str | None:
@@ -298,7 +293,17 @@ def _normalize_project(project_id: str | None) -> str | None:
     if not project_id:
         return project_id
     key = project_id.strip().lower()
-    return _PROJECT_NORMALIZE.get(key, project_id)
+    if key in _PROJECT_NORMALIZE:
+        return _PROJECT_NORMALIZE[key]
+    # User-defined aliases from config (memorybridge.yaml `project_aliases`).
+    try:
+        import config
+        aliases = config.project_aliases()
+        if key in aliases:
+            return aliases[key]
+    except Exception:
+        pass
+    return project_id
 
 
 # --- Tag cap to prevent unbounded compounding --------------------------------
@@ -307,15 +312,21 @@ _MAX_TAGS = 12
 
 
 def _cap_tags(tags: list[str], max_tags: int = _MAX_TAGS) -> list[str]:
-    """Truncate tag list if it exceeds max_tags.
+    """Truncate a tag list if it exceeds max_tags, but ALWAYS keep every
+    `entity:` and `project:` tag.
 
-    Priority order: existing/caller tags first, then category, then
-    project, then content-type, then keywords. This ensures the most
-    informative tags survive the truncation.
+    Fuzzy dedup (_maybe_merge) and related-expansion (_expand_related) key
+    entirely off entity tags, so a blind head-slice could silently drop them
+    below the merge threshold and disable dedup for that row. Only the less
+    critical keyword/content-type tags are truncated.
     """
     if len(tags) <= max_tags:
         return tags
-    return tags[:max_tags]
+    priority = [t for t in tags if t.startswith(("entity:", "project:"))]
+    rest = [t for t in tags if not t.startswith(("entity:", "project:"))]
+    if len(priority) >= max_tags:
+        return priority  # keep all entity/project tags even beyond the cap
+    return priority + rest[:max_tags - len(priority)]
 
 
 # --- Keyword extraction (n-gram + stop-word heuristic) ----------------------

@@ -10,3 +10,22 @@ flagged_queue.json
 *.db-shm
 *.db-wal
 COMMIT_MSG.txt
+
+# Prevent re-committing sensitive data / build artifacts (#36)
+*.dxt
+*.plugin
+*.zip
+memory-health-report-*.md
+client-memory-*.md
+
+# Default-invocation outputs + runtime droppings (#120)
+memorybridge.okf/
+*.okf/
+instance.pid
+inbox/*.json
+
+# User's own config lives in the data dir; never commit a real one (the tracked
+# template is memorybridge.example.yaml).
+memorybridge.yaml
+memorybridge.yml
+memorybridge.json

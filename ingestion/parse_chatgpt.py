@@ -21,9 +21,16 @@ def _extract_messages_from_mapping(mapping: dict) -> list:
         root_id = next(iter(mapping))
 
     messages = []
+    # Track visited nodes: a truncated/corrupted export can contain a parent
+    # cycle (A->B->A with no true root), and without this the DFS would loop
+    # forever, hanging the run until the watcher's timeout.
+    visited = set()
     stack = [root_id] if root_id else []
     while stack:
         node_id = stack.pop()
+        if node_id in visited:
+            continue
+        visited.add(node_id)
         node = mapping.get(node_id, {})
         msg = node.get("message")
         if msg:
@@ -64,8 +71,12 @@ def parse(file_path: str, days: int = None) -> dict:
 
     conversations = []
     for item in raw:
-        create_time = item.get("create_time") or 0
-        if cutoff and create_time < cutoff:
+        create_time = item.get("create_time")
+        # Only drop a conversation for age when we actually KNOW its age. A
+        # missing/unparseable timestamp used to become 0 (1970) and get silently
+        # excluded by any --days filter — include it instead (#79).
+        if cutoff and isinstance(create_time, (int, float)) and create_time > 0 \
+                and create_time < cutoff:
             continue
 
         try:

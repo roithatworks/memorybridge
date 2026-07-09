@@ -1,141 +1,117 @@
 """Domain routing: assign each extracted fact to a memory profile.
 
-A fact carries category + project + the fact text. We route it to ONE of the
-domain profiles below, defaulting to "default" (the cross-cutting bucket for
-identity / voice / tooling that should apply everywhere) whenever the signal is
-weak. Misrouting to "default" is recoverable; misrouting into the wrong domain
-is silent damage — so the bias is intentionally toward "default".
+Routing is **config-driven** (see ``memorybridge.example.yaml``). A user defines
+domains + keyword sets; each fact is scored against them and written to the
+best-matching domain, defaulting to "default" (the cross-cutting bucket for
+identity / voice / tooling that applies everywhere) whenever the signal is weak.
+Misrouting to "default" is recoverable; misrouting into the wrong domain is
+silent damage — so the bias is intentionally toward "default".
 
-Signal priority:
-  1. explicit project name keywords  (strongest)
-  2. fact-text keywords
-  3. fall back to "default"
+If no domains are configured, routing is OFF: every fact goes to the run's
+profile. Power users who need bespoke logic can point ``custom_router`` at a
+Python module exporting ``route_profile(fact, base_profile)``.
 
-Tune the keyword sets below — that's the whole control surface.
+Signal priority (generic engine):
+  1. strong domain signal (score >= 2, e.g. a project-name hit or two keywords)
+  2. cross-cutting default_keywords -> "default" (or an anchor domain)
+  3. weak domain signal (score >= 1)
+  4. fall back to the run profile
 """
+from __future__ import annotations
 
+import importlib.util
 import re
+import sys
+from pathlib import Path
 
-# Profiles that domain facts route into. "default" is the catch-all and is NOT
-# in this map (it's the fallback).
-DOMAIN_PROFILES = ("job_search", "consulting", "teaching", "personal")
-
-# Identity / voice / cross-cutting facts belong in "default" so EVERY domain
-# sees them. If a fact matches these, it overrides domain routing.
-_DEFAULT_KEYWORDS = {
-    "voice", "tone", "writing style", "content style", "em dash", "em-dash",
-    "oxford comma", "prompt", "prompting", "claude", "gemini", "chatgpt",
-    "llm", "model", "cale corbett", "identity", "bluf",
-    "prefers", "style", "messages over",
-}
-
-# A named consulting/brand anchor. If present, a "voice/style" fact is
-# domain-specific (consulting voice), NOT universal default voice — so these
-# override the default-voice rule and pull the fact into consulting.
-_CONSULTING_ANCHORS = {
-    "control alt recover", "car ", " car", "roi that works", "roithatworks",
-    "client", "fairy chains", "71 model",
-}
-
-# Domain keyword sets. Order matters only for readability; scoring picks the
-# best match. Keep these specific — generic words cause misrouting.
-_DOMAIN_KEYWORDS = {
-    "job_search": {
-        "job search", "director pmo", "program management role", "resume",
-        "cover letter", "recruiter", "application", "ats", "greenhouse",
-        "lever", "interview", "remote role", "salary", "linkedin sales navigator",
-        "changed jobs", "hiring", "candidate",
-        # LinkedIn job-search mechanics (Sales Nav / saved-search filters used
-        # for role hunting): f_wt / f_e / boolean filter codes, saved search.
-        "f_wt", "remote work filter", "saved search", "boolean search",
-        "linkedin filter", "search url", "prospecting filter",
-    },
-    "consulting": {
-        "roi that works", "roithatworks", "control alt recover", "car ",
-        "client", "consulting", "pmo design", "transformation", "fractional",
-        "medical billing", "rcm", "revenue cycle", "prior auth", "apollo",
-        "prospect", "icp", "outreach", "71 model", "fairy chains",
-    },
-    "teaching": {
-        "canvas", "student", "grading", "grade", "course", "syllabus",
-        "adjunct", "lecture", "assignment", "rubric", "discussion post",
-    },
-    "personal": {
-        "wife", "mindy", "family", "daughter", "son", "father", "husband",
-        "personal", "home", "health", "vacation",
-    },
-}
+try:
+    from config import routing as _config_routing
+except Exception:  # pragma: no cover - config always importable in practice
+    def _config_routing() -> dict:
+        return {"domains": {}, "default_keywords": [], "anchors": {}, "custom_router": None}
 
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").lower())
 
 
-def route_profile(fact: dict, base_profile: str = "default") -> str:
+_CUSTOM_CACHE: dict[str, object] = {}
+
+
+def _load_custom_router(path: str):
+    """Import a user-provided router module exporting route_profile(fact, base)."""
+    if path in _CUSTOM_CACHE:
+        return _CUSTOM_CACHE[path]
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"custom_router not found: {p}")
+    spec = importlib.util.spec_from_file_location("_mb_custom_router", str(p))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_mb_custom_router"] = mod
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    if not hasattr(mod, "route_profile"):
+        raise AttributeError(f"custom_router {p} must define route_profile(fact, base_profile)")
+    _CUSTOM_CACHE[path] = mod
+    return mod
+
+
+def route_profile(fact: dict, base_profile: str = "default", routing: dict | None = None) -> str:
     """Return the profile this fact should be written to.
 
-    base_profile is the run-level profile (what --profile was set to). When the
-    run targets a specific profile other than 'default', we honor it as the
-    fallback instead of 'default' — so `--profile job_search` still works as an
-    override while auto-routing refines within a 'default' run.
+    *base_profile* is the run-level profile (what --profile was set to); it is
+    the fallback when no domain signal is found. *routing* overrides the loaded
+    config (used by tests).
     """
+    cfg = routing if routing is not None else _config_routing()
+
+    custom = cfg.get("custom_router")
+    if custom:
+        return _load_custom_router(custom).route_profile(fact, base_profile)
+
+    domains: dict = cfg.get("domains") or {}
+    if not domains:
+        # Routing is off — honor the run profile.
+        return base_profile
+
     text = _norm(fact.get("fact", ""))
     project = _norm(fact.get("project", ""))
     haystack = f"{project} {text}"
 
     # 1. Score each domain by keyword hits (project text weighted 2x).
     best, best_score = None, 0
-    for profile, kws in _DOMAIN_KEYWORDS.items():
+    for profile, kws in domains.items():
         score = 0
         for k in kws:
-            if k in project:
+            k = _norm(k)
+            if k and k in project:
                 score += 2
-            elif k in text:
+            elif k and k in text:
                 score += 1
         if score > best_score:
             best, best_score = profile, score
 
-    default_signal = any(k in haystack for k in _DEFAULT_KEYWORDS)
-    consulting_anchor = any(k in haystack for k in _CONSULTING_ANCHORS)
+    default_keywords = [_norm(k) for k in (cfg.get("default_keywords") or [])]
+    default_signal = any(k in haystack for k in default_keywords)
 
-    # 2. A STRONG domain signal (score >= 2, e.g. a project-name hit or two
-    #    keyword hits) wins even if cross-cutting words are also present — e.g.
-    #    "Mindy (wife) uses a LinkedIn prompt" is personal, not default.
+    anchors: dict = cfg.get("anchors") or {}
+    anchor_domain = None
+    for dom, kws in anchors.items():
+        if dom in domains and any(_norm(k) in haystack for k in kws):
+            anchor_domain = dom
+            break
+
+    # 2. Strong domain signal wins even if cross-cutting words are also present.
     if best and best_score >= 2:
         return best
 
-    # 3. Cross-cutting identity/voice/tooling → default (applies everywhere).
-    #    BUT if the fact names a consulting/brand anchor (CAR, ROI, client), the
-    #    voice is domain-specific → consulting, not universal default. Runs
-    #    before the LinkedIn rule so a LinkedIn *voice* fact with no client
-    #    anchor ("prefers direct messages") still lands in default.
+    # 3. Cross-cutting identity/voice/tooling -> default, unless an anchor pulls
+    #    it into a specific domain.
     if default_signal:
-        return "consulting" if consulting_anchor else "default"
+        return anchor_domain or "default"
 
-    # 4. LinkedIn special-case (Cale's rule): LinkedIn is primarily his
-    #    job-search and consulting/brand surface, not a generic default topic.
-    #    - LinkedIn + consulting/CAR/ROI signal → consulting (handled by step 2
-    #      already; if a weak consulting hit exists, prefer it here too).
-    #    - LinkedIn + job-search mechanics → job_search.
-    #    - any OTHER bare LinkedIn (posting, content, engagement, strategy with
-    #      no job-search signal) → consulting (it's his brand work).
-    if "linkedin" in haystack:
-        if best == "consulting" and best_score >= 1:
-            return "consulting"
-        if best == "job_search" and best_score >= 1:
-            return "job_search"
-        # Bare LinkedIn with no domain signal: job-search if it reads like the
-        # hunt (connections, search, hiring), else consulting (brand/content).
-        if any(k in haystack for k in (
-            "connect", "connection", "search", "filter", "recruiter",
-            "hiring", "job", "role", "candidate", "sales navigator",
-        )):
-            return "job_search"
-        return "consulting"
-
-    # 5. A weak-but-present domain signal still routes to its domain.
+    # 4. Weak-but-present domain signal routes to its domain.
     if best and best_score >= 1:
         return best
 
-    # 6. No signal → safe fallback.
-    return base_profile if base_profile in DOMAIN_PROFILES else "default"
+    # 5. No signal -> run profile (or default).
+    return base_profile if base_profile in domains or base_profile == "default" else "default"

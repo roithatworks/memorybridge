@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-LOG="/Users/cale/memorybridge/logs/server.error.log"
+LOG="${MEMORYBRIDGE_DATA:-$HOME/memorybridge}/logs/server.error.log"
 LOG_LIMIT_MB=50
 BRIDGE_PORT=8484
 

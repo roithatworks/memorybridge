@@ -1,10 +1,22 @@
-fastmcp>=0.1.0,<3.0.0
-tiktoken>=0.7.0
-python-dotenv>=1.0.0
-openai>=1.0.0
-anthropic>=0.20.0
-notion-client>=2.2.0
-fastembed>=0.2.0
-numpy>=1.24.0
-streamlit>=1.30.0
-pandas>=2.0.0
+# Runtime dependencies. Each pin has an UPPER BOUND capping the next major so a
+# fresh `pip install` can't silently pull a breaking release (#104). Ranges are
+# anchored to the versions this code is known to run against (fastmcp 2.x,
+# streamlit 1.5x, openai 2.x, numpy 2.x). Bump a cap deliberately after testing.
+#
+# fastmcp: the server/UI touch the 2.x-only `.fn` tool attribute, so this must
+# stay on the 2.x line — NOT the old floor of 0.1.0 which allowed 1.x.
+fastmcp>=2.0.0,<3.0.0
+tiktoken>=0.7.0,<1.0.0
+python-dotenv>=1.0.0,<2.0.0
+openai>=1.0.0,<3.0.0
+anthropic>=0.20.0,<1.0.0
+notion-client>=2.2.0,<4.0.0
+fastembed>=0.2.0,<1.0.0
+numpy>=1.24.0,<3.0.0
+# streamlit capped <2.0: the UI still uses `use_container_width=`, which
+# Streamlit has deprecated and will remove in a future major — the cap keeps a
+# fresh install on a version that still supports it.
+streamlit>=1.37.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+# Human-editable config file (memorybridge.yaml). JSON config works without it.
+pyyaml>=6.0,<7.0

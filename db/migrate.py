@@ -29,11 +29,45 @@ def migrate():
     data = json.loads(MEMORY_JSON.read_text())
 
     conn = sqlite3.connect(str(MEMORY_DB))
-    conn.executescript(SCHEMA_SQL.read_text())
+    # Match the store's connection settings so this can't deadlock/error if the
+    # server is running, and so the migration is durable (#92).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.executescript(SCHEMA_SQL.read_text())  # DDL auto-commits
 
+    # Migrate all rows in ONE transaction — a mid-loop failure rolls back the
+    # whole thing instead of leaving a half-populated DB (#92).
+    try:
+        conn.execute("BEGIN")
+        total_written, total_skipped = _migrate_rows(conn, data)
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+
+    active_count = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()[0]
+    conn.close()
+
+    # Back up the original JSON only AFTER a successful, committed migration.
+    backup = MEMORY_JSON.with_suffix(".json.pre-sqlite-backup")
+    if not backup.exists():
+        MEMORY_JSON.rename(backup)
+        print(f"Original backed up to {backup}")
+    else:
+        print(f"Backup already exists at {backup} — keeping memory.json in place")
+
+    print("Migration complete.")
+    print(f"  Active memories in DB : {active_count}")
+    print(f"  Written: {total_written}, Skipped (dup): {total_skipped}")
+    return
+
+
+def _migrate_rows(conn, data):
     total_written = 0
     total_skipped = 0
-
     for profile_name, profile_data in data.get("profiles", {}).items():
         conn.execute(
             "INSERT OR REPLACE INTO profiles VALUES (?,?,?,?)",
@@ -44,7 +78,12 @@ def migrate():
         )
 
         for mem in profile_data.get("memories", []):
-            h = _content_hash(mem.get("content", ""))
+            mem_id = mem.get("id")
+            content = mem.get("content")
+            if not mem_id or content is None:
+                total_skipped += 1
+                continue
+            h = _content_hash(content)
             try:
                 conn.execute(
                     """INSERT INTO memories
@@ -52,8 +91,9 @@ def migrate():
                         relevance_score,created_at,last_accessed,access_count,
                         tags,project_id,token_count)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (mem["id"], profile_name, mem["content"], h,
-                     mem["category"], mem["importance"],
+                    (mem_id, profile_name, content, h,
+                     mem.get("category", "general"),
+                     mem.get("importance", "medium"),
                      mem.get("relevance_score", 1.0),
                      mem.get("created_at", "2026-01-01"),
                      mem.get("last_accessed", "2026-01-01"),
@@ -67,7 +107,11 @@ def migrate():
                 total_skipped += 1
 
         for mem in profile_data.get("archived", []):
-            h = _content_hash(mem.get("content", ""))
+            mem_id = mem.get("id")
+            content = mem.get("content")
+            if not mem_id or content is None:
+                continue
+            h = _content_hash(content)
             try:
                 conn.execute(
                     """INSERT INTO memories
@@ -75,8 +119,9 @@ def migrate():
                         relevance_score,created_at,last_accessed,access_count,
                         tags,project_id,token_count,archived,archived_at,archive_reason)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)""",
-                    (mem["id"], profile_name, mem["content"], h,
-                     mem["category"], mem["importance"],
+                    (mem_id, profile_name, content, h,
+                     mem.get("category", "general"),
+                     mem.get("importance", "medium"),
                      mem.get("relevance_score", 1.0),
                      mem.get("created_at", "2026-01-01"),
                      mem.get("last_accessed", "2026-01-01"),
@@ -90,27 +135,7 @@ def migrate():
             except sqlite3.IntegrityError:
                 pass
 
-    # Rebuild FTS index from memories table
-    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
-    conn.commit()
-    conn.close()
-
-    active_count = sqlite3.connect(str(MEMORY_DB)).execute(
-        "SELECT COUNT(*) FROM memories WHERE archived=0"
-    ).fetchone()[0]
-
-    # Backup original JSON
-    backup = MEMORY_JSON.with_suffix(".json.pre-sqlite-backup")
-    if not backup.exists():
-        MEMORY_JSON.rename(backup)
-        print(f"Original backed up to {backup}")
-    else:
-        print(f"Backup already exists at {backup} — keeping memory.json in place")
-
-    print("Migration complete.")
-    print(f"  Active memories in DB : {active_count}")
-    print(f"  Inserted              : {total_written}")
-    print(f"  Skipped (duplicate)   : {total_skipped}")
+    return total_written, total_skipped
 
 
 if __name__ == "__main__":

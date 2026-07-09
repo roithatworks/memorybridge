@@ -1,11 +1,30 @@
 """Extraction-time filters: ephemeral noise + Hermes-infra plumbing trivia.
 Run: python -m pytest tests/unit/test_noise_filter.py -v
 """
+import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ingestion"))
 from extractor import _is_noise, _is_infra_trivia  # noqa: E402
+
+
+def test_config_noise_patterns_are_applied(tmp_path, monkeypatch):
+    """User-supplied noise_patterns from config extend the built-in set (#7)."""
+    import config
+    import extractor
+    (tmp_path / "memorybridge.json").write_text(
+        json.dumps({"noise_patterns": ["widget factory heartbeat"]}))
+    monkeypatch.setenv("MEMORYBRIDGE_DATA", str(tmp_path))
+    config.reset_cache()
+    extractor._NOISE_RE = None  # force rebuild with config applied
+    try:
+        assert _is_noise("widget factory heartbeat ok at 03:00")
+        assert not _is_noise("The user prefers concise summaries")
+    finally:
+        extractor._NOISE_RE = None
+        config.reset_cache()
 
 
 # --- ephemeral operational telemetry -> dropped ---------------------------

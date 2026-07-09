@@ -27,7 +27,12 @@ CREATE TABLE IF NOT EXISTS memories (
     token_count    INTEGER NOT NULL,
     archived       INTEGER NOT NULL DEFAULT 0,
     archived_at    TEXT,
-    archive_reason TEXT
+    archive_reason TEXT,
+    -- Temporal validity (supersession, #temporal). valid_until is set when a
+    -- newer fact replaces this one; superseded_by points at that newer memory.
+    -- A NULL valid_until means the fact is still current.
+    valid_until    TEXT,
+    superseded_by  TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_content_hash
@@ -70,6 +75,8 @@ CREATE TABLE IF NOT EXISTS access_log (
     details       TEXT,
     tokens_served INTEGER DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_access_profile ON access_log(profile);
+CREATE INDEX IF NOT EXISTS idx_access_ts ON access_log(ts);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -98,3 +105,4 @@ CREATE TABLE IF NOT EXISTS analytics_events (
 );
 CREATE INDEX IF NOT EXISTS idx_analytics_date ON analytics_events(session_date);
 CREATE INDEX IF NOT EXISTS idx_analytics_op   ON analytics_events(operation);
+CREATE INDEX IF NOT EXISTS idx_analytics_model ON analytics_events(model);
