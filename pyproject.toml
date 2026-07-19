@@ -22,6 +22,7 @@ classifiers = [
 # Upper bounds cap the next major so a fresh install can't pull a breaking release.
 dependencies = [
     "fastmcp>=2.0.0,<3.0.0",
+    "fastmcp>=3.2.0,<4.0.0",
     "tiktoken>=0.7.0,<1.0.0",
     "python-dotenv>=1.0.0,<2.0.0",
     "openai>=1.0.0,<3.0.0",
