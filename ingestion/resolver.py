@@ -109,7 +109,11 @@ def _resolve_one(client: anthropic.Anthropic, fact: dict) -> dict:
     msg = client.messages.create(
         model=_pick_model(client),
         max_tokens=256,
-        system=SYSTEM_PROMPT,
+        system=[{
+            "type": "text",
+            "text": SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
         messages=[{"role": "user", "content": _build_user_message(fact)}],
     )
     raw = msg.content[0].text.strip()
