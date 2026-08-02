@@ -26,6 +26,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from fastmcp import FastMCP
+import workspace
 from db.pruner import run_auto_prune, record_outcome, get_pruner_report
 from db.constants import VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score  # noqa: F401
 # Token counting, recency decay, and the model-export logic live in a
@@ -982,6 +983,84 @@ def export_passport(
     )
 
 
+# --------------------------------------------------------------------------- #
+# ws_* workspace tools (F1) — sandboxed scratch/reference filesystem for
+# non-Claude-Code MCP clients (ChatGPT, Gemini, Perplexity). See F1/F4 in
+# docs/MULTI_MODEL_FEATURES.md. Implementation lives in workspace.py; these
+# are thin @mcp.tool() wrappers, same pattern as get_memory/add_memory above.
+# --------------------------------------------------------------------------- #
+
+@mcp.tool()
+def ws_status() -> str:
+    """
+    Report the workspace root, file count, and current write allowlist.
+
+    Returns:
+        JSON with root path, file_count, and write_allowed prefixes.
+    """
+    return json.dumps(workspace.ws_status(), indent=2)
+
+
+@mcp.tool()
+def ws_list(path: str = "", recursive: bool = False) -> str:
+    """
+    List entries under the workspace (or a subdirectory of it).
+
+    Args:
+        path: Subdirectory relative to the workspace root (default: root)
+        recursive: If True, list all nested entries, not just the top level
+    Returns:
+        JSON with the listed path and its entries.
+    """
+    return json.dumps(workspace.ws_list(path, recursive=recursive), indent=2)
+
+
+@mcp.tool()
+def ws_read(path: str) -> str:
+    """
+    Read a text file from the workspace.
+
+    Args:
+        path: File path relative to the workspace root
+    Returns:
+        JSON with the file content, or a structured error (not found, binary).
+    """
+    return json.dumps(workspace.ws_read(path), indent=2)
+
+
+@mcp.tool()
+def ws_write(path: str, content: str, overwrite: bool = False) -> str:
+    """
+    Write a text file to the workspace. Deny-by-default: only paths under a
+    configured `workspace_write_allowed` prefix may be written.
+
+    Over the HTTP bridge (remote mode), overwrite=True is required even for
+    a brand-new file — see F4 in docs/MULTI_MODEL_FEATURES.md.
+
+    Args:
+        path: File path relative to the workspace root
+        content: Text content to write
+        overwrite: Required to replace an existing file (or, remotely, to write at all)
+    Returns:
+        JSON with bytes_written, or a structured error.
+    """
+    return json.dumps(workspace.ws_write(path, content, overwrite=overwrite), indent=2)
+
+
+@mcp.tool()
+def ws_search(query: str, path: str = "") -> str:
+    """
+    Search workspace text files for a substring match.
+
+    Args:
+        query: Plain substring to search for
+        path: Subdirectory relative to the workspace root (default: whole root)
+    Returns:
+        JSON with the query and the list of matching file paths.
+    """
+    return json.dumps(workspace.ws_search(query, path), indent=2)
+
+
 @mcp.tool()
 def ingest_from_inbox(
     profile: str = None,
@@ -1143,6 +1222,13 @@ def _start_parent_watchdog() -> None:
 REMOTE_ALLOWED_TOOLS = {
     "get_memory", "search_memory", "reflect", "add_memory",
     "list_projects", "export_passport",
+    # F1 workspace read tools — ws_write intentionally excluded here; it is
+    # added to this allowlist only once the F4 remote-write guard exists
+    # (it now does, in workspace.py, but per the F1/F4 doc the allowlist
+    # change and the guard must land in the same commit as a deliberate
+    # decision, not a byproduct of ws_write existing). See F4 acceptance
+    # criteria in docs/MULTI_MODEL_FEATURES.md.
+    "ws_status", "ws_list", "ws_read", "ws_search",
 }
 
 
@@ -1270,6 +1356,7 @@ def _run_http() -> None:
     # writes that arrive over this bridge (see add_memory / issue #37).
     global _REMOTE_MODE
     _REMOTE_MODE = True
+    workspace.set_remote_mode(True)  # F4: ws_write now requires overwrite=True
 
     token = os.environ.get("MEMORYBRIDGE_TOKEN", "").strip()
     if len(token) < 32:

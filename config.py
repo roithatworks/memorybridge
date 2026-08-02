@@ -46,12 +46,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # `project:` tags. Shape: {"variant spelling": "canonical"} (keys are matched
     # case-insensitively). Empty by default (unknown ids pass through unchanged).
     "project_aliases": {},
+
+    # Sandboxed root for the ws_* workspace tools (F1). Empty allowlist below
+    # means no writes permitted anywhere under it — deny by default; F1 ships
+    # read tools live, writes stay locked until a prefix is configured here.
+    "workspace_write_allowed": [],   # e.g. ["notes/", "scratch/"]
 }
 
 
 def data_dir() -> Path:
     """The mutable data directory (db, logs, inbox, config). Never the code dir."""
     return Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge")).expanduser()
+
+
+def workspace_root() -> Path:
+    """Sandboxed root for the ws_* workspace tools (F1). Never the code dir."""
+    return Path(os.environ.get(
+        "MEMORYBRIDGE_WORKSPACE_ROOT",
+        Path.home() / "memorybridge" / "workspace",
+    )).expanduser()
 
 
 def _find_config_file() -> Path | None:
@@ -126,3 +139,8 @@ def project_aliases() -> dict:
     """{variant_lower: canonical} project-name aliases from config."""
     raw = load().get("project_aliases", {}) or {}
     return {str(k).strip().lower(): v for k, v in raw.items()}
+
+
+# Alias kept for the ws_* tools (workspace.py) — same cached merged config as
+# load(), just named for what callers there are reading it for.
+load_config = load
