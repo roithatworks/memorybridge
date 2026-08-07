@@ -80,6 +80,23 @@ def _active_profile() -> str:
     return DEFAULT_PROFILE if _REMOTE_MODE else _current_profile
 
 
+def _caller_model() -> str:
+    """Best-effort caller identity for analytics/provenance (#180).
+
+    The capability-URL auth scheme (see _RateLimitAuthMiddleware) is one
+    shared secret for every remote client — there is no per-client credential
+    to distinguish ChatGPT from Gemini from Perplexity. _REMOTE_MODE is the
+    only real signal available today, so this can only say "claude" (stdio —
+    provably true) or "remote" (HTTP bridge — true that it's non-Claude-Code,
+    unknown which one). Previously every analytics event hardcoded "claude"
+    regardless of transport, so the analytics table had no record that a
+    non-Claude client had ever touched the system even when one demonstrably
+    had. True per-model attribution needs F2 (per-client bearer tokens,
+    docs/MULTI_MODEL_FEATURES.md) — this is the honest ceiling until then.
+    """
+    return "remote" if _REMOTE_MODE else "claude"
+
+
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
@@ -412,7 +429,7 @@ def get_memory(
     log_to_analytics(
         tokens_served=total_tokens_served,
         memories_returned=len(selected_memories),
-        model="claude",
+        model=_caller_model(),
         profile=profile,
         operation="get_memory"
     )
@@ -456,7 +473,7 @@ def add_memory(
         mid = _store.add_memory(profile, content,
                                 category=category, importance=importance,
                                 tags=tags, project_id=project_id,
-                                supersedes=supersedes)
+                                supersedes=supersedes, source=_caller_model())
     except GuardrailRejection as e:
         # Document-shaped content: return the structured error contract every
         # other validation path uses, instead of surfacing an unhandled MCP error.
@@ -544,7 +561,7 @@ def add_memories(
         try:
             mid = _store.add_memory(profile, fact,
                                     category=category, importance=importance,
-                                    project_id=project)
+                                    project_id=project, source=_caller_model())
         except GuardrailRejection as e:
             rejected.append({
                 "reason": str(e),
@@ -710,7 +727,7 @@ def search_memory(
     log_to_analytics(
         tokens_served=tokens_served,
         memories_returned=len(results),
-        model="claude",
+        model=_caller_model(),
         profile=profile,
         operation="search_memory"
     )
@@ -870,6 +887,26 @@ def prune_memories(
         "pruned_count": len(pruned_ids),
         "pruned_ids": pruned_ids,
         "profile": profile
+    }, indent=2)
+
+
+@mcp.tool()
+def list_profiles() -> str:
+    """
+    List available profile names. Read-only — does not switch the active
+    profile (see switch_profile for that; it stays local-only).
+
+    Remote clients are pinned to the default profile when no `profile`
+    argument is given, but tools like get_memory/search_memory DO honor an
+    explicit profile= argument remotely. This lets a remote client discover
+    what profile names exist to pass, instead of guessing blind (#180).
+
+    Returns:
+        JSON with the list of profile names and which one is the default.
+    """
+    return json.dumps({
+        "profiles": _store.list_profiles(),
+        "default_profile": DEFAULT_PROFILE,
     }, indent=2)
 
 
@@ -1303,6 +1340,22 @@ def _start_parent_watchdog() -> None:
 REMOTE_ALLOWED_TOOLS = {
     "get_memory", "search_memory", "reflect", "add_memory",
     "list_projects", "export_passport",
+    # export_for_model (#180): the ChatGPT/Gemini/Ollama-formatted exports
+    # exist specifically for non-Claude remote clients to consume, but were
+    # never reachable from the bridge those clients connect through — only
+    # Claude stdio and the Streamlit UI could call it, so using it remotely
+    # meant generating a blob locally and pasting it in by hand, the exact
+    # manual workflow the bridge exists to replace. Read-only, no new risk.
+    "export_for_model",
+    # list_profiles (#180): switch_profile stays excluded — it mutates
+    # _current_profile, global state a remote model shouldn't control. But
+    # get_memory/search_memory/etc. all accept an explicit profile= argument
+    # that IS honored remotely (remote mode only pins the *default* when one
+    # isn't given), so a remote client was access-unblocked but
+    # discovery-blind: it could reach a non-default profile if it happened to
+    # guess the name, with no way to learn what names exist. This is a
+    # read-only enumeration of names only — no identity/content/memory data.
+    "list_profiles",
     # F1 workspace read tools — ws_write intentionally excluded here; it is
     # added to this allowlist only once the F4 remote-write guard exists
     # (it now does, in workspace.py, but per the F1/F4 doc the allowlist

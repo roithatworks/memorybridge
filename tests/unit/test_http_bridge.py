@@ -31,6 +31,20 @@ def test_remote_allowlist_includes_read_and_add():
         assert tool in allow
 
 
+def test_remote_allowlist_includes_export_for_model_and_list_profiles():
+    # Regression (issue #180): export_for_model exists specifically for
+    # non-Claude remote clients to consume, but was unreachable from the
+    # bridge those clients connect through. list_profiles is new — a
+    # read-only enumeration so a remote client (pinned to the default
+    # profile, but able to pass an explicit profile= to get_memory/etc.) can
+    # discover what profile names exist instead of guessing blind.
+    allow = server.REMOTE_ALLOWED_TOOLS
+    assert "export_for_model" in allow
+    assert "list_profiles" in allow
+    # switch_profile mutates global _current_profile state — must stay local.
+    assert "switch_profile" not in allow
+
+
 # --------------------------------------------------------------------------
 # Remote-mode profile resolution (#70)
 # --------------------------------------------------------------------------
@@ -45,6 +59,49 @@ def test_active_profile_pins_default_in_remote_mode():
         assert server._active_profile() == server.DEFAULT_PROFILE  # remote: pinned
     finally:
         server._REMOTE_MODE, server._current_profile = orig_remote, orig_cur
+
+
+# --------------------------------------------------------------------------
+# Caller-model attribution + list_profiles (#180)
+# --------------------------------------------------------------------------
+
+def test_caller_model_reflects_remote_mode():
+    # Regression (issue #180): every analytics event and, now, every
+    # add_memory write hardcoded model="claude" regardless of transport — the
+    # analytics table had no record a non-Claude client had ever touched the
+    # system even when one demonstrably had (proven live against the running
+    # bridge during the audit). _caller_model() is the honest ceiling given
+    # the current shared-secret auth: "claude" only when it's provably true
+    # (stdio), "remote" otherwise (HTTP bridge — non-Claude-Code, but not
+    # which specific model).
+    orig_remote = server._REMOTE_MODE
+    try:
+        server._REMOTE_MODE = False
+        assert server._caller_model() == "claude"
+        server._REMOTE_MODE = True
+        assert server._caller_model() == "remote"
+    finally:
+        server._REMOTE_MODE = orig_remote
+
+
+def test_list_profiles_is_read_only_and_does_not_switch(tmp_path, monkeypatch):
+    from db.store import MemoryStore
+    s = MemoryStore(tmp_path / "list_profiles_test.db")
+    monkeypatch.setattr(server, "_store", s)
+    s.ensure_profile("default")
+    s.ensure_profile("consulting")
+    orig_cur = server._current_profile
+    try:
+        server._current_profile = "default"
+        import json
+        result = json.loads(server.list_profiles.fn())
+        assert set(result["profiles"]) >= {"default", "consulting"}
+        assert result["default_profile"] == server.DEFAULT_PROFILE
+        # Must not have switched anything — that's switch_profile's job, and
+        # switch_profile stays local-only precisely because it mutates this.
+        assert server._current_profile == "default"
+    finally:
+        server._current_profile = orig_cur
 
 
 # --------------------------------------------------------------------------

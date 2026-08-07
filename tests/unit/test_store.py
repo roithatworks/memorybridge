@@ -28,6 +28,26 @@ def test_add_and_retrieve(db):
     assert any(m["content"] == "Cale prefers dark mode" for m in mems)
 
 
+def test_add_memory_persists_source_provenance(db):
+    # Regression (issue #180): memories carried no record of which transport
+    # wrote them — every analytics event hardcoded model="claude" regardless
+    # of origin. source is the persisted counterpart to server.py's
+    # _caller_model(): "claude" for local stdio writes, "remote" for HTTP
+    # bridge writes (not which specific remote model — the shared-secret auth
+    # can't distinguish that), None when the caller doesn't pass one.
+    local_id = db.add_memory("default", "written locally by Claude",
+                             category="fact", source="claude")
+    remote_id = db.add_memory("default", "written over the HTTP bridge",
+                              category="fact", source="remote")
+    unset_id = db.add_memory("default", "written with no source arg",
+                             category="fact")
+    row = lambda mid: db._conn.execute(
+        "SELECT source FROM memories WHERE id=?", (mid,)).fetchone()
+    assert row(local_id)["source"] == "claude"
+    assert row(remote_id)["source"] == "remote"
+    assert row(unset_id)["source"] is None
+
+
 def test_duplicate_content_rejected(db):
     db.add_memory("default", "Cale prefers dark mode",
                   category="preference", importance="medium")

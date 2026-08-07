@@ -32,7 +32,15 @@ CREATE TABLE IF NOT EXISTS memories (
     -- newer fact replaces this one; superseded_by points at that newer memory.
     -- A NULL valid_until means the fact is still current.
     valid_until    TEXT,
-    superseded_by  TEXT
+    superseded_by  TEXT,
+    -- Write provenance (#180). "claude" = written over local stdio
+    -- (Claude Code/Desktop) — provably true, since that's the only
+    -- transport a stdio process serves. "remote" = written over the HTTP
+    -- bridge — provably non-Claude-Code, but NOT which specific model, since
+    -- the capability-URL auth scheme is one shared secret for every remote
+    -- client (see server.py's _caller_model). NULL for rows written before
+    -- this column existed.
+    source         TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_content_hash

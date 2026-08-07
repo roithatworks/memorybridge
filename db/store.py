@@ -348,7 +348,8 @@ class MemoryStore:
                    tags: list = None, project_id: str = None,
                    enforce_guardrail: bool = True,
                    skip_enrichment: bool = False,
-                   supersedes: list[str] | None = None) -> str | None:
+                   supersedes: list[str] | None = None,
+                   source: str | None = None) -> str | None:
         """Returns memory ID on success, None if exact duplicate.
 
         Raises GuardrailRejection if content is document-shaped (too long, too
@@ -363,6 +364,10 @@ class MemoryStore:
         it drops out of default retrieval but stays queryable as history. Use
         this when a fact CHANGES ("left the job", "moved cities") rather than
         when it is merely reworded (which the fuzzy merge handles).
+
+        *source* — write provenance (#180): "claude" (local stdio) or
+        "remote" (HTTP bridge) from server.py's _caller_model(). None for
+        internal/migration writes that don't go through an MCP tool call.
         """
         if enforce_guardrail:
             ok, reason = guardrail_check(content)
@@ -407,10 +412,10 @@ class MemoryStore:
                 self._conn.execute(
                     """INSERT INTO memories
                        (id,profile,content,content_hash,category,importance,
-                        created_at,last_accessed,tags,project_id,token_count)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        created_at,last_accessed,tags,project_id,token_count,source)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (mid, profile, content, h, category, importance,
-                     now, now, json.dumps(enriched_tags or []), project_id, tc)
+                     now, now, json.dumps(enriched_tags or []), project_id, tc, source)
                 )
                 # Supersession: invalidate the facts this one replaces, in the
                 # same transaction so the swap is atomic (#temporal).
@@ -1065,6 +1070,8 @@ class MemoryStore:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN valid_until TEXT")
             if "superseded_by" not in cols:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT")
+            if "source" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN source TEXT")
             pruner_log_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(pruner_log)").fetchall()}
             if pruner_log_cols and "content" not in pruner_log_cols:
                 self._conn.execute("ALTER TABLE pruner_log ADD COLUMN content TEXT")
