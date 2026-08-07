@@ -88,7 +88,10 @@ def test_maintenance_trims_logs_and_creates_indexes(tmp_path, monkeypatch):
 
     assert conn.execute("SELECT count(*) FROM access_log").fetchone()[0] == 1
     assert conn.execute("SELECT count(*) FROM analytics_events").fetchone()[0] == 1
-    assert conn.execute("SELECT count(*) FROM pruner_log").fetchone()[0] == 1
+    # pruner_log is exempt from trimming (#175) — it's the only durable record
+    # of what an irreversible auto-deletion destroyed. Both rows survive
+    # regardless of age.
+    assert conn.execute("SELECT count(*) FROM pruner_log").fetchone()[0] == 2
     # q1 (resolved + old) trimmed; q2 (unresolved) kept regardless of age
     assert conn.execute("SELECT count(*) FROM prune_queue").fetchone()[0] == 1
 

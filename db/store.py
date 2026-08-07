@@ -1065,6 +1065,9 @@ class MemoryStore:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN valid_until TEXT")
             if "superseded_by" not in cols:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT")
+            pruner_log_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(pruner_log)").fetchall()}
+            if pruner_log_cols and "content" not in pruner_log_cols:
+                self._conn.execute("ALTER TABLE pruner_log ADD COLUMN content TEXT")
         except Exception:
             pass
         try:
@@ -1073,10 +1076,14 @@ class MemoryStore:
             days = 90
         if days > 0:
             cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            # pruner_log is exempt (#175): it's the only durable record of what
+            # an auto-deletion destroyed. access_log/analytics_events are
+            # high-volume telemetry where 90 days is the right tradeoff;
+            # pruner_log is a low-volume audit trail of irreversible actions
+            # and should outlive the DELETE it describes.
             for sql, params in (
                 ("DELETE FROM access_log WHERE ts < ?", (cutoff,)),
                 ("DELETE FROM analytics_events WHERE created_at < ?", (cutoff,)),
-                ("DELETE FROM pruner_log WHERE created_at < ?", (cutoff,)),
                 ("DELETE FROM prune_queue WHERE resolved=1 AND resolved_at IS NOT NULL AND resolved_at < ?", (cutoff,)),
             ):
                 try:

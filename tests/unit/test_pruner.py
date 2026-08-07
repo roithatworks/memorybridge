@@ -184,9 +184,13 @@ class TestAutoExecuteRouting:
         assert len(result["auto_executed"]) == 0
         assert "mem_a" not in deleted
 
-    def test_auto_executes_when_above_threshold(self, conn):
-        # Use a non-review-only rule (stale_project_status) to exercise the
-        # auto-execute path. verbatim_subset is review-only (see next test).
+    def test_auto_executes_when_above_threshold(self, conn, monkeypatch):
+        # Both shipped rules are review-only as of #175 (see the two tests
+        # above), so exercising the auto-execute mechanism itself requires
+        # isolating it from REVIEW_ONLY_RULES rather than picking a rule that
+        # happens not to be in it.
+        import db.pruner as pruner_mod
+        monkeypatch.setattr(pruner_mod, "REVIEW_ONLY_RULES", set())
         conn.execute(
             "UPDATE pruner_rules SET confidence=0.90 WHERE rule_name='stale_project_status'"
         )
@@ -225,6 +229,116 @@ class TestAutoExecuteRouting:
             "SELECT COUNT(*) FROM prune_queue WHERE candidate_id='mem_a' AND resolved=0"
         ).fetchone()[0]
         assert count <= 1
+
+    def test_stale_project_status_is_review_only(self, conn):
+        # Regression (issue #175): stale_project_status previously auto-executed
+        # at 0.85+ confidence with no review gate. A single add_memory call
+        # collapsed an 11-deep project history to one row because every stale
+        # entry in the chain was individually a valid candidate. It must now
+        # behave like verbatim_subset — always queued, never auto-deleted,
+        # regardless of confidence.
+        conn.execute(
+            "UPDATE pruner_rules SET confidence=0.99 WHERE rule_name='stale_project_status'"
+        )
+        conn.commit()
+        _add(conn, "mem_old", "CAR site pre-launch",
+             category="project_status", project_id="car", days_ago=40)
+        _add(conn, "mem_new", "CAR site live",
+             category="project_status", project_id="car", days_ago=2)
+        deleted = {}
+        result = run_auto_prune(conn, "default", make_delete_fn(deleted))
+        assert len(result["auto_executed"]) == 0
+        assert "mem_old" not in deleted
+        assert len(result["queued"]) >= 1
+
+    def test_stale_project_status_chain_never_cascade_deletes(self, conn):
+        # Regression (issue #175): reproduces the actual 2026-07-23 incident
+        # shape — a sequential chain of project_status entries where each one
+        # (except the newest) is "stale with a newer entry". Before the fix,
+        # one run_auto_prune call would walk the whole chain and delete all
+        # but the last entry. After the fix, none are auto-deleted.
+        conn.execute(
+            "UPDATE pruner_rules SET confidence=0.99 WHERE rule_name='stale_project_status'"
+        )
+        conn.commit()
+        chain = ["mem_1", "mem_2", "mem_3", "mem_4", "mem_5"]
+        for i, mid in enumerate(chain):
+            days_ago = (len(chain) - i) * 10 + 31  # oldest first, all >30 days apart
+            _add(conn, mid, f"status update {i}",
+                 category="project_status", project_id="car", days_ago=days_ago)
+        deleted = {}
+        run_auto_prune(conn, "default", make_delete_fn(deleted))
+        assert deleted == {}
+        # All but the newest should be queued for human review instead.
+        queued_ids = {
+            r["candidate_id"] for r in
+            conn.execute("SELECT candidate_id FROM prune_queue WHERE resolved=0").fetchall()
+        }
+        assert queued_ids == set(chain[:-1])
+
+
+class TestSupersederRevalidation:
+    """Defense-in-depth: a candidate's recorded superseder must still exist
+    immediately before it is auto-deleted, not just at enumeration time. This
+    protects against another process/thread removing the superseder between
+    candidate discovery and this candidate's turn in the loop."""
+
+    def test_skips_delete_when_superseder_already_gone(self, conn, monkeypatch):
+        import db.pruner as pruner_mod
+        # Isolate this test from the review-only fix above — force the rule
+        # down the auto-execute path so the revalidation guard is what's
+        # actually under test here.
+        monkeypatch.setattr(pruner_mod, "REVIEW_ONLY_RULES", set())
+        conn.execute(
+            "UPDATE pruner_rules SET confidence=0.95 WHERE rule_name='stale_project_status'"
+        )
+        conn.commit()
+        _add(conn, "mem_candidate", "stale status")
+        # Note: no "mem_ghost" row exists in memories at all — simulates a
+        # superseder that vanished between enumeration and this candidate's
+        # turn in the loop.
+        fake_candidates = [{
+            "rule_name": "stale_project_status",
+            "candidate_id": "mem_candidate",
+            "superseded_by": "mem_ghost",
+            "reason": "test candidate with a missing superseder",
+            "tokens_freed": 30,
+            "candidate_importance": "medium",
+        }]
+        monkeypatch.setattr(pruner_mod, "find_stale_project_status",
+                            lambda conn, profile: fake_candidates)
+        monkeypatch.setattr(pruner_mod, "find_subset_candidates",
+                            lambda conn, profile: [])
+        deleted = {}
+        result = run_auto_prune(conn, "default", make_delete_fn(deleted))
+        assert "mem_candidate" not in deleted
+        assert len(result["auto_executed"]) == 0
+        assert len(result["queued"]) == 1
+
+
+class TestPrunerLogContent:
+    """Regression (issue #175): pruner_log recorded IDs only, never content —
+    once deleted, a memory's content was unrecoverable even in the audit
+    trail. Auto-deletions must capture the deleted content."""
+
+    def test_auto_deleted_logs_content(self, conn, monkeypatch):
+        import db.pruner as pruner_mod
+        monkeypatch.setattr(pruner_mod, "REVIEW_ONLY_RULES", set())
+        conn.execute(
+            "UPDATE pruner_rules SET confidence=0.90 WHERE rule_name='stale_project_status'"
+        )
+        conn.commit()
+        _add(conn, "mem_old", "CAR site pre-launch unique marker",
+             category="project_status", project_id="car", days_ago=40)
+        _add(conn, "mem_new", "CAR site live",
+             category="project_status", project_id="car", days_ago=2)
+        deleted = {}
+        run_auto_prune(conn, "default", make_delete_fn(deleted))
+        row = conn.execute(
+            "SELECT content FROM pruner_log WHERE candidate_id='mem_old' AND outcome='auto_deleted'"
+        ).fetchone()
+        assert row is not None
+        assert "CAR site pre-launch unique marker" in row["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +463,11 @@ class TestPrunerReport:
         assert "tokens_freed_this_period" in report
         assert "recalibration_changes" in report
 
-    def test_report_counts_auto_deleted(self, conn):
-        # stale_project_status still auto-executes (verbatim_subset is now
-        # review-only), so use it to produce an auto-deletion to count.
+    def test_report_counts_auto_deleted(self, conn, monkeypatch):
+        # Both shipped rules are review-only as of #175 — isolate the
+        # auto-execute mechanism to produce an auto-deletion to count.
+        import db.pruner as pruner_mod
+        monkeypatch.setattr(pruner_mod, "REVIEW_ONLY_RULES", set())
         conn.execute(
             "UPDATE pruner_rules SET confidence=0.90 WHERE rule_name='stale_project_status'"
         )

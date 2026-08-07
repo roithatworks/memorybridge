@@ -42,7 +42,15 @@ NEVER_AUTO_DELETE_IMPORTANCE = {"critical"}  # always queue, never auto-execute
 # the rule has become. verbatim_subset infers "the shorter fact is redundant"
 # from containment, which is often a refinement/exception rather than a true
 # duplicate — too risky to ever auto-delete unattended.
-REVIEW_ONLY_RULES = {"verbatim_subset"}
+#
+# stale_project_status joined this list after issue #175: a single add_memory
+# call auto-deleted an entire 11-deep project_status history down to one row,
+# because every entry in the chain (except the newest) independently qualifies
+# as "stale with a newer entry" and the rule had crossed AUTO_EXECUTE_THRESHOLD
+# with no review gate. Deletion is irreversible (db/store.py delete_memory is a
+# hard DELETE) — collapsing project history is exactly the kind of decision
+# that belongs in front of a human.
+REVIEW_ONLY_RULES = {"verbatim_subset", "stale_project_status"}
 
 RULE_NAMES = ["verbatim_subset", "stale_project_status"]
 
@@ -85,7 +93,8 @@ CREATE TABLE IF NOT EXISTS pruner_log (
     outcome     TEXT NOT NULL,
     tokens_freed INTEGER NOT NULL DEFAULT 0,
     triggered_by TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    content     TEXT
 );
 
 -- Indexes for the per-candidate lookups run on the add_memory write hot-path (#125).
@@ -287,11 +296,29 @@ def run_auto_prune(conn, profile: str, delete_fn, allow_auto_delete: bool = True
             continue
 
         review_only = rule_name in REVIEW_ONLY_RULES
-        if confidence >= AUTO_EXECUTE_THRESHOLD and allow_auto_delete and not review_only:
+        eligible_for_auto = confidence >= AUTO_EXECUTE_THRESHOLD and allow_auto_delete and not review_only
+
+        # Re-validate the superseder immediately before deleting, not just at
+        # enumeration time (#175 defense-in-depth): another process/thread
+        # could have removed it in between. If it's gone, fall back to queuing
+        # rather than deleting on a reference that no longer resolves.
+        superseder_gone = False
+        if eligible_for_auto and cand.get("superseded_by"):
+            still_there = conn.execute(
+                "SELECT 1 FROM memories WHERE id=?", (cand["superseded_by"],)
+            ).fetchone()
+            superseder_gone = still_there is None
+
+        content_row = conn.execute(
+            "SELECT content FROM memories WHERE id=?", (cand["candidate_id"],)
+        ).fetchone()
+        content = content_row["content"] if content_row else None
+
+        if eligible_for_auto and not superseder_gone:
             # Auto-execute
             tokens_freed = delete_fn(profile, cand["candidate_id"])
             _log_decision(conn, profile, rule_name, "delete", cand,
-                          "auto_deleted", tokens_freed, "auto_pruner", now)
+                          "auto_deleted", tokens_freed, "auto_pruner", now, content)
             conn.execute(
                 "UPDATE pruner_rules SET auto_count=auto_count+1, updated_at=? WHERE rule_name=?",
                 (now, rule_name)
@@ -305,6 +332,10 @@ def run_auto_prune(conn, profile: str, delete_fn, allow_auto_delete: bool = True
             })
         else:
             # Queue for human review
+            reason = cand["reason"]
+            if eligible_for_auto and superseder_gone:
+                reason += (f" [superseder {cand['superseded_by']} no longer exists — "
+                           "routed to review instead of auto-deleting]")
             qid = f"pq_{uuid.uuid4().hex[:8]}"
             conn.execute(
                 """INSERT INTO prune_queue
@@ -312,11 +343,11 @@ def run_auto_prune(conn, profile: str, delete_fn, allow_auto_delete: bool = True
                     confidence,suggested_action,created_at)
                    VALUES(?,?,?,?,?,?,?,?,?)""",
                 (qid, profile, rule_name, cand["candidate_id"],
-                 cand.get("superseded_by"), cand["reason"],
+                 cand.get("superseded_by"), reason,
                  confidence, "delete", now)
             )
             _log_decision(conn, profile, rule_name, "delete", cand,
-                          "queued", 0, "auto_pruner", now)
+                          "queued", 0, "auto_pruner", now, content)
             conn.execute(
                 "UPDATE pruner_rules SET queue_count=queue_count+1, updated_at=? WHERE rule_name=?",
                 (now, rule_name)
@@ -327,7 +358,7 @@ def run_auto_prune(conn, profile: str, delete_fn, allow_auto_delete: bool = True
                 "memory_id": cand["candidate_id"],
                 "rule": rule_name,
                 "confidence": round(confidence, 3),
-                "reason": cand["reason"],
+                "reason": reason,
             })
 
     return {"auto_executed": auto_executed, "queued": queued}
@@ -352,6 +383,11 @@ def record_outcome(conn, queue_id: str, approved: bool, delete_fn) -> dict:
     outcome = "user_approved" if approved else "user_rejected"
     tokens_freed = 0
 
+    content_row = conn.execute(
+        "SELECT content FROM memories WHERE id=?", (row["candidate_id"],)
+    ).fetchone()
+    content = content_row["content"] if content_row else None
+
     if approved:
         tokens_freed = delete_fn(row["profile"], row["candidate_id"])
 
@@ -366,7 +402,7 @@ def record_outcome(conn, queue_id: str, approved: bool, delete_fn) -> dict:
         conn, row["profile"], row["rule_name"], "delete",
         {"candidate_id": row["candidate_id"], "superseded_by": row["superseded_by"],
          "tokens_freed": tokens_freed},
-        outcome, tokens_freed, "human_review", now
+        outcome, tokens_freed, "human_review", now, content
     )
 
     # Recalibrate confidence
@@ -517,14 +553,19 @@ def get_pruner_report(conn, since_days: int = 7) -> dict:
 # ---------------------------------------------------------------------------
 
 def _log_decision(conn, profile, rule_name, action, cand,
-                  outcome, tokens_freed, triggered_by, now):
+                  outcome, tokens_freed, triggered_by, now, content=None):
+    """content: the candidate memory's content at decision time (issue #175 —
+    pruner_log previously recorded IDs only, so an auto-deleted memory's
+    content was unrecoverable once the row was gone). Optional so existing
+    callers (record_outcome) that pass a plain dict without a live conn
+    lookup still work."""
     lid = f"pl_{uuid.uuid4().hex[:8]}"
     conn.execute(
         """INSERT INTO pruner_log
            (id,profile,rule_name,action,candidate_id,superseded_by,
-            outcome,tokens_freed,triggered_by,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            outcome,tokens_freed,triggered_by,created_at,content)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (lid, profile, rule_name, action,
          cand["candidate_id"], cand.get("superseded_by"),
-         outcome, tokens_freed, triggered_by, now)
+         outcome, tokens_freed, triggered_by, now, content)
     )
