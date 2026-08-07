@@ -36,6 +36,7 @@ from exports import (  # noqa: E402
     count_tokens, apply_decay, DECAY_CONFIG,
     export_for_model as _export_for_model_impl,
     export_passport as _export_passport_impl,
+    UNTRUSTED_NOTICE,
 )
 
 # Initialize MCP server
@@ -338,6 +339,13 @@ def get_memory(
             "overhead_tokens": overhead_tokens
         }
     }
+    # Untrusted-data framing (#178): the memories above are content, not
+    # instructions — user-written notes, ingested excerpts, or memories
+    # written by another model over the HTTP bridge. Added as a field rather
+    # than mutating each memory's "content" (the Streamlit UI displays that
+    # value verbatim; literal delimiter tags would leak into it).
+    if selected_memories:
+        response["_security_notice"] = UNTRUSTED_NOTICE
 
     _store.log_access("get_memory", profile,
                       f"hint={context_hint}, cat={category}, budget={max_tokens}",
@@ -627,13 +635,17 @@ def search_memory(
         profile=profile,
         operation="search_memory"
     )
-    return json.dumps({
+    response = {
         "query": query,
         "profile": profile,
         "results": [_clean_result(m) for m in results],
         "total_matches": len(results),
         "tokens_served": tokens_served
-    }, indent=2)
+    }
+    # Untrusted-data framing (#178) — see the matching comment in get_memory.
+    if results:
+        response["_security_notice"] = UNTRUSTED_NOTICE
+    return json.dumps(response, indent=2)
 
 
 @mcp.tool()
