@@ -105,6 +105,54 @@ def test_list_profiles_is_read_only_and_does_not_switch(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Self-reported client_name (follow-on to #180)
+# --------------------------------------------------------------------------
+
+def test_sanitize_client_name():
+    assert server._sanitize_client_name("hermes") == "hermes"
+    assert server._sanitize_client_name("Hermes") == "hermes"
+    assert server._sanitize_client_name("  hermes  ") == "hermes"
+    assert server._sanitize_client_name("Hermes Agent!!") == "hermesagent"
+    assert server._sanitize_client_name("a" * 40) == "a" * 32
+    assert server._sanitize_client_name("") is None
+    assert server._sanitize_client_name("   ") is None
+    assert server._sanitize_client_name(None) is None
+    assert server._sanitize_client_name("!!!") is None  # sanitizes to empty
+
+
+def test_add_memory_tool_persists_sanitized_client_name(tmp_path, monkeypatch):
+    from db.store import MemoryStore
+    s = MemoryStore(tmp_path / "client_name_test.db")
+    monkeypatch.setattr(server, "_store", s)
+    s.ensure_profile("default")
+    monkeypatch.setattr(server, "_REMOTE_MODE", False)
+
+    import json
+    out = json.loads(server.add_memory.fn(
+        content="written by a second local agent",
+        profile="default", client_name="Hermes Agent",
+    ))
+    mid = out["memory_id"]
+    row = s._conn.execute("SELECT source, client_name FROM memories WHERE id=?", (mid,)).fetchone()
+    assert row["source"] == "claude"          # transport-derived, unaffected
+    assert row["client_name"] == "hermesagent"  # self-reported, sanitized
+
+
+def test_get_memory_serves_client_name_field(tmp_path, monkeypatch):
+    from db.store import MemoryStore
+    s = MemoryStore(tmp_path / "client_name_served_test.db")
+    monkeypatch.setattr(server, "_store", s)
+    s.ensure_profile("default")
+    s.add_memory("default", "written by hermes", category="fact",
+                source="claude", client_name="hermes")
+
+    import json
+    out = json.loads(server.get_memory.fn(profile="default"))
+    mems = out["memories"]
+    assert any(m.get("client_name") == "hermes" for m in mems)
+
+
+# --------------------------------------------------------------------------
 # Rate-limit + constant-time auth middleware
 # --------------------------------------------------------------------------
 

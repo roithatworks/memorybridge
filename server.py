@@ -97,6 +97,20 @@ def _caller_model() -> str:
     return "remote" if _REMOTE_MODE else "claude"
 
 
+def _sanitize_client_name(client_name: Optional[str]) -> Optional[str]:
+    """Clean a caller-supplied client_name (e.g. "hermes") before storage.
+
+    Unlike _caller_model()'s source, this is self-reported and unverified —
+    any caller can claim any name. Sanitizing keeps it a short identifying
+    label rather than arbitrary text: lowercased, [a-z0-9_-] only, <=32 chars.
+    Empty/whitespace-only/None all collapse to None (no label).
+    """
+    if not client_name:
+        return None
+    cleaned = re.sub(r"[^a-z0-9_-]", "", client_name.strip().lower())[:32]
+    return cleaned or None
+
+
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
@@ -248,7 +262,7 @@ def compress_memory(mem: dict, target_tokens: int = 50) -> dict:
 # =============================================================================
 
 _RESULT_FIELDS = {"id", "content", "category", "importance",
-                  "project_id", "tags", "token_count", "created_at"}
+                  "project_id", "tags", "token_count", "created_at", "client_name"}
 
 
 def _clean_result(mem: dict) -> dict:
@@ -444,7 +458,8 @@ def add_memory(
     tags: list[str] = None,
     project_id: Optional[str] = None,
     profile: str = None,
-    supersedes: list[str] = None
+    supersedes: list[str] = None,
+    client_name: Optional[str] = None
 ) -> str:
     """
     Add a new memory with automatic token counting and content-hash dedup.
@@ -460,6 +475,10 @@ def add_memory(
             fact changed (e.g. a job change, a moved deadline). Each is archived
             and stamped with a valid_until timestamp so it leaves normal recall
             but remains as history. Use for facts that changed, not rewordings.
+        client_name: Optional self-reported caller label (e.g. "hermes") for
+            multi-agent setups sharing this store over stdio. Distinct from
+            the transport-derived source field — unverified, sanitized to
+            lowercase [a-z0-9_-], max 32 chars.
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
@@ -473,7 +492,8 @@ def add_memory(
         mid = _store.add_memory(profile, content,
                                 category=category, importance=importance,
                                 tags=tags, project_id=project_id,
-                                supersedes=supersedes, source=_caller_model())
+                                supersedes=supersedes, source=_caller_model(),
+                                client_name=_sanitize_client_name(client_name))
     except GuardrailRejection as e:
         # Document-shaped content: return the structured error contract every
         # other validation path uses, instead of surfacing an unhandled MCP error.
@@ -522,7 +542,8 @@ def add_memories(
     category: str = "fact",
     importance: str = "medium",
     project: Optional[str] = None,
-    profile: str = None
+    profile: str = None,
+    client_name: Optional[str] = None
 ) -> str:
     """
     BATCH-ADD operation -- inserts multiple new memory rows. This does NOT edit
@@ -537,6 +558,8 @@ def add_memories(
         importance: Importance level for all facts
         project: Optional project association
         profile: Memory profile
+        client_name: Optional self-reported caller label (e.g. "hermes") —
+            see add_memory's client_name for details.
     Returns:
         Summary with all added memory IDs and total tokens
     """
@@ -561,7 +584,8 @@ def add_memories(
         try:
             mid = _store.add_memory(profile, fact,
                                     category=category, importance=importance,
-                                    project_id=project, source=_caller_model())
+                                    project_id=project, source=_caller_model(),
+                                    client_name=_sanitize_client_name(client_name))
         except GuardrailRejection as e:
             rejected.append({
                 "reason": str(e),

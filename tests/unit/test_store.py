@@ -48,6 +48,21 @@ def test_add_memory_persists_source_provenance(db):
     assert row(unset_id)["source"] is None
 
 
+def test_add_memory_persists_client_name(db):
+    # client_name is separate from source: self-reported (e.g. "hermes" for a
+    # second local agent sharing this store over stdio), unverified — a
+    # caller can claim anything. server.py sanitizes before it reaches here;
+    # the store just persists whatever it's given.
+    tagged_id = db.add_memory("default", "written by a second local agent",
+                              category="fact", source="claude", client_name="hermes")
+    unset_id = db.add_memory("default", "written with no client_name",
+                             category="fact", source="claude")
+    row = lambda mid: db._conn.execute(
+        "SELECT client_name FROM memories WHERE id=?", (mid,)).fetchone()
+    assert row(tagged_id)["client_name"] == "hermes"
+    assert row(unset_id)["client_name"] is None
+
+
 def test_duplicate_content_rejected(db):
     db.add_memory("default", "Cale prefers dark mode",
                   category="preference", importance="medium")

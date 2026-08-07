@@ -40,7 +40,15 @@ CREATE TABLE IF NOT EXISTS memories (
     -- the capability-URL auth scheme is one shared secret for every remote
     -- client (see server.py's _caller_model). NULL for rows written before
     -- this column existed.
-    source         TEXT
+    source         TEXT,
+    -- Self-reported client label (e.g. "hermes"), distinct from `source`.
+    -- `source` is transport-derived and can't be spoofed by the caller
+    -- (a stdio process really is local, an HTTP-bridge request really is
+    -- remote); `client_name` is whatever the caller says it is, unverified —
+    -- useful when you already trust your own multi-agent setup (Hermes,
+    -- a future second local agent) but not a substitute for real per-client
+    -- auth. Sanitized (lowercase, [a-z0-9_-], <=32 chars) on write.
+    client_name    TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_content_hash
