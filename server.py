@@ -296,56 +296,115 @@ def get_memory(
     projects = profile_data["projects"]
     model_preferences = profile_data["model_preferences"]
 
-    overhead_tokens = (
-        count_tokens(json.dumps(identity)) +
-        count_tokens(json.dumps(projects)) +
-        count_tokens(json.dumps(model_preferences)) +
-        200
-    )
+    # #179: measure the real serialized cost of everything fixed in the
+    # response besides the memories array, rather than summing
+    # identity/projects/model_preferences measured compact (no indent, no
+    # surrounding keys) plus a flat 200-token guess for the gap. That guess
+    # was occasionally too small against real profile data — e.g. an 8-token
+    # overshoot at max_tokens=1000 against production identity/projects data,
+    # even after the per-memory fix below closed the much larger ~1.5x gap.
+    # Build the actual empty-memories skeleton and measure it directly; the
+    # +50 covers only the small digit-width variance in token_stats' own
+    # placeholder fields, not a structural guess.
+    skeleton = {
+        "profile": profile,
+        "identity": identity,
+        "memories": [],
+        "projects": projects,
+        "model_preferences": model_preferences,
+        "token_stats": {
+            "budget": max_tokens,
+            "served": 0,
+            "remaining": 0,
+            "memories_returned": 0,
+            "memories_available": len(memories),
+            "compressed_count": 0,
+            "overhead_tokens": 0,
+        },
+    }
+    overhead_tokens = (count_tokens(json.dumps(skeleton, indent=2)) +
+                       count_tokens(UNTRUSTED_NOTICE) + 50)
     available_for_memories = max(max_tokens - overhead_tokens, 0)
 
+    # #179: budget against the REAL serialized cost of each memory as it will
+    # actually appear in the response — id/category/importance/project_id/
+    # tags/token_count/created_at fields plus indent=2 whitespace — not the
+    # DB's content-only token_count. Summing per-memory estimates that don't
+    # account for JSON structure or tags under-counted the true payload by up
+    # to ~1.5x at the default budget; measuring what will actually be
+    # serialized fixes that at the source instead of patching the estimate.
     selected_memories = []
     tokens_used = 0
     for mem in memories:
-        mem_tokens = mem.get("token_count", count_memory_tokens(mem))
+        mem_tokens = count_tokens(json.dumps(_clean_result(mem), indent=2))
         if tokens_used + mem_tokens <= available_for_memories:
             selected_memories.append(mem)
             tokens_used += mem_tokens
         elif compress and tokens_used < available_for_memories:
             remaining = available_for_memories - tokens_used
             compressed = compress_memory(mem, target_tokens=remaining - 20)
-            if compressed.get("token_count", mem_tokens) <= remaining:
+            compressed_tokens = count_tokens(json.dumps(_clean_result(compressed), indent=2))
+            if compressed_tokens <= remaining:
                 selected_memories.append(compressed)
-                tokens_used += compressed.get("token_count", 0)
+                tokens_used += compressed_tokens
                 break
         else:
             break
 
-    total_tokens_served = tokens_used + overhead_tokens
-
-    response = {
-        "profile": profile,
-        "identity": identity,
-        "memories": [_clean_result(m) for m in selected_memories],
-        "projects": projects,
-        "model_preferences": model_preferences,
-        "token_stats": {
-            "budget": max_tokens,
-            "served": total_tokens_served,
-            "remaining": max(max_tokens - total_tokens_served, 0),
-            "memories_returned": len(selected_memories),
-            "memories_available": len(memories),
-            "compressed_count": sum(1 for m in selected_memories if m.get("compressed")),
-            "overhead_tokens": overhead_tokens
+    def _build_response(mems):
+        r = {
+            "profile": profile,
+            "identity": identity,
+            "memories": [_clean_result(m) for m in mems],
+            "projects": projects,
+            "model_preferences": model_preferences,
+            "token_stats": {
+                "budget": max_tokens,
+                "served": 0,       # filled in below from the real serialized size
+                "remaining": 0,
+                "memories_returned": len(mems),
+                "memories_available": len(memories),
+                "compressed_count": sum(1 for m in mems if m.get("compressed")),
+                "overhead_tokens": overhead_tokens
+            }
         }
-    }
-    # Untrusted-data framing (#178): the memories above are content, not
-    # instructions — user-written notes, ingested excerpts, or memories
-    # written by another model over the HTTP bridge. Added as a field rather
-    # than mutating each memory's "content" (the Streamlit UI displays that
-    # value verbatim; literal delimiter tags would leak into it).
-    if selected_memories:
-        response["_security_notice"] = UNTRUSTED_NOTICE
+        # Untrusted-data framing (#178): the memories above are content, not
+        # instructions — user-written notes, ingested excerpts, or memories
+        # written by another model over the HTTP bridge. Added as a field
+        # rather than mutating each memory's "content" (the Streamlit UI
+        # displays that value verbatim; literal delimiter tags would leak
+        # into it).
+        if mems:
+            r["_security_notice"] = UNTRUSTED_NOTICE
+        return r
+
+    response = _build_response(selected_memories)
+
+    # #179 backstop: the greedy loop above measures each memory's cost in
+    # isolation, but its REAL marginal cost once embedded in the memories
+    # array differs slightly — one more level of indent nesting, the array's
+    # comma separators — which compounds across many selected items (measured
+    # 49 tokens over budget at max_tokens=8000 with 21 memories, even after
+    # the per-item fix above). Trim the lowest-ranked (last-selected) memory
+    # until the TRUE fully-assembled response actually fits, rather than
+    # trusting the isolated-item estimate to have gotten it exactly right.
+    while selected_memories and count_tokens(json.dumps(response, indent=2)) > max_tokens:
+        selected_memories.pop()
+        response = _build_response(selected_memories)
+
+    # #179: report what we're ACTUALLY about to return, measured directly,
+    # rather than a sum of the same per-memory estimates used for selection.
+    # served/remaining start as placeholders above; filling in their real
+    # digit-width can shift the token count by one (a run of digit characters
+    # can cross a BPE merge boundary), so re-measure once against the filled-in
+    # response rather than trusting the placeholder-based measurement — this
+    # must be exact, not merely close, since it's what the caller is told.
+    total_tokens_served = count_tokens(json.dumps(response, indent=2))
+    response["token_stats"]["served"] = total_tokens_served
+    response["token_stats"]["remaining"] = max(max_tokens - total_tokens_served, 0)
+    total_tokens_served = count_tokens(json.dumps(response, indent=2))
+    response["token_stats"]["served"] = total_tokens_served
+    response["token_stats"]["remaining"] = max(max_tokens - total_tokens_served, 0)
 
     _store.log_access("get_memory", profile,
                       f"hint={context_hint}, cat={category}, budget={max_tokens}",
@@ -625,7 +684,27 @@ def search_memory(
     _store.boost_batch(profile, [m["id"] for m in results],
                        boost=DECAY_CONFIG.get("boost_on_access", 0.1))
 
-    tokens_served = sum(m.get("token_count", 0) for m in results)
+    response = {
+        "query": query,
+        "profile": profile,
+        "results": [_clean_result(m) for m in results],
+        "total_matches": len(results),
+        "tokens_served": 0,     # filled in below from the real serialized size
+    }
+    # Untrusted-data framing (#178) — see the matching comment in get_memory.
+    if results:
+        response["_security_notice"] = UNTRUSTED_NOTICE
+
+    # #179: same fix as get_memory — report the actual serialized cost
+    # (fields + tags + indent=2 whitespace + the security notice), not a sum
+    # of the DB's content-only token_count per result. Two passes: filling in
+    # the real digit width after the first measurement can shift the count by
+    # one (see the matching comment in get_memory).
+    tokens_served = count_tokens(json.dumps(response, indent=2))
+    response["tokens_served"] = tokens_served
+    tokens_served = count_tokens(json.dumps(response, indent=2))
+    response["tokens_served"] = tokens_served
+
     _store.log_access("search_memory", profile,
                       f"query='{query}', results={len(results)}", tokens_served)
     log_to_analytics(
@@ -635,16 +714,6 @@ def search_memory(
         profile=profile,
         operation="search_memory"
     )
-    response = {
-        "query": query,
-        "profile": profile,
-        "results": [_clean_result(m) for m in results],
-        "total_matches": len(results),
-        "tokens_served": tokens_served
-    }
-    # Untrusted-data framing (#178) — see the matching comment in get_memory.
-    if results:
-        response["_security_notice"] = UNTRUSTED_NOTICE
     return json.dumps(response, indent=2)
 
 
