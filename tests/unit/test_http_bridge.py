@@ -98,3 +98,14 @@ def test_middleware_uses_constant_time_compare():
     # not ==, to avoid a timing oracle. Verify the primitive is wired in.
     assert secrets.compare_digest("a" * 40, "a" * 40) is True
     assert _status(_make_mw(TOKEN), f"/{'T' * 39}X/mcp", "7.7.7.7") == 404
+
+
+def test_middleware_non_ascii_path_returns_404_not_500():
+    # Regression (issue #177): secrets.compare_digest raises TypeError on a
+    # non-ASCII str, and that ran before auth — so any unauthenticated request
+    # with a percent-encoded non-ASCII path segment (uvicorn decodes the raw
+    # path as UTF-8 before the scope reaches this middleware) crashed the ASGI
+    # app with an unhandled 500 instead of the uniform 404 every other
+    # bad-token path gets. Live-reproduced against the running bridge:
+    # GET /%C3%A9/mcp -> 500. Must behave exactly like any other wrong token.
+    assert _status(_make_mw(TOKEN), "/é/mcp", "8.8.8.8") == 404

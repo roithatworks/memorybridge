@@ -1326,16 +1326,36 @@ class _RateLimitAuthMiddleware:
 
     def _token_ok(self, scope) -> bool:
         segment = scope.get("path", "").lstrip("/").split("/", 1)[0]
+        # secrets.compare_digest raises TypeError on a non-ASCII str rather
+        # than returning False (issue #177) — uvicorn decodes a percent-encoded
+        # non-ASCII path segment to UTF-8 before scope reaches here, so an
+        # unauthenticated request could crash this pre-auth check with a 500
+        # instead of the uniform 404 every other bad token gets.
+        if not segment.isascii():
+            return False
         return secrets.compare_digest(segment, self.expected_token)
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        if not self._rate_ok(self._client_ip(scope)):
+        # This is a pre-auth boundary parsing attacker-controlled input (path,
+        # headers) from the open internet. Any unexpected exception here must
+        # not become an unauthenticated 500 (issue #177) — that both discloses
+        # more than a uniform 404 and, since it's logged, is a free remote log
+        # amplification vector. Fail closed to 404, log the exception type only.
+        try:
+            rate_ok = self._rate_ok(self._client_ip(scope))
+            token_ok = self._token_ok(scope) if rate_ok else True
+        except Exception as e:
+            print(f"[memorybridge] auth middleware error (denying request): "
+                  f"{type(e).__name__}", file=sys.stderr)
+            await _send_plain(send, 404, "not found")
+            return
+        if not rate_ok:
             await _send_plain(send, 429, "rate limit exceeded")
             return
-        if not self._token_ok(scope):
+        if not token_ok:
             await _send_plain(send, 404, "not found")
             return
         await self.app(scope, receive, send)
