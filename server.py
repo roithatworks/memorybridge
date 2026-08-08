@@ -111,6 +111,28 @@ def _sanitize_client_name(client_name: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+def _resolve_client_name(client_name: Optional[str]) -> Optional[str]:
+    """Resolve the client_name to persist for an add_memory/add_memories call.
+
+    An explicit per-call argument always wins. Otherwise falls back to
+    MEMORYBRIDGE_CLIENT_NAME, a process-level default set on this specific
+    spawned server.py instance's environment (e.g. via `hermes mcp add
+    memorybridge --env MEMORYBRIDGE_CLIENT_NAME=hermes`).
+
+    This is the durable alternative to relying on a prompt instruction
+    (e.g. a HERMES.md rule telling an LLM caller to always pass
+    client_name="hermes"): a prompt only takes effect if it's actually
+    loaded for a given invocation and the LLM remembers to follow it on
+    every call. An env var set once on the process is unconditional — every
+    write from that spawned instance is labeled, with no cooperation
+    required from whatever is calling the tool.
+    """
+    explicit = _sanitize_client_name(client_name)
+    if explicit:
+        return explicit
+    return _sanitize_client_name(os.environ.get("MEMORYBRIDGE_CLIENT_NAME"))
+
+
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
@@ -478,7 +500,10 @@ def add_memory(
         client_name: Optional self-reported caller label (e.g. "hermes") for
             multi-agent setups sharing this store over stdio. Distinct from
             the transport-derived source field — unverified, sanitized to
-            lowercase [a-z0-9_-], max 32 chars.
+            lowercase [a-z0-9_-], max 32 chars. If omitted, falls back to
+            the MEMORYBRIDGE_CLIENT_NAME env var set on this process (a
+            durable per-instance default that doesn't depend on the caller
+            remembering to pass this argument).
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
@@ -493,7 +518,7 @@ def add_memory(
                                 category=category, importance=importance,
                                 tags=tags, project_id=project_id,
                                 supersedes=supersedes, source=_caller_model(),
-                                client_name=_sanitize_client_name(client_name))
+                                client_name=_resolve_client_name(client_name))
     except GuardrailRejection as e:
         # Document-shaped content: return the structured error contract every
         # other validation path uses, instead of surfacing an unhandled MCP error.
@@ -585,7 +610,7 @@ def add_memories(
             mid = _store.add_memory(profile, fact,
                                     category=category, importance=importance,
                                     project_id=project, source=_caller_model(),
-                                    client_name=_sanitize_client_name(client_name))
+                                    client_name=_resolve_client_name(client_name))
         except GuardrailRejection as e:
             rejected.append({
                 "reason": str(e),

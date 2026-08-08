@@ -120,6 +120,50 @@ def test_sanitize_client_name():
     assert server._sanitize_client_name("!!!") is None  # sanitizes to empty
 
 
+def test_resolve_client_name_explicit_beats_env(monkeypatch):
+    monkeypatch.setenv("MEMORYBRIDGE_CLIENT_NAME", "env-default")
+    assert server._resolve_client_name("hermes") == "hermes"
+
+
+def test_resolve_client_name_falls_back_to_env(monkeypatch):
+    # The durable path (issue: HERMES.md-style prompt instructions aren't
+    # enforced — an LLM caller can forget to pass client_name, or a rules
+    # file can fail to load). A process-level env var set once on the
+    # spawned server.py instance (e.g. `hermes mcp add memorybridge --env
+    # MEMORYBRIDGE_CLIENT_NAME=hermes`) labels every write unconditionally.
+    monkeypatch.setenv("MEMORYBRIDGE_CLIENT_NAME", "hermes")
+    assert server._resolve_client_name(None) == "hermes"
+    assert server._resolve_client_name("") == "hermes"
+
+
+def test_resolve_client_name_sanitizes_env_value_too(monkeypatch):
+    monkeypatch.setenv("MEMORYBRIDGE_CLIENT_NAME", "Hermes Agent!!")
+    assert server._resolve_client_name(None) == "hermesagent"
+
+
+def test_resolve_client_name_none_when_neither_set(monkeypatch):
+    monkeypatch.delenv("MEMORYBRIDGE_CLIENT_NAME", raising=False)
+    assert server._resolve_client_name(None) is None
+
+
+def test_add_memory_tool_uses_env_fallback_without_explicit_arg(tmp_path, monkeypatch):
+    from db.store import MemoryStore
+    s = MemoryStore(tmp_path / "client_name_env_test.db")
+    monkeypatch.setattr(server, "_store", s)
+    s.ensure_profile("default")
+    monkeypatch.setattr(server, "_REMOTE_MODE", False)
+    monkeypatch.setenv("MEMORYBRIDGE_CLIENT_NAME", "hermes")
+
+    import json
+    out = json.loads(server.add_memory.fn(
+        content="written with no explicit client_name argument",
+        profile="default",
+    ))
+    mid = out["memory_id"]
+    row = s._conn.execute("SELECT client_name FROM memories WHERE id=?", (mid,)).fetchone()
+    assert row["client_name"] == "hermes"
+
+
 def test_add_memory_tool_persists_sanitized_client_name(tmp_path, monkeypatch):
     from db.store import MemoryStore
     s = MemoryStore(tmp_path / "client_name_test.db")
