@@ -437,7 +437,8 @@ def recalibrate_thresholds(conn) -> list[dict]:
     for rule_name in RULE_NAMES:
         recent = conn.execute(
             """SELECT outcome FROM pruner_log
-               WHERE rule_name=? AND outcome IN ('user_approved','user_rejected')
+               WHERE rule_name=?
+                 AND (outcome LIKE 'user_approved%' OR outcome LIKE 'user_rejected%')
                ORDER BY created_at DESC LIMIT 20""",
             (rule_name,)
         ).fetchall()
@@ -445,7 +446,10 @@ def recalibrate_thresholds(conn) -> list[dict]:
         if not recent:
             continue
 
-        approvals = sum(1 for r in recent if r["outcome"] == "user_approved")
+        # Prefix match, not equality: outcome values can carry annotations (the
+        # 2026-09-12 record correction suffixed several), and an exact compare
+        # silently dropped those rows from calibration (issue #194).
+        approvals = sum(1 for r in recent if (r["outcome"] or "").startswith("user_approved"))
         rejections = len(recent) - approvals
 
         rule_row = conn.execute(
@@ -558,6 +562,17 @@ def autonomous_reverse_prune(conn, profile: str, memory_id: str, reason: str) ->
     Un-archives a memory autonomously and logs it as an auto_reversed action.
     If the rule that originally pruned it has caused >1 reversal in a rolling 30 days,
     its confidence is heavily penalized to require human review again.
+
+    Confidence recovery (issue #194): the penalty here is NOT permanent.
+    recalibrate_thresholds() nudges confidence upward on each subsequent
+    user_approved decision (clamped to MAX_CONFIDENCE), so a penalized rule earns
+    auto-execute back through continued correct behavior. This function and
+    recalibrate_thresholds are the only two writers of pruner_rules.confidence.
+
+    Lossless restore: depends on the memory still holding its embedding, so it is
+    visible to semantic search immediately. Store.purge_archived_embeddings()
+    guards a 30-day window for exactly this reason — reversing inside that window
+    needs no re-embed.
     """
     now = datetime.now()
     now_iso = now.isoformat()
@@ -567,10 +582,13 @@ def autonomous_reverse_prune(conn, profile: str, memory_id: str, reason: str) ->
     if not row or row["archived"] == 0:
         return {"error": f"Memory '{memory_id}' not found or not archived"}
     
-    # Find the most recent auto_deleted log for this memory to trace back the rule
+    # Find the most recent auto-prune record to trace back the rule. Matches
+    # both spellings: 'auto_deleted' (pre-#195 hard deletes) and 'auto_archived'
+    # (post-#195). Exact-match on one string silently missed the other.
     log_row = conn.execute(
         """SELECT rule_name, content FROM pruner_log 
-           WHERE candidate_id=? AND profile=? AND outcome='auto_deleted'
+           WHERE candidate_id=? AND profile=?
+             AND (outcome LIKE 'auto_deleted%' OR outcome LIKE 'auto_archived%')
            ORDER BY created_at DESC LIMIT 1""",
         (memory_id, profile)
     ).fetchone()
@@ -581,8 +599,14 @@ def autonomous_reverse_prune(conn, profile: str, memory_id: str, reason: str) ->
     rule_name = log_row["rule_name"]
     content = log_row["content"]
     
-    # Un-archive the memory
-    conn.execute("UPDATE memories SET archived=0 WHERE id=?", (memory_id,))
+    # Un-archive the memory. Profile-scoped to match the SELECT above and every
+    # other write path (issue #194 — the original omitted it). Clearing
+    # archived_at/archive_reason so the row is not left half-archived.
+    conn.execute(
+        "UPDATE memories SET archived=0, archived_at=NULL, archive_reason=NULL "
+        "WHERE id=? AND profile=?",
+        (memory_id, profile)
+    )
     
     # Log the reversal
     _log_decision(

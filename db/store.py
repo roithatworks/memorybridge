@@ -776,6 +776,43 @@ class MemoryStore:
         self._embedding_cache.invalidate(profile)
         return tc
 
+    def purge_archived_embeddings(self, older_than_days: int | None = 30) -> int:
+        """Delete embeddings belonging to archived memories (issue #192).
+
+        Guard: only memories archived longer ago than *older_than_days* are
+        purged. Purging a recently-archived memory's vector would leave it
+        invisible to semantic search after a reversal (see
+        autonomous_reverse_prune) until the next startup backfill re-embeds it
+        -- a silent blind spot. 30 days covers any realistic reversal window at
+        negligible storage cost.
+
+        Pass None to purge regardless of age.
+
+        Compared on date(archived_at) rather than a raw string compare:
+        archived_at is stored via isoformat() ("...T...") while SQLite's
+        datetime() emits a space separator, so a same-day string comparison
+        would misorder. date() normalizes both.
+
+        Returns the number of embedding rows deleted.
+        """
+        with self._conn.transaction():
+            if older_than_days is None:
+                cur = self._conn.execute(
+                    "DELETE FROM memory_embeddings WHERE id IN "
+                    "(SELECT id FROM memories WHERE archived=1)"
+                )
+            else:
+                cur = self._conn.execute(
+                    "DELETE FROM memory_embeddings WHERE id IN "
+                    "(SELECT id FROM memories WHERE archived=1 "
+                    " AND archived_at IS NOT NULL "
+                    " AND date(archived_at) < date('now', ?))",
+                    (f"-{int(older_than_days)} days",),
+                )
+            deleted = cur.rowcount
+            self._conn.commit()
+        return deleted
+
     # -------------------------------------------------------------------------
     # Memories — read
     # -------------------------------------------------------------------------

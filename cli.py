@@ -306,10 +306,10 @@ def cmd_maintain(args: argparse.Namespace) -> int:
         lambda p, mid: store.archive_memory(p, mid, reason="pruned: cli maintenance"),
         allow_auto_delete=True)
     print(f"  Duplicates / stale auto-pruned: {len(prune_res.get('auto_executed', []))}")
-    # 3. Purge archived embeddings (Issue #192)
-    store._conn.execute("DELETE FROM memory_embeddings WHERE id IN (SELECT id FROM memories WHERE archived=1)")
-    store._conn.commit()
-    print(f"  Orphaned embeddings cleaned up")
+    # 3. Purge archived embeddings (issue #192). Guarded to memories archived
+    #    longer than 30 days, so a recent reversal keeps its vector.
+    purged = store.purge_archived_embeddings(older_than_days=30)
+    print(f"  Archived embeddings purged (archived >30d): {purged}")
     if args.weekly:
         # 3. Low-score pruning
         budget_pruned = store.auto_prune(profile, threshold=0.15)
@@ -375,6 +375,37 @@ def cmd_edges(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reverse_prune(args: argparse.Namespace) -> int:
+    """Un-archive a pruned memory — the caller for autonomous_reverse_prune (#194).
+
+    db/pruner.py owns the policy (when/what to penalize); this is the entry point
+    that exercises it. Logged as 'auto_reversed' so the weekly audit can see it.
+    """
+    data = config.data_dir()
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    from db.store import MemoryStore
+    from db.pruner import autonomous_reverse_prune
+
+    store = MemoryStore(data / "memory.db")
+    profile = args.profile or "default"
+    store.ensure_profile(profile)
+
+    result = autonomous_reverse_prune(store._conn, profile, args.memory_id, args.reason)
+
+    if "error" in result:
+        print(f"  Reverse failed: {result['error']}")
+        return 1
+
+    print(f"  Reversed {args.memory_id} (rule: {result['rule_name']})")
+    print(f"  Reason: {result['reason']}")
+    if result["penalty_applied"]:
+        print(
+            f"  Rule '{result['rule_name']}' penalized: >1 reversal in 30d, "
+            f"confidence held below auto-execute until it re-earns it"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mb", description="MemoryBridge — cross-model memory server")
     sub = p.add_subparsers(dest="command", required=True)
@@ -409,6 +440,12 @@ def build_parser() -> argparse.ArgumentParser:
     mt.add_argument("--weekly", action="store_true", help="run weekly maintenance & health report")
     mt.add_argument("--profile", default="default", help="target profile")
     mt.set_defaults(func=cmd_maintain)
+
+    rv = sub.add_parser("reverse-prune", help="un-archive a pruned memory (autonomous reversal)")
+    rv.add_argument("memory_id", help="memory ID to un-archive")
+    rv.add_argument("--reason", required=True, help="why this prune is being reversed")
+    rv.add_argument("--profile", default="default", help="target profile")
+    rv.set_defaults(func=cmd_reverse_prune)
 
     edg = sub.add_parser("edges", help="manage knowledge graph edges")
     edg_sub = edg.add_subparsers(dest="action", required=True)
