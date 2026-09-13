@@ -306,7 +306,10 @@ def cmd_maintain(args: argparse.Namespace) -> int:
         lambda p, mid: store.archive_memory(p, mid, reason="pruned: cli maintenance"),
         allow_auto_delete=True)
     print(f"  Duplicates / stale auto-pruned: {len(prune_res.get('auto_executed', []))}")
-
+    # 3. Purge archived embeddings (Issue #192)
+    store._conn.execute("DELETE FROM memory_embeddings WHERE id IN (SELECT id FROM memories WHERE archived=1)")
+    store._conn.commit()
+    print(f"  Orphaned embeddings cleaned up")
     if args.weekly:
         # 3. Low-score pruning
         budget_pruned = store.auto_prune(profile, threshold=0.15)

@@ -448,6 +448,26 @@ class TestHumanFeedback:
         result2 = record_outcome(conn, "pq_test3", approved=True, delete_fn=make_delete_fn(deleted))
         assert "error" in result2
 
+    def test_phantom_candidate_fails(self, conn):
+        self._queue_item(conn, "pq_test_phantom", "mem_missing")
+        deleted = {}
+        result = record_outcome(conn, "pq_test_phantom", approved=True, delete_fn=make_delete_fn(deleted))
+        assert "error" in result
+        assert "missing or already archived" in result["error"]
+        assert "mem_missing" not in deleted
+
+    def test_already_archived_candidate_fails(self, conn):
+        _add(conn, "mem_archived", "old fact")
+        conn.execute("UPDATE memories SET archived=1 WHERE id='mem_archived'")
+        conn.commit()
+        
+        self._queue_item(conn, "pq_test_archived", "mem_archived")
+        deleted = {}
+        result = record_outcome(conn, "pq_test_archived", approved=True, delete_fn=make_delete_fn(deleted))
+        assert "error" in result
+        assert "missing or already archived" in result["error"]
+        assert "mem_archived" not in deleted
+
 
 # ---------------------------------------------------------------------------
 # Report generation

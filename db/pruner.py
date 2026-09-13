@@ -384,9 +384,13 @@ def record_outcome(conn, queue_id: str, approved: bool, delete_fn) -> dict:
     tokens_freed = 0
 
     content_row = conn.execute(
-        "SELECT content FROM memories WHERE id=?", (row["candidate_id"],)
+        "SELECT content, archived FROM memories WHERE id=?", (row["candidate_id"],)
     ).fetchone()
-    content = content_row["content"] if content_row else None
+    
+    if not content_row or content_row["archived"] == 1:
+        return {"error": f"Candidate '{row['candidate_id']}' is missing or already archived."}
+
+    content = content_row["content"]
 
     if approved:
         tokens_freed = delete_fn(row["profile"], row["candidate_id"])
@@ -549,6 +553,74 @@ def get_pruner_report(conn, since_days: int = 7) -> dict:
 
 
 # ---------------------------------------------------------------------------
+def autonomous_reverse_prune(conn, profile: str, memory_id: str, reason: str) -> dict:
+    """
+    Un-archives a memory autonomously and logs it as an auto_reversed action.
+    If the rule that originally pruned it has caused >1 reversal in a rolling 30 days,
+    its confidence is heavily penalized to require human review again.
+    """
+    now = datetime.now()
+    now_iso = now.isoformat()
+    
+    # Check if memory is currently archived
+    row = conn.execute("SELECT archived FROM memories WHERE id=? AND profile=?", (memory_id, profile)).fetchone()
+    if not row or row["archived"] == 0:
+        return {"error": f"Memory '{memory_id}' not found or not archived"}
+    
+    # Find the most recent auto_deleted log for this memory to trace back the rule
+    log_row = conn.execute(
+        """SELECT rule_name, content FROM pruner_log 
+           WHERE candidate_id=? AND profile=? AND outcome='auto_deleted'
+           ORDER BY created_at DESC LIMIT 1""",
+        (memory_id, profile)
+    ).fetchone()
+    
+    if not log_row:
+        return {"error": f"No auto-prune record found for '{memory_id}'"}
+        
+    rule_name = log_row["rule_name"]
+    content = log_row["content"]
+    
+    # Un-archive the memory
+    conn.execute("UPDATE memories SET archived=0 WHERE id=?", (memory_id,))
+    
+    # Log the reversal
+    _log_decision(
+        conn, profile, rule_name, "restore",
+        {"candidate_id": memory_id, "superseded_by": None},
+        "auto_reversed", 0, "autonomous_reversal", now_iso, content
+    )
+    
+    # Check if this rule has caused >1 reversal in the last 30 days
+    thirty_days_ago = (now - timedelta(days=30)).isoformat()
+    reversals = conn.execute(
+        """SELECT COUNT(*) FROM pruner_log 
+           WHERE rule_name=? AND outcome='auto_reversed' AND created_at >= ?""",
+        (rule_name, thirty_days_ago)
+    ).fetchone()[0]
+    
+    if reversals > 1:
+        # Penalize confidence: drop it below AUTO_EXECUTE_THRESHOLD (0.85) to force review
+        conn.execute(
+            """UPDATE pruner_rules 
+               SET confidence=0.75, updated_at=?
+               WHERE rule_name=?""",
+            (now_iso, rule_name)
+        )
+        penalty_applied = True
+    else:
+        penalty_applied = False
+        
+    conn.commit()
+    
+    return {
+        "status": "reversed",
+        "rule_name": rule_name,
+        "penalty_applied": penalty_applied,
+        "reason": reason
+    }
+
+
 # Internal helpers
 # ---------------------------------------------------------------------------
 

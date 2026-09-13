@@ -10,9 +10,11 @@
 # Status: /Users/cale/memorybridge/logs/groomer-status.txt
 # Alerts: macOS notification only when something needs attention.
 
-LOG="/Users/cale/memorybridge/logs/server.error.log"
-STATUS="/Users/cale/memorybridge/logs/groomer-status.txt"
-HISTORY="/Users/cale/memorybridge/logs/groomer-history.log"
+DATA_DIR="${MEMORYBRIDGE_DATA:-/Users/cale/memorybridge}"
+LOG="$DATA_DIR/logs/server.error.log"
+HTTP_LOG="$DATA_DIR/logs/http-bridge.error.log"
+STATUS="$DATA_DIR/logs/groomer-status.txt"
+HISTORY="$DATA_DIR/logs/groomer-history.log"
 MAX_BYTES=$((50 * 1024 * 1024))
 PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -36,9 +38,22 @@ sigs=$(tail -200 "$LOG" 2>/dev/null \
 [ -n "$sigs" ] && issues+=("crash signatures in last 200 lines")
 
 # 3. Truncate if oversized
-if [ "$size" -gt "$MAX_BYTES" ]; then
-  : > "$LOG"
-  issues+=("error log was ${human} (>50MB) — truncated")
+for l in "$LOG" "$HTTP_LOG"; do
+  if [ -f "$l" ]; then
+    l_size=$(stat -f%z "$l")
+    if [ "$l_size" -gt "$MAX_BYTES" ]; then
+      : > "$l"
+      issues+=("$(basename "$l") was oversized (>50MB) — truncated")
+      echo "truncated $(basename "$l")"
+    fi
+  fi
+done
+
+# 3.5 Cleanup stale .bak DB files
+bak_count=$(find "$DATA_DIR" -maxdepth 1 -name "memory.db.bak-*" -type f -mtime +13 2>/dev/null | wc -l | tr -d ' ')
+if [ "$bak_count" -gt 0 ]; then
+  find "$DATA_DIR" -maxdepth 1 -name "memory.db.bak-*" -type f -mtime +13 -delete 2>/dev/null
+  echo "Deleted $bak_count stale .bak DB file(s)"
 fi
 
 # 4. HTTP bridge on :8484
