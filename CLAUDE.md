@@ -12,7 +12,7 @@ Local-first MCP memory server (FastMCP v2). Cross-model memory portability via S
 
 - **server.py** — FastMCP MCP server entry point
 - **db/** — SQLite persistence layer (WAL mode, FTS5 search)
-- **ingestion/** — JSON conversation-export ingestion (Claude/ChatGPT/Gemini/Hermes) via DeepSeek extraction + Anthropic resolver; a watcher polls the inbox for new export files (Note: must be executed manually; automated trigger pending in issue #193)
+- **ingestion/** — JSON conversation-export ingestion (Claude/ChatGPT/Gemini/Hermes) via DeepSeek extraction + Anthropic resolver; a watcher automatically polls the inbox for new export files via a launchd agent (`com.memorybridge.ingestion-watcher`)
 - **scripts/** — admin/utility scripts
 - **ui/** — optional web interface
 

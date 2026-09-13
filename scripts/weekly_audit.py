@@ -6,7 +6,7 @@ import random
 from datetime import datetime, timedelta
 
 def main():
-    db_path = os.path.expanduser("~/GitHub/memorybridge/memory.db")
+    db_path = os.path.expanduser("~/memorybridge/memory.db")
     if not os.path.exists(db_path):
         print(f"Error: Database not found at {db_path}")
         sys.exit(1)
@@ -101,7 +101,7 @@ def main():
         report_lines.append("- No pruner logs this week to spot check.")
 
     report_content = "\n".join(report_lines)
-    report_path = os.path.expanduser("~/GitHub/memorybridge/weekly_audit_report.md")
+    report_path = os.path.expanduser("~/memorybridge/logs/weekly_audit_report.md")
     with open(report_path, "w") as f:
         f.write(report_content)
         
