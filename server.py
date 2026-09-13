@@ -555,8 +555,12 @@ def add_memory(
 
     # Adaptive dedup/staleness prune. Over the remote bridge, never auto-delete:
     # route candidates to the review queue so a remote write can't destroy data.
-    prune_result = run_auto_prune(_store._conn, profile, _store.delete_memory,
-                                  allow_auto_delete=not _REMOTE_MODE)
+    # Both paths ARCHIVE rather than delete (issue #195): a pruned memory leaves
+    # default retrieval but stays recoverable, per the archive-only policy.
+    prune_result = run_auto_prune(
+        _store._conn, profile,
+        lambda p, mid: _store.archive_memory(p, mid, reason="pruned: auto (dedup/stale)"),
+        allow_auto_delete=not _REMOTE_MODE)
 
     _store.log_access("add_memory", profile, f"id={mid}, tokens={token_count}")
 
@@ -1300,7 +1304,10 @@ def resolve_prune_queue(
     """
     profile = profile or _active_profile()
     _store.ensure_profile(profile)
-    result = record_outcome(_store._conn, queue_id, approved, _store.delete_memory)
+    # Archive, don't delete (issue #195) — an approved prune is reversible.
+    result = record_outcome(
+        _store._conn, queue_id, approved,
+        lambda p, mid: _store.archive_memory(p, mid, reason="pruned: reviewed queue approval"))
 
     if "error" in result:
         return json.dumps(result)

@@ -742,6 +742,40 @@ class MemoryStore:
         self._embedding_cache.invalidate(profile)
         return tc
 
+    def archive_memory(self, profile: str, memory_id: str,
+                       reason: str = "pruned") -> int:
+        """Archive (soft-delete) a memory. Returns token_count freed, or 0 if not found.
+
+        Counterpart to delete_memory for PRUNE paths. Drops the memory out of
+        default retrieval (every read path hardcodes archived=0) while keeping
+        the row recoverable, per the workspace archive-only policy.
+
+        Same return contract as delete_memory so it is a drop-in delete_fn for
+        db/pruner.py callers. Budget accounting needs no change: usage/budget
+        queries already count archived=0, so archiving frees budget identically.
+
+        The embeddings row is intentionally left in place (it is filtered by
+        the archived=0 join in search_semantic). Hard-deleting embeddings here
+        would make an un-archive lossy for no benefit.
+        """
+        with self._conn.transaction():
+            row = self._conn.execute(
+                "SELECT token_count FROM memories WHERE id=? AND profile=? AND archived=0",
+                (memory_id, profile)
+            ).fetchone()
+            if not row:
+                return 0
+            tc = row["token_count"]
+            now = datetime.now().isoformat()
+            self._conn.execute(
+                "UPDATE memories SET archived=1, archived_at=?, archive_reason=? "
+                "WHERE id=? AND profile=?",
+                (now, reason, memory_id, profile)
+            )
+            self._conn.commit()
+        self._embedding_cache.invalidate(profile)
+        return tc
+
     # -------------------------------------------------------------------------
     # Memories — read
     # -------------------------------------------------------------------------

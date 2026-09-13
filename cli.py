@@ -300,8 +300,11 @@ def cmd_maintain(args: argparse.Namespace) -> int:
         store._conn.commit()
     print(f"  Expired TTL memories purged: {expired_count}")
 
-    # 2. Dedup / Auto-prune
-    prune_res = run_auto_prune(store._conn, profile, store.delete_memory, allow_auto_delete=True)
+    # 2. Dedup / Auto-prune (archives, does not delete — issue #195)
+    prune_res = run_auto_prune(
+        store._conn, profile,
+        lambda p, mid: store.archive_memory(p, mid, reason="pruned: cli maintenance"),
+        allow_auto_delete=True)
     print(f"  Duplicates / stale auto-pruned: {len(prune_res.get('auto_executed', []))}")
 
     if args.weekly:
