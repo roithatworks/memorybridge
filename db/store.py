@@ -1106,8 +1106,8 @@ class MemoryStore:
     def get_rule_confidence_after(self, queue_id: str) -> dict | None:
         """Return rule_name and confidence for the pruner_rule linked to a queue item."""
         row = self._conn.execute(
-            """SELECT rule_name, confidence FROM pruner_rules
-               JOIN prune_queue ON pruner_rules.rule_name = prune_queue.rule_name
+            """SELECT pruner_rules.rule_name, pruner_rules.confidence FROM pruner_rules
+            JOIN prune_queue ON pruner_rules.rule_name = prune_queue.rule_name
                WHERE prune_queue.id = ?""",
             (queue_id,)
         ).fetchone()
