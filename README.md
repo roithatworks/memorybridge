@@ -308,10 +308,21 @@ tests/
 
 ## Tests
 
+Use the repo's `.venv` — Python 3.12 with the pinned `fastmcp`. Other
+interpreters on this machine have fastmcp 2.x, which `requirements.txt`
+explicitly rejects for CVE reasons, and a green run there is meaningless.
+
 ```bash
-pip install -e ".[dev]"
-python -m pytest tests/unit -q
+# one-time (or after requirements change)
+uv pip install --python .venv/bin/python -r requirements.txt -r requirements-dev.txt
+
+# run
+.venv/bin/python -m pytest tests/unit -q
 ```
+
+`tests/conftest.py` asserts this: it exits with the fix instructions if fastmcp
+is missing or below the pinned version, so a wrong interpreter fails loudly
+instead of passing.
 
 The gating unit suite runs in CI on Python 3.11 and 3.12.
 

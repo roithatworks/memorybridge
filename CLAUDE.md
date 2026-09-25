@@ -1,12 +1,16 @@
 # memorybridge
 
-Local-first MCP memory server (FastMCP v2). Cross-model memory portability via SQLite + FTS5.
+Local-first MCP memory server (FastMCP 3.x). Cross-model memory portability via SQLite + FTS5.
 
 ## Quick commands
 
+Use the repo's `.venv` (Python 3.12 + the pinned fastmcp). A bare `python` may
+resolve to an interpreter with fastmcp 2.x, which requirements.txt rejects for
+CVE reasons — a green run there proves nothing.
+
 - `fastmcp run server.py` — start server
-- `pip install -r requirements.txt` — install deps
-- `python -m pytest tests/` — run tests
+- `uv pip install --python .venv/bin/python -r requirements.txt -r requirements-dev.txt` — install deps
+- `.venv/bin/python -m pytest tests/ -q` — run tests
 
 ## Architecture
 
