@@ -1582,19 +1582,6 @@ class MemoryStore:
                                min_confidence=min_confidence)
         q_len = len(q_vec)
 
-        # Fetch embedding rows for profile, joined against memories to exclude
-        # archived ones (issue #181 P2-1): archived memories are unreachable
-        # via normal reads (archived=0 is hardcoded on every read path) but
-        # their embeddings were still being loaded and scored on every
-        # semantic search — pure wasted work once a memory is archived.
-        # Query confidence as well to do query-time filtering.
-        rows = self._conn.execute(
-            "SELECT e.id, e.vector, m.confidence FROM memory_embeddings e "
-            "JOIN memories m ON m.id = e.id "
-            "WHERE e.profile=? AND m.archived=0",
-            (profile,)
-        ).fetchall()
-
         # Score by cosine similarity. Collect usable same-dimension vectors into
         # one matrix and score them with a single vectorized matmul instead of a
         # Python-level cosine call per row (#54). Stale/unparseable vectors are
@@ -1606,6 +1593,19 @@ class MemoryStore:
             ids, confidences, M = cached
             mismatched = 0
         else:
+            # Fetch embedding rows for profile, joined against memories to exclude
+            # archived ones (issue #181 P2-1): archived memories are unreachable
+            # via normal reads (archived=0 is hardcoded on every read path) but
+            # their embeddings were still being loaded and scored on every
+            # semantic search — pure wasted work once a memory is archived.
+            # Query confidence as well to do query-time filtering.
+            rows = self._conn.execute(
+                "SELECT e.id, e.vector, m.confidence FROM memory_embeddings e "
+                "JOIN memories m ON m.id = e.id "
+                "WHERE e.profile=? AND m.archived=0",
+                (profile,)
+            ).fetchall()
+
             ids: list[str] = []
             confidences: list[float] = []
             mat: list[list[float]] = []
@@ -1932,9 +1932,11 @@ class MemoryStore:
         rows = self._conn.execute(
             """SELECT e.*, m1.content as source_content, m2.content as target_content
                FROM memory_edges e
-               LEFT JOIN memories m1 ON e.source_id = m1.id
-               LEFT JOIN memories m2 ON e.target_id = m2.id
-               WHERE e.source_id = ? OR e.target_id = ?
+               JOIN memories m1 ON e.source_id = m1.id
+               JOIN memories m2 ON e.target_id = m2.id
+               WHERE (e.source_id = ? OR e.target_id = ?)
+                 AND m1.archived = 0
+                 AND m2.archived = 0
                ORDER BY e.created_at DESC""",
             (memory_id, memory_id)
         ).fetchall()
