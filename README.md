@@ -79,6 +79,7 @@ your data dir (`mb init` writes a starter; full documented schema in
 
 | Setting | What it does |
 | --- | --- |
+| `profile` | The active memory profile (default `default`). Also `MEMORYBRIDGE_PROFILE`. Clients should read this rather than hardcoding the name. |
 | `max_total_tokens` | Token ceiling the store serves/holds (default 50000). Also `MEMORYBRIDGE_MAX_TOKENS`. |
 | `routing.domains` | Split memory by area. Each fact is scored against your keyword sets; best match wins, else `default`. **Off by default** — everything goes to `default` until you add domains. |
 | `routing.default_keywords` | Facts matching these are forced to `default` (cross-cutting identity/voice). |
@@ -91,6 +92,7 @@ people, and concepts (`{"entities": [{"tag": "acme", "names": ["Acme Corp"], "ty
 It merges with a small generic built-in seed.
 
 **Key environment variables:** `MEMORYBRIDGE_DATA` (data dir, default `~/memorybridge`),
+`MEMORYBRIDGE_PROFILE` (active profile, wins over the `profile` config key),
 `MEMORYBRIDGE_MAX_TOKENS`, `MEMORYBRIDGE_PORT` (HTTP bridge), `MEMORYBRIDGE_TOKEN`
 (HTTP bridge auth), `MEMORYBRIDGE_NO_EMBED` (skip the embedding model).
 

@@ -59,7 +59,12 @@ except (ImportError, OSError):
     pass
 
 MEMORY_DB              = DATA_DIR / "memory.db"
-DEFAULT_PROFILE        = "default"
+# The active profile is a config contract (config.py): MEMORYBRIDGE_PROFILE env
+# -> `profile:` in memorybridge.yaml -> "default". Resolve it, never hardcode the
+# literal — a pinned profile silently hides every other one (#197). Imported here,
+# after the .env load above, so a MEMORYBRIDGE_PROFILE set there still applies.
+import config as _config  # noqa: E402
+DEFAULT_PROFILE        = _config.profile()
 _current_profile       = DEFAULT_PROFILE
 # True only while serving over the HTTP bridge (remote clients). Gates the
 # auto-pruner's delete path so a remote-origin write can never destroy a
@@ -138,7 +143,7 @@ SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
 # Total-token ceiling is now configurable (config file `max_total_tokens` or
 # MEMORYBRIDGE_MAX_TOKENS env); defaults to 50000 for a fresh install (#7).
-import config as _config  # noqa: E402
+# (`config` is imported above, next to DEFAULT_PROFILE.)
 MAX_TOTAL_TOKENS       = _config.max_total_tokens()
 ARCHIVE_SCORE_THRESHOLD = 0.15
 
@@ -224,7 +229,7 @@ _store = MemoryStore(
 
 
 def log_to_analytics(tokens_served: int, memories_returned: int,
-                     model: str = "claude", profile: str = "default",
+                     model: str = "claude", profile: str = DEFAULT_PROFILE,
                      operation: str = "get_memory") -> None:
     """Write one analytics event directly to SQLite (issue #8: replaces buffered JSON)."""
     _store.log_analytics_event(

@@ -20,9 +20,23 @@ from pathlib import Path
 from typing import Any
 
 # --------------------------------------------------------------------------- #
+# Profile identity — the ONE place the fallback name lives.
+# --------------------------------------------------------------------------- #
+# Consumers (the MCP server, the CLI, and any external integration) must resolve
+# the active profile through profile() rather than hardcoding this literal. A
+# hardcoded profile silently hides every other profile from that consumer, with
+# no error and no log line — learned the hard way when a Hermes-side integration
+# pinned itself to "default" and could not see five other profiles. See #197.
+DEFAULT_PROFILE = "default"
+
+# --------------------------------------------------------------------------- #
 # Built-in defaults — a generic, single-profile setup with routing OFF.
 # --------------------------------------------------------------------------- #
 DEFAULT_CONFIG: dict[str, Any] = {
+    # Active memory profile. Override with MEMORYBRIDGE_PROFILE or config
+    # `profile`. Read via profile() — never as a literal.
+    "profile": DEFAULT_PROFILE,
+
     # Hard ceiling on total tokens the store will serve/hold before pruning
     # pressure. Override with MEMORYBRIDGE_MAX_TOKENS or config `max_total_tokens`.
     "max_total_tokens": 50000,
@@ -115,6 +129,9 @@ def load() -> dict:
             cfg["max_total_tokens"] = int(env_tokens)
         except ValueError:
             pass
+    env_profile = os.environ.get("MEMORYBRIDGE_PROFILE")
+    if env_profile and env_profile.strip():
+        cfg["profile"] = env_profile.strip()
     return cfg
 
 
@@ -125,6 +142,20 @@ def reset_cache() -> None:
 
 def max_total_tokens() -> int:
     return int(load().get("max_total_tokens", DEFAULT_CONFIG["max_total_tokens"]))
+
+
+def profile() -> str:
+    """The active memory profile.
+
+    Precedence: ``MEMORYBRIDGE_PROFILE`` env -> config ``profile`` ->
+    ``DEFAULT_PROFILE``. Blank/whitespace-only values at any level are ignored
+    rather than accepted, so an empty env var can't silently blank the profile.
+
+    Every consumer should call this instead of hardcoding ``"default"``.
+    """
+    value = load().get("profile", DEFAULT_PROFILE)
+    text = str(value).strip() if value is not None else ""
+    return text or DEFAULT_PROFILE
 
 
 def routing() -> dict:

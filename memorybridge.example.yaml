@@ -4,6 +4,18 @@
 # ~/memorybridge) and edit. Everything here is optional — MemoryBridge runs with
 # zero config. Prefer JSON? Use `memorybridge.json` with the same structure.
 
+# ---------------------------------------------------------------------------
+# Active memory profile.
+#
+# Most installs stay on "default" and never touch this. Set it when one process
+# serves several clients and you want them all pointed at the same scoped slice
+# of memory. Code should read the active profile through `config.profile()`
+# rather than hardcoding the name — a client that pins the literal silently
+# hides every other profile from itself, with no error. MEMORYBRIDGE_PROFILE in
+# the environment wins over this key.
+# ---------------------------------------------------------------------------
+profile: default
+
 # Hard ceiling on total tokens the store serves/holds. Also settable via the
 # MEMORYBRIDGE_MAX_TOKENS environment variable (which wins over this file).
 max_total_tokens: 50000

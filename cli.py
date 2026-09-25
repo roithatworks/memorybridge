@@ -50,6 +50,12 @@ ANTHROPIC_API_KEY=
 _CONFIG_TEMPLATE = """\
 # MemoryBridge config (optional — delete to fall back to defaults).
 # See memorybridge.example.yaml in the repo for the full documented schema.
+
+# Active memory profile. Every client should read this (rather than hardcoding
+# the name), so one setting moves the whole install. MEMORYBRIDGE_PROFILE in the
+# environment wins over this key.
+profile: default
+
 max_total_tokens: 50000
 
 # Domain auto-routing is OFF until you add domains here. Example:
@@ -83,12 +89,16 @@ def cmd_init(args: argparse.Namespace) -> int:
     else:
         print(f"  kept  {target} (already exists)")
 
-    # Create the store + a default profile (skip embedding model download).
+    # Create the store + the configured profile (skip embedding model download).
     os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
     from db.store import MemoryStore
     store = MemoryStore(data / "memory.db")
-    store.ensure_profile("default")
-    print(f"  ready {data / 'memory.db'} (profile 'default')")
+    # The starter config written above may set `profile`; drop the cached config
+    # so we read what we just wrote, not a pre-init load.
+    config.reset_cache()
+    active_profile = config.profile()
+    store.ensure_profile(active_profile)
+    print(f"  ready {data / 'memory.db'} (profile {active_profile!r})")
 
     snippet = {
         "mcpServers": {
@@ -197,7 +207,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
     from db.store import MemoryStore
     store = MemoryStore(db_path)
-    profile = args.profile or "default"
+    profile = args.profile or config.profile()
 
     week_ago = (datetime.now() - timedelta(days=7)).isoformat()
     rows = store._conn.execute(
@@ -271,7 +281,7 @@ def cmd_maintain(args: argparse.Namespace) -> int:
     from db.store import MemoryStore
     from db.pruner import run_auto_prune
     store = MemoryStore(data / "memory.db")
-    profile = args.profile or "default"
+    profile = args.profile or config.profile()
     store.ensure_profile(profile)
 
     mode = "weekly" if args.weekly else "nightly"
@@ -387,7 +397,7 @@ def cmd_reverse_prune(args: argparse.Namespace) -> int:
     from db.pruner import autonomous_reverse_prune
 
     store = MemoryStore(data / "memory.db")
-    profile = args.profile or "default"
+    profile = args.profile or config.profile()
     store.ensure_profile(profile)
 
     result = autonomous_reverse_prune(store._conn, profile, args.memory_id, args.reason)
@@ -420,14 +430,14 @@ def build_parser() -> argparse.ArgumentParser:
     ig.add_argument("--source", required=True, choices=["claude", "chatgpt", "gemini", "hermes"])
     ig.add_argument("--file")
     ig.add_argument("--days", type=int)
-    ig.add_argument("--profile", default="default")
+    ig.add_argument("--profile", default=config.profile())
     ig.add_argument("--preview", action="store_true")
     ig.set_defaults(func=cmd_ingest)
 
     sub.add_parser("ui", help="launch the Streamlit review UI").set_defaults(func=cmd_ui)
 
     stp = sub.add_parser("status", help="per-client activity: volume, 7-day delta, trust")
-    stp.add_argument("--profile", default="default", help="target profile")
+    stp.add_argument("--profile", default=config.profile(), help="target profile")
     stp.set_defaults(func=cmd_status)
 
     bk = sub.add_parser("backup", help="create, list, or verify VACUUM INTO backups")
@@ -438,13 +448,13 @@ def build_parser() -> argparse.ArgumentParser:
     mt = sub.add_parser("maintain", help="run background maintenance (TTL cleanup, dedup, pruning)")
     mt.add_argument("--nightly", action="store_true", help="run nightly maintenance (default)")
     mt.add_argument("--weekly", action="store_true", help="run weekly maintenance & health report")
-    mt.add_argument("--profile", default="default", help="target profile")
+    mt.add_argument("--profile", default=config.profile(), help="target profile")
     mt.set_defaults(func=cmd_maintain)
 
     rv = sub.add_parser("reverse-prune", help="un-archive a pruned memory (autonomous reversal)")
     rv.add_argument("memory_id", help="memory ID to un-archive")
     rv.add_argument("--reason", required=True, help="why this prune is being reversed")
-    rv.add_argument("--profile", default="default", help="target profile")
+    rv.add_argument("--profile", default=config.profile(), help="target profile")
     rv.set_defaults(func=cmd_reverse_prune)
 
     edg = sub.add_parser("edges", help="manage knowledge graph edges")
