@@ -300,13 +300,34 @@ def cmd_maintain(args: argparse.Namespace) -> int:
 
     # 1. Purge expired TTL memories
     now_iso = datetime.now().isoformat()
+    expired_count = 0
+    from db.pruner import _log_decision
     with store._conn.transaction():
-        cur = store._conn.execute(
-            "UPDATE memories SET archived=1, archived_at=?, archive_reason='TTL expired' "
+        expired = store._conn.execute(
+            "SELECT id, content, token_count FROM memories "
             "WHERE profile=? AND archived=0 AND expires_at IS NOT NULL AND expires_at < ?",
-            (now_iso, profile, now_iso)
-        )
-        expired_count = cur.rowcount
+            (profile, now_iso)
+        ).fetchall()
+        
+        for row in expired:
+            mid = row["id"]
+            store._conn.execute(
+                "UPDATE memories SET archived=1, archived_at=?, archive_reason='ttl_expired' "
+                "WHERE id=? AND profile=?",
+                (now_iso, mid, profile)
+            )
+            _log_decision(
+                store._conn, profile, "ttl_expired", "archive",
+                {"candidate_id": mid, "superseded_by": None},
+                "auto_archived", row["token_count"], "ttl_eviction", now_iso, row["content"]
+            )
+            expired_count += 1
+            
+        if expired_count > 0:
+            store._conn.execute(
+                "UPDATE pruner_rules SET auto_count=auto_count+?, updated_at=? WHERE rule_name='ttl_expired'",
+                (expired_count, now_iso)
+            )
         store._conn.commit()
     print(f"  Expired TTL memories purged: {expired_count}")
 

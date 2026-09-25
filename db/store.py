@@ -1007,7 +1007,7 @@ class MemoryStore:
         """Archive memories whose decay-adjusted score is below threshold."""
         now = datetime.now()
         rows = self._conn.execute(
-            "SELECT id, relevance_score, importance, access_count, created_at "
+            "SELECT id, content, token_count, relevance_score, importance, access_count, created_at "
             "FROM memories WHERE profile=? AND archived=0", (profile,)
         ).fetchall()
 
@@ -1015,19 +1015,34 @@ class MemoryStore:
         for row in rows:
             score = effective_score(dict(row), now)
             if score < threshold:
-                to_archive.append(row["id"])
+                to_archive.append(row)
 
+        archived_ids = []
         if to_archive:
             now_str = now.isoformat()
+            from db.pruner import _log_decision
             with self._conn.transaction():
-                self._conn.executemany(
-                    "UPDATE memories SET archived=1, archived_at=?, "
-                    "archive_reason='auto_prune_low_score' WHERE id=?",
-                    [(now_str, mid) for mid in to_archive]
+                for row in to_archive:
+                    mid = row["id"]
+                    self._conn.execute(
+                        "UPDATE memories SET archived=1, archived_at=?, "
+                        "archive_reason='auto_prune_low_score' WHERE id=?",
+                        (now_str, mid)
+                    )
+                    _log_decision(
+                        self._conn, profile, "auto_prune_low_score", "archive",
+                        {"candidate_id": mid, "superseded_by": None},
+                        "auto_archived", row["token_count"], "budget_eviction", now_str, row["content"]
+                    )
+                    archived_ids.append(mid)
+                
+                self._conn.execute(
+                    "UPDATE pruner_rules SET auto_count=auto_count+?, updated_at=? WHERE rule_name='auto_prune_low_score'",
+                    (len(to_archive), now_str)
                 )
                 self._conn.commit()
             self._embedding_cache.invalidate(profile)
-        return to_archive
+        return archived_ids
 
     # -------------------------------------------------------------------------
     # Access log

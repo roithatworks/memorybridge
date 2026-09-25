@@ -52,7 +52,7 @@ NEVER_AUTO_DELETE_IMPORTANCE = {"critical"}  # always queue, never auto-execute
 # that belongs in front of a human.
 REVIEW_ONLY_RULES = {"verbatim_subset", "stale_project_status"}
 
-RULE_NAMES = ["verbatim_subset", "stale_project_status"]
+RULE_NAMES = ["verbatim_subset", "stale_project_status", "auto_prune_low_score", "ttl_expired"]
 
 
 # ---------------------------------------------------------------------------
