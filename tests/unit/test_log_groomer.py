@@ -7,6 +7,13 @@ already fixed under issue #177 (both logs are in the LOGS array with a
 one-off scripts (backfill-tags.py, backfill-entities.py) each write a
 timestamped memory.db.bak-<label>-<ts> before mutating the DB, and nothing
 ever deleted them (53MB of stale .bak DBs accumulated per the issue).
+
+NOTE on the issue numbers above: #177 and #181 do not resolve to those
+topics in this repo's tracker, so treat them as unreliable provenance. The
+rotation test below is load-bearing regardless -- it was the only thing
+catching a real portability bug (#197): the size lookup used BSD-only
+`stat -f%z`, which yields empty output on GNU stat, so rotation silently
+never happened on Linux/CI while passing on macOS.
 """
 import os
 import subprocess

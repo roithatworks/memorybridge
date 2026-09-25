@@ -3,11 +3,14 @@
 # "memorybridge-log-groomer" (retired 2026-09-06 to cut nightly token cost).
 #
 # Observe-and-report only. NEVER kills processes (see repo history: the old
-# task killed live servers out from under sessions). Only write action is
-# truncating server.error.log when it exceeds 50MB.
+# task killed live servers out from under sessions). Write actions are limited to
+# truncating the two error logs in the LOGS loop below when they exceed 50MB, and
+# deleting stale memory.db.bak-* files older than 13 days.
 #
-# Installed as launchd agent com.memorybridge.log-groomer (3:10 AM daily).
-# Status: /Users/cale/memorybridge/logs/groomer-status.txt
+# Scheduling: scripts/com.memorybridge.log-groomer.plist runs this daily at 3:10 AM.
+# It is NOT installed automatically — copy it to ~/Library/LaunchAgents/ and load
+# it, or nothing in this file ever runs.
+# Status: $DATA_DIR/logs/groomer-status.txt
 # Alerts: macOS notification only when something needs attention.
 
 DATA_DIR="${MEMORYBRIDGE_DATA:-/Users/cale/memorybridge}"
@@ -18,16 +21,23 @@ HISTORY="$DATA_DIR/logs/groomer-history.log"
 MAX_BYTES=$((50 * 1024 * 1024))
 PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
+# Portable byte size. `stat -f%z` is BSD/macOS-only — GNU stat reads -f as
+# "filesystem status" and %z as a *filename*, so it fails with empty stdout. That
+# made the truncation check below unable to fire on Linux (and CI) while working
+# fine on macOS: silent, and it went unnoticed for months (#197). `wc -c` is POSIX.
+file_size() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
 issues=()
 notes=()
 
 # 1. Log size
 if [ -f "$LOG" ]; then
-  size=$(stat -f%z "$LOG")
+  size=$(file_size "$LOG")
 else
   size=0
   notes+=("error log not found")
 fi
+[ -z "$size" ] && size=0
 human=$(du -sh "$LOG" 2>/dev/null | cut -f1)
 [ -z "$human" ] && human="0"
 
@@ -39,14 +49,21 @@ sigs=$(tail -200 "$LOG" 2>/dev/null \
 
 # 3. Truncate if oversized
 for l in "$LOG" "$HTTP_LOG"; do
-  if [ -f "$l" ]; then
-    l_size=$(stat -f%z "$l")
-    if [ "$l_size" -gt "$MAX_BYTES" ]; then
-      : > "$l"
-      issues+=("$(basename "$l") was oversized (>50MB) — truncated")
-      echo "truncated $(basename "$l")"
-    fi
-  fi
+  [ -f "$l" ] || continue
+  l_size=$(file_size "$l")
+  # A blank or non-numeric size means the lookup failed. Report it loudly rather
+  # than falling through: silently skipping rotation is exactly how an oversized
+  # log grows without bound (#197).
+  case "$l_size" in
+    ''|*[!0-9]*)
+      issues+=("could not size $(basename "$l") — rotation skipped") ;;
+    *)
+      if [ "$l_size" -gt "$MAX_BYTES" ]; then
+        : > "$l"
+        issues+=("$(basename "$l") was oversized (>50MB) — truncated")
+        echo "truncated $(basename "$l")"
+      fi ;;
+  esac
 done
 
 # 3.5 Cleanup stale .bak DB files
