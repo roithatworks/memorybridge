@@ -110,6 +110,7 @@ your data dir (`mb init` writes a starter; full documented schema in
 
 | Setting | What it does |
 | --- | --- |
+| `profile` | The active memory profile (default `default`). Also `MEMORYBRIDGE_PROFILE`. Clients should read this rather than hardcoding the name. |
 | `max_total_tokens` | Token ceiling the store serves/holds (default 50000). Also `MEMORYBRIDGE_MAX_TOKENS`. |
 | `routing.domains` | Split memory by area. Each fact is scored against your keyword sets; best match wins, else `default`. **Off by default** — everything goes to `default` until you add domains. |
 | `routing.default_keywords` | Facts matching these are forced to `default` (cross-cutting identity/voice). |
@@ -122,6 +123,7 @@ people, and concepts (`{"entities": [{"tag": "acme", "names": ["Acme Corp"], "ty
 It merges with a small generic built-in seed.
 
 **Key environment variables:** `MEMORYBRIDGE_DATA` (data dir, default `~/memorybridge`),
+`MEMORYBRIDGE_PROFILE` (active profile, wins over the `profile` config key),
 `MEMORYBRIDGE_MAX_TOKENS`, `MEMORYBRIDGE_PORT` (HTTP bridge), `MEMORYBRIDGE_TOKEN`
 (HTTP bridge auth), `MEMORYBRIDGE_NO_EMBED` (skip the embedding model).
 
@@ -337,10 +339,21 @@ tests/
 
 ## Tests
 
+Use the repo's `.venv` — Python 3.12 with the pinned `fastmcp`. Other
+interpreters on this machine have fastmcp 2.x, which `requirements.txt`
+explicitly rejects for CVE reasons, and a green run there is meaningless.
+
 ```bash
-pip install -e ".[dev]"
-python -m pytest tests/unit -q
+# one-time (or after requirements change)
+uv pip install --python .venv/bin/python -r requirements.txt -r requirements-dev.txt
+
+# run
+.venv/bin/python -m pytest tests/unit -q
 ```
+
+`tests/conftest.py` asserts this: it exits with the fix instructions if fastmcp
+is missing or below the pinned version, so a wrong interpreter fails loudly
+instead of passing.
 
 The gating unit suite runs in CI on Python 3.11 and 3.12.
 

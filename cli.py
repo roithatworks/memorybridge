@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import config
+from config import DEFAULT_PROFILE
 
 
 # --------------------------------------------------------------------------- #
@@ -54,7 +55,7 @@ _CONFIG_TEMPLATE = """\
 # Active memory profile. Every client should read this (rather than hardcoding
 # the name), so one setting moves the whole install. MEMORYBRIDGE_PROFILE in the
 # environment wins over this key.
-profile: default
+profile: """ + DEFAULT_PROFILE + """
 
 max_total_tokens: 50000
 
