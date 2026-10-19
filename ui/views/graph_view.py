@@ -32,9 +32,15 @@ def render():
             
             if st.form_submit_button("Create Edge"):
                 if src and tgt and rel:
-                    store.add_edge(src, tgt, rel)
-                    st.success("Edge created!")
-                    st.rerun()
+                    import sqlite3
+                    try:
+                        store.add_edge(src.strip(), tgt.strip(), rel.strip())
+                        st.success("Edge created!")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("Invalid Source or Target Memory ID (must exist in active memories).")
+                    except Exception as e:
+                        st.error(f"Failed to create edge: {e}")
                 else:
                     st.error("All fields are required.")
 

@@ -23,7 +23,8 @@ from datetime import datetime, timedelta
 
 
 def main():
-    db_path = os.path.expanduser("~/memorybridge/memory.db")
+    data_dir = os.environ.get("MEMORYBRIDGE_DATA", os.path.expanduser("~/memorybridge"))
+    db_path = os.path.join(data_dir, "memory.db")
     if not os.path.exists(db_path):
         print(f"Error: Database not found at {db_path}")
         sys.exit(1)

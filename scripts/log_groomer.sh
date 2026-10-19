@@ -13,7 +13,7 @@
 # Status: $DATA_DIR/logs/groomer-status.txt
 # Alerts: macOS notification only when something needs attention.
 
-DATA_DIR="${MEMORYBRIDGE_DATA:-/Users/cale/memorybridge}"
+DATA_DIR="${MEMORYBRIDGE_DATA:-$HOME/memorybridge}"
 LOG="$DATA_DIR/logs/server.error.log"
 HTTP_LOG="$DATA_DIR/logs/http-bridge.error.log"
 STATUS="$DATA_DIR/logs/groomer-status.txt"
