@@ -244,7 +244,12 @@ class MemoryStore:
         fallback.
         """
         self._path = db_path
-        self._entity_extractor = entity_extractor
+        if entity_extractor is False:
+            self._entity_extractor = None
+        elif entity_extractor is None:
+            self._entity_extractor = EntityExtractor()
+        else:
+            self._entity_extractor = entity_extractor
         self._merge_threshold = merge_threshold
         self._merge_min_tags = merge_min_tags
         self._recency_decay_days = recency_decay_days
@@ -338,6 +343,11 @@ class MemoryStore:
                 target=self._backfill_missing_embeddings,
                 daemon=True, name="embedding-backfill"
             ).start()
+
+    @property
+    def path(self) -> Path:
+        """Return the filesystem Path to the underlying SQLite database."""
+        return self._path
 
     # -------------------------------------------------------------------------
     # Profiles
@@ -500,15 +510,24 @@ class MemoryStore:
                 # Supersession: invalidate the facts this one replaces, in the
                 # same transaction so the swap is atomic (#temporal).
                 for old_id in (supersedes or []):
-                    self._conn.execute(
+                    cur = self._conn.execute(
                         "UPDATE memories SET valid_until=?, superseded_by=?, "
                         "archived=1, archived_at=?, archive_reason=? "
                         "WHERE id=? AND profile=? AND archived=0",
                         (now, mid, now, f"superseded by {mid}", old_id, profile),
                     )
+                    if cur.rowcount > 0:
+                        edge_id = f"edge_{uuid.uuid4().hex[:12]}"
+                        self._conn.execute(
+                            """INSERT OR IGNORE INTO memory_edges (id, source_id, target_id, relation, created_at)
+                               VALUES (?, ?, ?, 'supersedes', ?)""",
+                            (edge_id, mid, old_id, now),
+                        )
                 # FTS sync handled by memories_ai trigger (issue #3)
                 self._conn.commit()
             self._embedding_cache.invalidate(profile)
+            # Autonomous Knowledge Graph auto-linking on entity co-occurrence
+            self._auto_link_entities(mid, profile, enriched_tags or [])
             # Embed-on-write (issue #5): background thread so model load
             # doesn't block the MCP response. Tracked in _pending_embeds
             # so shutdown drains it before os._exit(0).
@@ -1273,6 +1292,8 @@ class MemoryStore:
                         (memory_id, profile, _pack_vector(vec))
                     )
                     self._conn.commit()
+            # Autonomous background semantic near-neighbor edge linking
+            self._auto_link_semantic(memory_id, profile, vec)
             return True
         except Exception as e:
             import sys
@@ -1354,6 +1375,7 @@ class MemoryStore:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_edge_source ON memory_edges(source_id)",
             "CREATE INDEX IF NOT EXISTS idx_edge_target ON memory_edges(target_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_edge_unique ON memory_edges(source_id, target_id, relation)",
         ):
             try:
                 self._conn.execute(ddl)
@@ -1844,13 +1866,139 @@ class MemoryStore:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return [mem for _, _, mem in scored]
 
-    def _expand_related(self, results: list[dict], profile: str,
-                        max_related: int = 3) -> list[dict]:
-        """Expand search results with related memories by knowledge graph edges
-        (memory_edges) and entity tag overlap.
+    def traverse_graph(
+        self,
+        start_ids: list[str] | str,
+        profile: str | None = None,
+        max_hops: int = 2,
+        max_nodes: int = 10,
+        include_archived: bool = False,
+        directed: bool = False,
+    ) -> list[dict]:
+        """Perform breadth-first multi-hop graph traversal starting from start_ids.
 
-        1. Graph expansion: retrieves 1-hop connected memories via memory_edges.
-        2. Tag expansion: finds additional memories sharing >=2 entity tags.
+        Traverses memory_edges up to max_hops (clamped between 1 and 3).
+        Guards against graph cycles with a visited set.
+        Applies geometric score decay per hop (hop 1: 1.0, hop 2: 0.5, hop 3: 0.25).
+
+        Returns a list of discovered memory dicts enriched with:
+            - 'hop_distance': int (1, 2, 3)
+            - 'graph_score': float (1.0, 0.5, 0.25)
+            - 'edge_relation': str (relation of the connecting edge)
+            - 'connected_from': str (id of the immediate predecessor node)
+            - 'traversal_path': list of memory IDs / relations forming the path
+            - 'related': True
+        """
+        if isinstance(start_ids, str):
+            start_ids = [start_ids]
+        start_ids = [s for s in start_ids if s]
+        if not start_ids or max_hops <= 0 or max_nodes <= 0:
+            return []
+
+        hops_clamped = min(max(1, int(max_hops)), 3)
+        visited = set(start_ids)
+        current_frontier = set(start_ids)
+        paths: dict[str, list] = {sid: [sid] for sid in start_ids}
+        results: list[dict] = []
+
+        for hop in range(1, hops_clamped + 1):
+            if not current_frontier or len(results) >= max_nodes:
+                break
+
+            frontier_list = list(current_frontier)
+            placeholders = ",".join("?" for _ in frontier_list)
+            try:
+                if directed:
+                    edge_rows = self._conn.execute(
+                        f"""SELECT source_id, target_id, relation
+                            FROM memory_edges
+                            WHERE source_id IN ({placeholders})
+                            ORDER BY created_at DESC""",
+                        frontier_list,
+                    ).fetchall()
+                else:
+                    edge_rows = self._conn.execute(
+                        f"""SELECT source_id, target_id, relation
+                            FROM memory_edges
+                            WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})
+                            ORDER BY created_at DESC""",
+                        (*frontier_list, *frontier_list),
+                    ).fetchall()
+            except Exception as e:
+                logger.debug("Graph edge query failed: %s", e)
+                break
+
+            next_frontier = set()
+            edge_meta: dict[str, tuple[str, str]] = {}  # neighbor_id -> (relation, from_node)
+
+            for er in edge_rows:
+                src = er["source_id"]
+                tgt = er["target_id"]
+                rel = er["relation"]
+
+                if src in current_frontier and tgt not in visited:
+                    neighbor = tgt
+                    from_node = src
+                elif not directed and tgt in current_frontier and src not in visited:
+                    neighbor = src
+                    from_node = tgt
+                else:
+                    continue
+
+                if neighbor not in next_frontier:
+                    next_frontier.add(neighbor)
+                    edge_meta[neighbor] = (rel, from_node)
+                    paths[neighbor] = paths.get(from_node, [from_node]) + [rel, neighbor]
+
+            if not next_frontier:
+                break
+
+            visited.update(next_frontier)
+            nf_list = list(next_frontier)
+            nf_placeholders = ",".join("?" for _ in nf_list)
+
+            sql = f"SELECT * FROM memories WHERE id IN ({nf_placeholders})"
+            params: list[Any] = list(nf_list)
+            if profile:
+                sql += " AND profile = ?"
+                params.append(profile)
+            if not include_archived:
+                sql += " AND archived = 0"
+
+            try:
+                mem_rows = self._conn.execute(sql, params).fetchall()
+            except Exception as e:
+                logger.debug("Graph memory row query failed: %s", e)
+                break
+
+            mem_by_id = {r["id"]: self._row_to_dict(r) for r in mem_rows}
+            hop_score = round(0.5 ** (hop - 1), 3)
+
+            for nid in nf_list:
+                if nid in mem_by_id:
+                    mem = mem_by_id[nid]
+                    rel, from_node = edge_meta.get(nid, ("relates_to", ""))
+                    mem["related"] = True
+                    mem["hop_distance"] = hop
+                    mem["graph_score"] = hop_score
+                    mem["edge_relation"] = rel
+                    mem["connected_from"] = from_node
+                    mem["traversal_path"] = paths.get(nid, [nid])
+                    results.append(mem)
+                    if len(results) >= max_nodes:
+                        return results
+
+            current_frontier = {nid for nid in next_frontier if nid in mem_by_id}
+
+        return results
+
+    def _expand_related(self, results: list[dict], profile: str,
+                        max_related: int = 3, max_hops: int = 2) -> list[dict]:
+        """Expand search results with related memories by knowledge graph edges
+        (memory_edges, multi-hop BFS traversal) and entity tag overlap.
+
+        1. Graph expansion: multi-hop traversal via traverse_graph (up to max_hops).
+        2. Tag expansion: finds additional memories sharing >=2 entity tags if capacity remains.
         Related results are appended after primary results with a ``related: true`` flag.
 
         Skips memories already in the primary result set. Caps at
@@ -1862,42 +2010,24 @@ class MemoryStore:
         existing_ids: set[str] = {mem["id"] for mem in results}
         related: list[dict] = []
 
-        # 1. 1-hop Graph Edge Traversal
+        # 1. Multi-hop Graph Traversal (up to max_hops, max_nodes=max_related)
         if existing_ids:
-            id_list = list(existing_ids)
-            placeholders = ",".join("?" for _ in id_list)
             try:
-                edge_rows = self._conn.execute(
-                    f"""SELECT DISTINCT 
-                               CASE WHEN source_id IN ({placeholders}) THEN target_id ELSE source_id END AS connected_id,
-                               relation
-                        FROM memory_edges
-                        WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})""",
-                    (*id_list, *id_list, *id_list),
-                ).fetchall()
-                connected_map = {}
-                for er in edge_rows:
-                    cid = er["connected_id"]
-                    if cid not in existing_ids and cid not in connected_map:
-                        connected_map[cid] = er["relation"]
-                
-                if connected_map:
-                    c_placeholders = ",".join("?" for _ in connected_map)
-                    mem_rows = self._conn.execute(
-                        f"""SELECT * FROM memories 
-                            WHERE id IN ({c_placeholders}) AND profile = ? AND archived = 0""",
-                        (*connected_map.keys(), profile),
-                    ).fetchall()
-                    for mr in mem_rows:
-                        mem = self._row_to_dict(mr)
-                        mem["related"] = True
-                        mem["edge_relation"] = connected_map.get(mem["id"], "relates_to")
-                        related.append(mem)
-                        existing_ids.add(mem["id"])
+                graph_nodes = self.traverse_graph(
+                    list(existing_ids),
+                    profile=profile,
+                    max_hops=max_hops,
+                    max_nodes=max_related,
+                    include_archived=False,
+                )
+                for node in graph_nodes:
+                    if node["id"] not in existing_ids:
+                        related.append(node)
+                        existing_ids.add(node["id"])
                         if len(related) >= max_related:
                             return results + related
             except Exception as e:
-                logger.debug("Edge expansion query failed: %s", e)
+                logger.debug("Graph traversal in _expand_related failed: %s", e)
 
         # 2. Entity Tag Overlap Expansion (if remaining capacity)
         remaining = max_related - len(related)
@@ -1949,27 +2079,37 @@ class MemoryStore:
 
     def add_edge(self, source_id: str, target_id: str, relation: str = "relates_to") -> str:
         """Create a directed relation edge between two memories."""
+        if source_id == target_id:
+            raise ValueError("Cannot create an edge from a memory to itself")
+        # Idempotency check: return existing edge if already present
+        existing = self._conn.execute(
+            "SELECT id FROM memory_edges WHERE source_id=? AND target_id=? AND relation=?",
+            (source_id, target_id, relation)
+        ).fetchone()
+        if existing:
+            return existing["id"]
+
         edge_id = f"edge_{uuid.uuid4().hex[:12]}"
         now = datetime.now().isoformat()
         with self._conn.transaction():
             self._conn.execute(
-                """INSERT INTO memory_edges (id, source_id, target_id, relation, created_at)
+                """INSERT OR IGNORE INTO memory_edges (id, source_id, target_id, relation, created_at)
                    VALUES (?, ?, ?, ?, ?)""",
                 (edge_id, source_id, target_id, relation, now)
             )
             self._conn.commit()
         return edge_id
 
-    def get_edges(self, memory_id: str) -> list[dict]:
+    def get_edges(self, memory_id: str, include_archived: bool = False) -> list[dict]:
         """Get graph edges connected to a memory (outgoing and incoming)."""
+        archive_clause = "" if include_archived else "AND ((m1.archived = 0 AND m2.archived = 0) OR e.relation = 'supersedes')"
         rows = self._conn.execute(
-            """SELECT e.*, m1.content as source_content, m2.content as target_content
+            f"""SELECT e.*, m1.content as source_content, m2.content as target_content
                FROM memory_edges e
                JOIN memories m1 ON e.source_id = m1.id
                JOIN memories m2 ON e.target_id = m2.id
                WHERE (e.source_id = ? OR e.target_id = ?)
-                 AND m1.archived = 0
-                 AND m2.archived = 0
+                 {archive_clause}
                ORDER BY e.created_at DESC""",
             (memory_id, memory_id)
         ).fetchall()
@@ -1982,6 +2122,192 @@ class MemoryStore:
             deleted = cur.rowcount > 0
             self._conn.commit()
         return deleted
+
+    def _auto_link_entities(self, memory_id: str, profile: str, tags: list[str], max_links: int = 5) -> int:
+        """Auto-link memories in the same profile that share >= 2 entity tags.
+        Returns the number of edges created."""
+        entity_tags = [t for t in (tags or []) if isinstance(t, str) and t.startswith("entity:")]
+        if len(entity_tags) < 2:
+            return 0
+        placeholders = ",".join("?" for _ in entity_tags)
+        try:
+            rows = self._conn.execute(
+                f"""SELECT m.id, COUNT(DISTINCT jt.value) AS shared
+                    FROM memories m, json_each(m.tags) AS jt
+                    WHERE m.profile = ?
+                      AND m.archived = 0
+                      AND m.id != ?
+                      AND jt.value IN ({placeholders})
+                    GROUP BY m.id
+                    HAVING shared >= 2
+                    ORDER BY shared DESC
+                    LIMIT ?""",
+                (profile, memory_id, *entity_tags, max_links),
+            ).fetchall()
+            if not rows:
+                return 0
+            count = 0
+            now = datetime.now().isoformat()
+            with self._conn.transaction():
+                for r in rows:
+                    target_id = r["id"]
+                    # Check both directions to prevent reciprocal duplicates
+                    existing = self._conn.execute(
+                        """SELECT 1 FROM memory_edges
+                           WHERE (source_id=? AND target_id=? AND relation='shares_entities')
+                              OR (source_id=? AND target_id=? AND relation='shares_entities')""",
+                        (memory_id, target_id, target_id, memory_id)
+                    ).fetchone()
+                    if not existing:
+                        edge_id = f"edge_{uuid.uuid4().hex[:12]}"
+                        self._conn.execute(
+                            """INSERT OR IGNORE INTO memory_edges (id, source_id, target_id, relation, created_at)
+                               VALUES (?, ?, ?, 'shares_entities', ?)""",
+                            (edge_id, memory_id, target_id, now)
+                        )
+                        count += 1
+                self._conn.commit()
+            return count
+        except Exception as e:
+            logger.debug("Auto entity linking failed: %s", e)
+            return 0
+
+    def _auto_link_semantic(self, memory_id: str, profile: str, vec: list[float],
+                            threshold: float = 0.85, max_links: int = 3) -> int:
+        """Find active memories in profile with cosine similarity >= threshold and link them.
+        Returns number of edges created."""
+        try:
+            import numpy as np
+            rows = self._conn.execute(
+                """SELECT e.id, e.vector FROM memory_embeddings e
+                   JOIN memories m ON e.id = m.id
+                   WHERE e.profile = ? AND e.id != ? AND m.archived = 0""",
+                (profile, memory_id)
+            ).fetchall()
+            if not rows:
+                return 0
+
+            other_ids = [r["id"] for r in rows]
+            raw_vecs = [_unpack_vector(r["vector"]) for r in rows]
+            valid_indices = [i for i, v in enumerate(raw_vecs) if v is not None]
+            if not valid_indices:
+                return 0
+
+            filtered_ids = [other_ids[i] for i in valid_indices]
+            other_mat = np.array([raw_vecs[i] for i in valid_indices], dtype=np.float32)
+            q = np.asarray(vec, dtype=np.float32)
+            q_norm = float(np.linalg.norm(q))
+            if q_norm == 0 or len(other_mat) == 0:
+                return 0
+
+            denom = np.linalg.norm(other_mat, axis=1) * q_norm
+            sims = np.divide(other_mat @ q, denom, out=np.zeros(len(other_mat), dtype=np.float32), where=denom > 0)
+
+            high_sim_indices = np.where(sims >= threshold)[0]
+            if len(high_sim_indices) == 0:
+                return 0
+
+            sorted_indices = high_sim_indices[np.argsort(-sims[high_sim_indices])][:max_links]
+            count = 0
+            now = datetime.now().isoformat()
+            with self._conn.transaction():
+                for idx in sorted_indices:
+                    target_id = filtered_ids[idx]
+                    existing = self._conn.execute(
+                        """SELECT 1 FROM memory_edges
+                           WHERE (source_id=? AND target_id=? AND relation='semantically_similar')
+                              OR (source_id=? AND target_id=? AND relation='semantically_similar')""",
+                        (memory_id, target_id, target_id, memory_id)
+                    ).fetchone()
+                    if not existing:
+                        edge_id = f"edge_{uuid.uuid4().hex[:12]}"
+                        self._conn.execute(
+                            """INSERT OR IGNORE INTO memory_edges (id, source_id, target_id, relation, created_at)
+                               VALUES (?, ?, ?, 'semantically_similar', ?)""",
+                            (edge_id, memory_id, target_id, now)
+                        )
+                        count += 1
+                self._conn.commit()
+            return count
+        except Exception as e:
+            logger.debug("Auto semantic linking failed: %s", e)
+            return 0
+
+    def backfill_graph_edges(self, profile: str | None = None) -> dict[str, int]:
+        """Backfill knowledge graph edges across existing memories:
+        - Supersession: links memories where superseded_by is set
+        - Entity co-occurrence: links memories sharing >= 2 entity tags
+        - Semantic similarity: links memories with cosine similarity >= 0.85
+
+        Returns dict with counts of created edges.
+        """
+        counts = {"supersedes": 0, "shares_entities": 0, "semantically_similar": 0}
+        now = datetime.now().isoformat()
+
+        # 1. Supersedes backfill
+        try:
+            sql = """SELECT m1.id, m1.superseded_by
+                     FROM memories m1
+                     JOIN memories m2 ON m1.superseded_by = m2.id
+                     WHERE m1.superseded_by IS NOT NULL"""
+            params = []
+            if profile:
+                sql += " AND m1.profile = ?"
+                params.append(profile)
+            rows = self._conn.execute(sql, params).fetchall()
+            with self._conn.transaction():
+                for r in rows:
+                    old_id = r["id"]
+                    new_id = r["superseded_by"]
+                    existing = self._conn.execute(
+                        "SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=? AND relation='supersedes'",
+                        (new_id, old_id)
+                    ).fetchone()
+                    if not existing:
+                        edge_id = f"edge_{uuid.uuid4().hex[:12]}"
+                        self._conn.execute(
+                            """INSERT OR IGNORE INTO memory_edges (id, source_id, target_id, relation, created_at)
+                               VALUES (?, ?, ?, 'supersedes', ?)""",
+                            (edge_id, new_id, old_id, now)
+                        )
+                        counts["supersedes"] += 1
+                self._conn.commit()
+        except Exception as e:
+            logger.debug("Backfill supersedes edges failed: %s", e)
+
+        # 2. Entity co-occurrence backfill
+        try:
+            sql = "SELECT id, profile, tags FROM memories WHERE archived=0"
+            params = []
+            if profile:
+                sql += " AND profile = ?"
+                params.append(profile)
+            mems = self._conn.execute(sql, params).fetchall()
+            for m in mems:
+                try:
+                    t_list = json.loads(m["tags"])
+                except Exception:
+                    t_list = []
+                counts["shares_entities"] += self._auto_link_entities(m["id"], m["profile"], t_list)
+        except Exception as e:
+            logger.debug("Backfill entity edges failed: %s", e)
+
+        # 3. Semantic similarity backfill
+        try:
+            sql = "SELECT id, profile, vector FROM memory_embeddings"
+            params = []
+            if profile:
+                sql += " WHERE profile = ?"
+                params.append(profile)
+            embed_rows = self._conn.execute(sql, params).fetchall()
+            for er in embed_rows:
+                vec = _unpack_vector(er["vector"])
+                if vec is not None:
+                    counts["semantically_similar"] += self._auto_link_semantic(er["id"], er["profile"], vec)
+        except Exception as e:
+            logger.debug("Backfill semantic edges failed: %s", e)
+
+        return counts
 
     # -------------------------------------------------------------------------
     # Provenance (v5.1)

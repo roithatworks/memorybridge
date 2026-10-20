@@ -403,7 +403,34 @@ def cmd_edges(args: argparse.Namespace) -> int:
         else:
             print(f"Edge {args.edge_id} not found")
             return 1
-            
+
+    elif args.action == "traverse":
+        nodes = store.traverse_graph(
+            args.memory_id,
+            profile=args.profile,
+            max_hops=args.hops,
+            max_nodes=args.limit,
+            directed=getattr(args, "directed", False)
+        )
+        if not nodes:
+            print(f"No connected graph memories found within {args.hops} hops of {args.memory_id}.")
+            return 0
+        print(f"Discovered {len(nodes)} graph nodes starting from {args.memory_id} (max {args.hops} hops):")
+        for n in nodes:
+            path_str = " -> ".join(str(p) for p in n.get("traversal_path", []))
+            print(f"  [Hop {n['hop_distance']} | Score {n['graph_score']:.2f}] {n['id']} ({n['category']}) via {n['edge_relation']}")
+            content_preview = n['content'].replace('\n', ' ')[:75]
+            print(f"    Content: {content_preview}...")
+            print(f"    Path: {path_str}")
+
+    elif args.action == "auto-link":
+        print(f"Running autonomous graph auto-linking for profile '{args.profile}'...")
+        counts = store.backfill_graph_edges(profile=args.profile)
+        print("Auto-linking complete:")
+        print(f"  Supersession edges created: {counts.get('supersedes', 0)}")
+        print(f"  Entity co-occurrence edges created: {counts.get('shares_entities', 0)}")
+        print(f"  Semantic similarity edges created: {counts.get('semantically_similar', 0)}")
+
     return 0
 
 
@@ -489,6 +516,14 @@ def build_parser() -> argparse.ArgumentParser:
     ea.add_argument("--relation", default="relates_to", help="relation type (default: relates_to)")
     er = edg_sub.add_parser("rm", help="delete a graph edge")
     er.add_argument("edge_id", help="ID of the edge to delete")
+    et = edg_sub.add_parser("traverse", help="multi-hop traversal starting from a memory")
+    et.add_argument("memory_id", help="starting memory ID")
+    et.add_argument("--hops", type=int, default=2, help="maximum traversal hops (1..3, default 2)")
+    et.add_argument("--limit", type=int, default=10, help="maximum connected nodes to return")
+    et.add_argument("--profile", default=config.profile(), help="target profile")
+    et.add_argument("--directed", action="store_true", help="only traverse outgoing edges (default: bidirectional)")
+    eb = edg_sub.add_parser("auto-link", help="backfill autonomous graph edges across memories")
+    eb.add_argument("--profile", default=config.profile(), help="target profile (optional)")
     edg.set_defaults(func=cmd_edges)
 
     return p

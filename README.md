@@ -110,6 +110,7 @@ Claude calls these automatically — no special syntax required.
 | `consolidate_session` | **(v5.0)** Synthesize raw session events/logs into durable candidate facts & procedural rules |
 | `add_memory_edge` | **(v5.0)** Create a directed Knowledge Graph edge between two memories (`source_id`, `target_id`, `relation`) |
 | `get_memory_edges` | **(v5.0)** Retrieve Knowledge Graph edge relations connected to a memory |
+| `traverse_memory_graph` | **(v5.1)** Breadth-first multi-hop graph traversal (1..3 hops) with distance-decayed scoring and cycle guards |
 | `edit_memory` | Edit content, importance, category, or project association of an existing memory in place |
 | `search_memory` | Hybrid BM25 + semantic search (default: limit=5, max_tokens=800, supports `min_confidence`) |
 | `reflect` | Synthesize a reasoned answer from memories with structured sections |

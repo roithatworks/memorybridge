@@ -315,7 +315,9 @@ def compress_memory(mem: dict, target_tokens: int = 50) -> dict:
 _RESULT_FIELDS = {"id", "content", "category", "importance",
                   "project_id", "tags", "token_count", "created_at", "client_name",
                   "confidence", "expires_at", "status", "source",
-                  "why_it_matters", "origin_type", "origin_file"}
+                  "why_it_matters", "origin_type", "origin_file",
+                  "related", "edge_relation", "hop_distance", "graph_score",
+                  "traversal_path", "connected_from"}
 
 
 def _clean_result(mem: dict) -> dict:
@@ -997,6 +999,70 @@ def get_memory_edges(
     """
     edges = _store.get_edges(memory_id)
     return json.dumps({"memory_id": memory_id, "edges": edges, "count": len(edges)}, indent=2)
+
+
+@mcp.tool()
+def traverse_memory_graph(
+    memory_id: str,
+    max_hops: int = 2,
+    max_nodes: int = 10,
+    profile: str = None,
+    directed: bool = False
+) -> str:
+    """
+    Perform a multi-hop graph traversal starting from a specific memory.
+    Discovers associative context connected across 1, 2, or 3 relation hops
+    with cycle prevention and distance score decay.
+
+    Args:
+        memory_id: Starting memory ID
+        max_hops: Depth of traversal (1, 2, or 3; default 2)
+        max_nodes: Maximum number of connected memories to return (default 10)
+        profile: Memory profile name (defaults to active profile)
+        directed: Whether to traverse only outgoing edges (default False: bidirectional)
+    Returns:
+        JSON object containing start node, discovered nodes with hops, paths, and scores.
+    """
+    prof = profile or _active_profile()
+    _validate_profile(prof)
+    hops = min(max(1, int(max_hops)), 3)
+    limit = min(max(1, int(max_nodes)), 50)
+
+    start_row = _store._conn.execute(
+        "SELECT id, content, category, tags FROM memories WHERE id=? AND profile=?",
+        (memory_id, prof)
+    ).fetchone()
+    if not start_row:
+        return json.dumps({"error": f"Memory '{memory_id}' not found in profile '{prof}'"})
+
+    nodes = _store.traverse_graph(
+        [memory_id],
+        profile=prof,
+        max_hops=hops,
+        max_nodes=limit,
+        include_archived=False,
+        directed=directed
+    )
+
+    cleaned_nodes = []
+    for n in nodes:
+        cleaned_nodes.append({
+            "id": n["id"],
+            "content": n.get("content", ""),
+            "category": n.get("category", "fact"),
+            "hop_distance": n.get("hop_distance", 1),
+            "graph_score": n.get("graph_score", 1.0),
+            "edge_relation": n.get("edge_relation", "relates_to"),
+            "traversal_path": n.get("traversal_path", []),
+            "connected_from": n.get("connected_from", "")
+        })
+
+    return json.dumps({
+        "start_memory_id": memory_id,
+        "max_hops": hops,
+        "count": len(cleaned_nodes),
+        "nodes": cleaned_nodes
+    }, indent=2)
 
 
 @mcp.tool()

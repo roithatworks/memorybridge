@@ -43,4 +43,5 @@ Before completing the session or after resolving an issue:
 - `consolidate_session`: Extract and promote session notes into consolidated memories (`session_notes`).
 - `add_memory_edge`: Link two memories in the Knowledge Graph (`source_id`, `target_id`, `relation`).
 - `get_memory_edges`: Retrieve connected edges for a memory ID.
+- `traverse_memory_graph`: Multi-hop BFS traversal from a memory (`memory_id`, `max_hops`, `max_nodes`).
 - `reflect`: Produce a structured synthesis of facts, dates, preferences, and contradictions for a query.

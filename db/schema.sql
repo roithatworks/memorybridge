@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS memory_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edge_source ON memory_edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edge_target ON memory_edges(target_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_edge_unique ON memory_edges(source_id, target_id, relation);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
