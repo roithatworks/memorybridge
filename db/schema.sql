@@ -28,9 +28,9 @@ CREATE TABLE IF NOT EXISTS memories (
     archived       INTEGER NOT NULL DEFAULT 0,
     archived_at    TEXT,
     archive_reason TEXT,
-    -- Temporal validity (supersession, #temporal). valid_until is set when a
-    -- newer fact replaces this one; superseded_by points at that newer memory.
-    -- A NULL valid_until means the fact is still current.
+    -- Bi-temporal validity (v5.2). valid_from is when fact became true (defaults to created_at).
+    -- valid_until is when the fact ceased to be valid in the real world (or when superseded).
+    valid_from     TEXT,
     valid_until    TEXT,
     superseded_by  TEXT,
     -- Write provenance (#180). "claude" = written over local stdio
@@ -73,6 +73,8 @@ CREATE INDEX IF NOT EXISTS idx_profile_cat
     ON memories(profile, category) WHERE archived = 0;
 CREATE INDEX IF NOT EXISTS idx_profile_score
     ON memories(profile, relevance_score DESC) WHERE archived = 0;
+CREATE INDEX IF NOT EXISTS idx_memories_temporal
+    ON memories(profile, created_at, valid_from, valid_until);
 
 CREATE TABLE IF NOT EXISTS memory_edges (
     id           TEXT PRIMARY KEY,
