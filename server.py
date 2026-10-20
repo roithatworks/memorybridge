@@ -138,6 +138,30 @@ def _resolve_client_name(client_name: Optional[str]) -> Optional[str]:
     return _sanitize_client_name(os.environ.get("MEMORYBRIDGE_CLIENT_NAME"))
 
 
+_PROFILE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
+
+
+def _validate_profile(p: Optional[str]) -> str:
+    """Validate and normalize a profile name."""
+    if not p:
+        return _active_profile()
+    cleaned = p.strip().lower()
+    if not _PROFILE_RE.fullmatch(cleaned) or cleaned.startswith((".", "-")):
+        return _active_profile()
+    return cleaned
+
+
+def _sanitize_why_it_matters(val: Optional[str]) -> Optional[str]:
+    """Sanitize belief injection instruction text."""
+    if not val:
+        return None
+    val = val.strip()
+    if not val:
+        return None
+    val = val.replace("<<<", "").replace(">>>", "").strip()
+    return val[:500] if val else None
+
+
 MAX_TOKENS_DEFAULT     = 4000
 SEARCH_LIMIT_DEFAULT   = 5
 SEARCH_MAX_TOKENS_DEFAULT = 800
@@ -526,7 +550,20 @@ def add_memory(
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
-    profile = profile or _active_profile()
+    profile = _validate_profile(profile)
+    if _REMOTE_MODE:
+        existing = set(_store.list_profiles())
+        if profile not in existing:
+            profile = DEFAULT_PROFILE
+        # Security: remote callers cannot mass-archive memories via supersedes
+        if supersedes:
+            supersedes = None
+        # Security: remote callers cannot inject behavioral instructions/beliefs
+        if why_it_matters:
+            why_it_matters = None
+    elif why_it_matters:
+        why_it_matters = _sanitize_why_it_matters(why_it_matters)
+
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
@@ -1725,7 +1762,15 @@ class _RateLimitAuthMiddleware:
         for h in ("cf-connecting-ip", "x-forwarded-for"):
             val = headers.get(h, "").strip()
             if val:
-                return val.split(",")[0].strip()
+                first = val.split(",")[0].strip()
+                m = re.match(r"^([0-9a-fA-F:.]+)", first)
+                if m:
+                    candidate = m.group(1)[:45]
+                    try:
+                        import ipaddress
+                        return str(ipaddress.ip_address(candidate))
+                    except ValueError:
+                        return candidate
         client = scope.get("client")
         return client[0] if client else "unknown"
 
@@ -1738,9 +1783,13 @@ class _RateLimitAuthMiddleware:
             count += 1
             self._hits[ip] = [window_start, count]
             if len(self._hits) > 4096:  # bound memory; drop stale windows
-                for k in [k for k, (s, _) in self._hits.items()
-                          if now - s >= self.window]:
+                stale = [k for k, (s, _) in self._hits.items()
+                         if now - s >= self.window]
+                for k in stale:
                     self._hits.pop(k, None)
+                # Hard cap fallback if attacker floods non-stale windows
+                while len(self._hits) > 4096:
+                    self._hits.pop(next(iter(self._hits)), None)
             return count <= self.limit
 
     def _token_ok(self, scope) -> bool:

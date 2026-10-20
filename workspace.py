@@ -97,12 +97,19 @@ def ws_list(path: str = "", recursive: bool = False) -> dict:
     return {"path": path, "entries": entries}
 
 
+MAX_WS_FILE_SIZE = 2 * 1024 * 1024  # 2MB ceiling to prevent OOM
+
+
 def ws_read(path: str) -> dict:
     """Read a text file at `path`. Binary files return a structured error."""
     target = _resolve(path)
     if not target.is_file():
         return {"error": f"not a file: {path}"}
+    if target.is_symlink() and not target.resolve().is_relative_to(config.workspace_root().resolve()):
+        return {"error": f"symlink escapes workspace: {path}"}
     try:
+        if target.stat().st_size > MAX_WS_FILE_SIZE:
+            return {"error": f"file exceeds size limit (2MB): {path}"}
         return {"path": path, "content": target.read_text(encoding="utf-8")}
     except UnicodeDecodeError:
         return {"error": f"binary file, cannot read as text: {path}"}
@@ -132,14 +139,19 @@ def ws_search(query: str, path: str = "") -> dict:
     """Search for `query` (plain substring) in text files under `path`."""
     target = _resolve(path)
     matches = []
-    root = config.workspace_root()
+    root = config.workspace_root().resolve()
     candidates = target.rglob("*") if target.is_dir() else [target]
     for p in candidates:
-        if not p.is_file():
-            continue
         try:
+            if not p.is_file() or p.is_symlink():
+                continue
+            resolved = p.resolve()
+            if not resolved.is_relative_to(root):
+                continue
+            if p.stat().st_size > MAX_WS_FILE_SIZE:
+                continue
             if query in p.read_text(encoding="utf-8"):
-                matches.append(str(p.relative_to(root)))
-        except UnicodeDecodeError:
+                matches.append(str(resolved.relative_to(root)))
+        except (OSError, UnicodeDecodeError):
             continue
     return {"query": query, "matches": matches}

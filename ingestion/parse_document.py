@@ -172,29 +172,19 @@ def _adr_why_it_matters(heading: str, decision_content: str = "") -> str | None:
     return None
 
 
+MAX_DOCUMENT_BYTES = 10 * 1024 * 1024  # 10MB ceiling to prevent OOM
+
+
 def parse(filepath: str, *, extract_facts: bool = False) -> list[dict]:
-    """Parse a markdown/text document into candidate memories.
-
-    Args:
-        filepath: Path to the document file
-        extract_facts: If True, would send sections through DeepSeek for
-            fact extraction (currently returns raw sections — the caller
-            can route through the extractor separately)
-
-    Returns:
-        List of candidate memory dicts, each with:
-          - content: str — the section content
-          - section: str — the heading text
-          - source_file: str — relative or absolute source path
-          - line_range: tuple[int, int] — (start_line, end_line)
-          - doc_type: str — "adr", "readme", "guide", "generic"
-          - category: str — inferred memory category
-          - importance: str — inferred importance level
-          - why_it_matters: str | None — auto-generated belief instruction
-          - confidence: float — confidence score for auto-accept routing
-    """
+    """Parse a markdown/text document into candidate memories."""
     path = Path(filepath)
     if not path.exists():
+        return []
+
+    try:
+        if path.stat().st_size > MAX_DOCUMENT_BYTES:
+            return []
+    except OSError:
         return []
 
     content = path.read_text(encoding="utf-8", errors="replace")

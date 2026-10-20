@@ -1846,11 +1846,12 @@ class MemoryStore:
 
     def _expand_related(self, results: list[dict], profile: str,
                         max_related: int = 3) -> list[dict]:
-        """Expand search results with related memories by entity tag overlap.
+        """Expand search results with related memories by knowledge graph edges
+        (memory_edges) and entity tag overlap.
 
-        Collects all entity tags from the primary results, then finds
-        additional memories that share ≥2 of those tags. Related results
-        are appended after primary results with a ``related: true`` flag.
+        1. Graph expansion: retrieves 1-hop connected memories via memory_edges.
+        2. Tag expansion: finds additional memories sharing >=2 entity tags.
+        Related results are appended after primary results with a ``related: true`` flag.
 
         Skips memories already in the primary result set. Caps at
         ``max_related`` additional results.
@@ -1858,52 +1859,84 @@ class MemoryStore:
         if not results or max_related <= 0:
             return results
 
-        # Collect all entity tags from primary results
-        all_entity_tags: set[str] = set()
-        existing_ids: set[str] = set()
-        for mem in results:
-            existing_ids.add(mem["id"])
-            tags = mem.get("tags", [])
-            for tag in tags:
-                if isinstance(tag, str) and tag.startswith("entity:"):
-                    all_entity_tags.add(tag)
-
-        if len(all_entity_tags) < 2:
-            return results  # Not enough entity signal
-
-        # Query for memories sharing ≥2 entity tags.
-        # Bind tags as ? placeholders — these values originate from stored
-        # `tags` (ultimately caller-supplied) and must never be interpolated.
-        entity_tag_list = list(all_entity_tags)
-        placeholders = ",".join("?" for _ in entity_tag_list)
-        try:
-            rows = self._conn.execute(
-                f"""SELECT m.*, COUNT(DISTINCT jt.value) AS shared
-                    FROM memories m, json_each(m.tags) AS jt
-                    WHERE m.profile = ?
-                      AND m.archived = 0
-                      AND jt.value IN ({placeholders})
-                    GROUP BY m.id
-                    HAVING shared >= 2
-                    ORDER BY shared DESC, m.relevance_score DESC
-                    LIMIT ?""",
-                (profile, *entity_tag_list, max_related * 2),
-            ).fetchall()
-        except Exception as e:
-            logger.debug("Related expansion query failed: %s", e)
-            return results
-
+        existing_ids: set[str] = {mem["id"] for mem in results}
         related: list[dict] = []
-        for row in rows:
-            mem = self._row_to_dict(row)
-            if mem["id"] in existing_ids:
-                continue
-            mem["related"] = True
-            mem["match_score"] = row["shared"] / max(len(all_entity_tags), 1)
-            related.append(mem)
-            existing_ids.add(mem["id"])
-            if len(related) >= max_related:
-                break
+
+        # 1. 1-hop Graph Edge Traversal
+        if existing_ids:
+            id_list = list(existing_ids)
+            placeholders = ",".join("?" for _ in id_list)
+            try:
+                edge_rows = self._conn.execute(
+                    f"""SELECT DISTINCT 
+                               CASE WHEN source_id IN ({placeholders}) THEN target_id ELSE source_id END AS connected_id,
+                               relation
+                        FROM memory_edges
+                        WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})""",
+                    (*id_list, *id_list, *id_list),
+                ).fetchall()
+                connected_map = {}
+                for er in edge_rows:
+                    cid = er["connected_id"]
+                    if cid not in existing_ids and cid not in connected_map:
+                        connected_map[cid] = er["relation"]
+                
+                if connected_map:
+                    c_placeholders = ",".join("?" for _ in connected_map)
+                    mem_rows = self._conn.execute(
+                        f"""SELECT * FROM memories 
+                            WHERE id IN ({c_placeholders}) AND profile = ? AND archived = 0""",
+                        (*connected_map.keys(), profile),
+                    ).fetchall()
+                    for mr in mem_rows:
+                        mem = self._row_to_dict(mr)
+                        mem["related"] = True
+                        mem["edge_relation"] = connected_map.get(mem["id"], "relates_to")
+                        related.append(mem)
+                        existing_ids.add(mem["id"])
+                        if len(related) >= max_related:
+                            return results + related
+            except Exception as e:
+                logger.debug("Edge expansion query failed: %s", e)
+
+        # 2. Entity Tag Overlap Expansion (if remaining capacity)
+        remaining = max_related - len(related)
+        if remaining > 0:
+            all_entity_tags: set[str] = set()
+            for mem in results:
+                tags = mem.get("tags", [])
+                for tag in tags:
+                    if isinstance(tag, str) and tag.startswith("entity:"):
+                        all_entity_tags.add(tag)
+
+            if len(all_entity_tags) >= 2:
+                entity_tag_list = list(all_entity_tags)
+                placeholders = ",".join("?" for _ in entity_tag_list)
+                try:
+                    rows = self._conn.execute(
+                        f"""SELECT m.*, COUNT(DISTINCT jt.value) AS shared
+                            FROM memories m, json_each(m.tags) AS jt
+                            WHERE m.profile = ?
+                              AND m.archived = 0
+                              AND jt.value IN ({placeholders})
+                            GROUP BY m.id
+                            HAVING shared >= 2
+                            ORDER BY shared DESC, m.relevance_score DESC
+                            LIMIT ?""",
+                        (profile, *entity_tag_list, remaining * 2),
+                    ).fetchall()
+                    for row in rows:
+                        mem = self._row_to_dict(row)
+                        if mem["id"] in existing_ids:
+                            continue
+                        mem["related"] = True
+                        mem["match_score"] = row["shared"] / max(len(all_entity_tags), 1)
+                        related.append(mem)
+                        existing_ids.add(mem["id"])
+                        if len(related) >= max_related:
+                            break
+                except Exception as e:
+                    logger.debug("Related expansion query failed: %s", e)
 
         if not related:
             return results
