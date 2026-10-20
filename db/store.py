@@ -420,7 +420,9 @@ class MemoryStore:
                    status: str = "active",
                    why_it_matters: str | None = None,
                    origin_type: str | None = None,
-                   origin_file: str | None = None) -> str | None:
+                   origin_file: str | None = None,
+                   valid_from: str | None = None,
+                   valid_until: str | None = None) -> str | None:
         """Returns memory ID on success, None if exact duplicate.
 
         Raises GuardrailRejection if content is document-shaped (too long, too
@@ -494,18 +496,20 @@ class MemoryStore:
         try:
             # Hold the lock across INSERT + FTS sync + commit so another
             # thread's commit can't land mid-sequence (issue #6).
+            v_from = valid_from or now
+            v_until = valid_until or expires_at
             with self._conn.transaction():
                 self._conn.execute(
                     """INSERT INTO memories
                        (id,profile,content,content_hash,category,importance,
                         created_at,last_accessed,tags,project_id,token_count,source,client_name,
                         confidence,expires_at,status,
-                        why_it_matters,origin_type,origin_file)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        why_it_matters,origin_type,origin_file,valid_from,valid_until)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (mid, profile, content, h, category, importance,
                      now, now, json.dumps(enriched_tags or []), project_id, tc, source, client_name,
                      float(confidence), expires_at, status,
-                     why_it_matters, origin_type, origin_file)
+                     why_it_matters, origin_type, origin_file, v_from, v_until)
                 )
                 # Supersession: invalidate the facts this one replaces, in the
                 # same transaction so the swap is atomic (#temporal).
@@ -836,12 +840,52 @@ class MemoryStore:
     # Memories — read
     # -------------------------------------------------------------------------
 
+    def _temporal_filter(self, as_of: str | None = None, table_alias: str = "") -> tuple[str, list[Any]]:
+        """Construct WHERE clause and parameter list for bi-temporal filtering.
+
+        - When as_of is None (current recall):
+          Filters for currently active memories that have not ceased validity:
+          archived = 0 AND (valid_from IS NULL OR valid_from <= now) AND (valid_until IS NULL OR valid_until > now) AND (expires_at IS NULL OR expires_at > now).
+        - When as_of is an ISO timestamp (historical epistemic time travel):
+          Reconstructs what the agent believed was true as of that timestamp:
+          created_at <= as_of AND (archived = 0 OR (archived_at IS NOT NULL AND archived_at > as_of)) AND (valid_from IS NULL OR valid_from <= as_of) AND (valid_until IS NULL OR valid_until > as_of) AND (expires_at IS NULL OR expires_at > as_of).
+        """
+        prefix = f"{table_alias}." if table_alias else ""
+        if as_of is None:
+            now_str = datetime.now().isoformat()
+            clause = (
+                f"{prefix}archived = 0 AND "
+                f"({prefix}valid_from IS NULL OR {prefix}valid_from <= ?) AND "
+                f"({prefix}valid_until IS NULL OR {prefix}valid_until > ?) AND "
+                f"({prefix}expires_at IS NULL OR {prefix}expires_at > ?)"
+            )
+            return clause, [now_str, now_str, now_str]
+        else:
+            norm_as_of = as_of.strip()
+            try:
+                datetime.fromisoformat(norm_as_of.replace("Z", "+00:00"))
+            except Exception as e:
+                raise ValueError(f"Invalid ISO timestamp for as_of: {as_of}") from e
+
+            clause = (
+                f"{prefix}created_at <= ? AND "
+                f"({prefix}archived = 0 OR ({prefix}archived_at IS NOT NULL AND {prefix}archived_at > ?)) AND "
+                f"({prefix}valid_from IS NULL OR {prefix}valid_from <= ?) AND "
+                f"({prefix}valid_until IS NULL OR {prefix}valid_until > ?) AND "
+                f"({prefix}expires_at IS NULL OR {prefix}expires_at > ?)"
+            )
+            return clause, [norm_as_of, norm_as_of, norm_as_of, norm_as_of, norm_as_of]
+
     def get_memories(self, profile: str, category: str = None,
-                     max_tokens: int = None, min_confidence: float = 0.0) -> list[dict]:
-        """Return active memories, ranked by relevance_score desc."""
-        now_str = datetime.now().isoformat()
-        sql = "SELECT * FROM memories WHERE profile=? AND archived=0 AND confidence>=? AND (expires_at IS NULL OR expires_at > ?)"
-        params = [profile, min_confidence, now_str]
+                     max_tokens: int = None, min_confidence: float = 0.0,
+                     as_of: str | None = None) -> list[dict]:
+        """Return active memories, ranked by relevance_score desc.
+        
+        Supports bi-temporal historical time travel via optional `as_of` ISO timestamp.
+        """
+        t_clause, t_params = self._temporal_filter(as_of)
+        sql = f"SELECT * FROM memories WHERE profile=? AND {t_clause} AND confidence>=?"
+        params = [profile, *t_params, min_confidence]
         if category:
             sql += " AND category=?"
             params.append(category)
@@ -861,13 +905,14 @@ class MemoryStore:
 
     def search(self, profile: str, query: str, category: str = None,
                limit: int = 5, max_tokens: int = 800, min_confidence: float = 0.0,
-               importance_boost: bool = True) -> list[dict]:
+               importance_boost: bool = True, as_of: str | None = None,
+               **kwargs) -> list[dict]:
         """FTS5 BM25 search with token budget.
 
         When BM25 returns no active results the query is re-run against archived
         memories so that queries using an obsolete term (e.g. an old employer
         name) can surface the replacement belief via the counter-signal path
-        (Fix 4: counter-signal retrieval).
+        (Fix 4: counter-signal retrieval). Suppressed during as_of time-travel.
 
         When *importance_boost* is True (default), a second pass queries the DB
         for high-importance beliefs that fit in remaining budget but were not
@@ -880,18 +925,17 @@ class MemoryStore:
             return []
         safe_query = " OR ".join(f'"{t}"' for t in terms)
 
-        now_str = datetime.now().isoformat()
-        sql = """
+        t_clause, t_params = self._temporal_filter(as_of, table_alias="m")
+        sql = f"""
             SELECT m.*, bm25(memories_fts) AS bm25_score
             FROM memories_fts
             JOIN memories m ON memories_fts.rowid = m.rowid
             WHERE memories_fts MATCH ?
               AND m.profile = ?
-              AND m.archived = 0
+              AND {t_clause}
               AND m.confidence >= ?
-              AND (m.expires_at IS NULL OR m.expires_at > ?)
         """
-        params = [safe_query, profile, min_confidence, now_str]
+        params = [safe_query, profile, *t_params, min_confidence]
         if category:
             sql += " AND m.category = ?"
             params.append(category)
@@ -903,10 +947,11 @@ class MemoryStore:
         except sqlite3.OperationalError as fts_err:
             logging.warning("FTS5 parse error for query %r: %s — falling back to LIKE search", query, fts_err)
             like_pattern = f"%{query}%"
+            t_clause_bare, t_params_bare = self._temporal_filter(as_of)
             like_sql = (
-                "SELECT * FROM memories WHERE profile=? AND archived=0 AND confidence>=? AND (expires_at IS NULL OR expires_at > ?) AND content LIKE ?"
+                f"SELECT * FROM memories WHERE profile=? AND {t_clause_bare} AND confidence>=? AND content LIKE ?"
             )
-            like_params = [profile, min_confidence, now_str, like_pattern]
+            like_params = [profile, *t_params_bare, min_confidence, like_pattern]
             if category:
                 like_sql += " AND category=?"
                 like_params.append(category)
@@ -916,10 +961,9 @@ class MemoryStore:
 
         # Fix 4: counter-signal retrieval — when BM25 found nothing in active
         # memories, check whether any archived (superseded) memories matched the
-        # query terms and, if so, surface their replacements. This ensures that
-        # querying an obsolete term (e.g. an old employer name) returns the
-        # current belief rather than an empty result set.
-        if not rows:
+        # query terms and, if so, surface their replacements.
+        # Only run for current recall (suppressed for historical as_of queries).
+        if not rows and as_of is None:
             archived_rows = self._conn.execute(
                 "SELECT DISTINCT superseded_by FROM memories "
                 "WHERE profile=? AND archived=1 AND superseded_by IS NOT NULL "
@@ -960,27 +1004,19 @@ class MemoryStore:
             if len(results) >= limit:
                 break
 
-        # Fix 3: importance-aware budget second pass — after the main BM25 trim,
-        # query the DB directly for high-importance beliefs that fit in the
-        # remaining budget but were not already admitted. This covers the case
-        # where a high-importance belief had zero token overlap with the query
-        # (BM25 never returned it) but should still be surfaced because it fits
-        # and the caller has capacity left.
-        # Disabled (importance_boost=False) for internal search_hybrid calls that
-        # run their own RRF-based prioritisation over both legs.
+        # Fix 3: importance-aware budget second pass
         admitted_ids = {m["id"] for m in results}
         remaining = max_tokens - tokens_used
         if importance_boost and remaining > 0 and len(results) < limit:
-            now_str2 = datetime.now().isoformat()
+            t_clause_imp, t_params_imp = self._temporal_filter(as_of)
             high_rows = self._conn.execute(
-                "SELECT * FROM memories "
-                "WHERE profile=? AND archived=0 AND importance='high' "
-                "  AND token_count <= ? "
-                "  AND (expires_at IS NULL OR expires_at > ?) "
-                "  AND confidence >= ? "
-                "ORDER BY relevance_score DESC "
-                "LIMIT ?",
-                (profile, remaining, now_str2, min_confidence, limit * 2)
+                f"SELECT * FROM memories "
+                f"WHERE profile=? AND {t_clause_imp} AND importance='high' "
+                f"  AND token_count <= ? "
+                f"  AND confidence >= ? "
+                f"ORDER BY relevance_score DESC "
+                f"LIMIT ?",
+                (profile, *t_params_imp, remaining, min_confidence, limit * 2)
             ).fetchall()
             for row in high_rows:
                 m = self._row_to_dict(row)
@@ -1294,6 +1330,11 @@ class MemoryStore:
                     self._conn.commit()
             # Autonomous background semantic near-neighbor edge linking
             self._auto_link_semantic(memory_id, profile, vec)
+            # Autonomous relation & triple mining in background
+            try:
+                self.mine_relations(memory_id, profile=profile, auto_link=True)
+            except Exception as e:
+                logger.debug("Background relation mining failed for %s: %s", memory_id, e)
             return True
         except Exception as e:
             import sys
@@ -1386,6 +1427,8 @@ class MemoryStore:
         # existed. SQLite has no ADD COLUMN IF NOT EXISTS, so check first.
         try:
             cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+            if "valid_from" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN valid_from TEXT")
             if "valid_until" not in cols:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN valid_until TEXT")
             if "superseded_by" not in cols:
@@ -1577,10 +1620,12 @@ class MemoryStore:
 
     def search_semantic(self, profile: str, query: str,
                         limit: int = 5, max_tokens: int = 800,
-                        min_confidence: float = 0.0) -> list[dict]:
+                        min_confidence: float = 0.0,
+                        as_of: str | None = None) -> list[dict]:
         """
         Vector cosine-similarity search against stored embeddings.
         Falls back to FTS5 if no embeddings have been built for this profile.
+        Supports bi-temporal as_of historical time travel.
         """
         # Check embeddings exist for this profile
         count = self._conn.execute(
@@ -1588,7 +1633,7 @@ class MemoryStore:
         ).fetchone()[0]
         if count == 0:
             return self.search(profile, query, limit=limit, max_tokens=max_tokens,
-                               min_confidence=min_confidence)
+                               min_confidence=min_confidence, as_of=as_of)
 
         # Embed query. If the embedding model can't load (fastembed missing,
         # download failed), DON'T let the exception propagate — callers (merger,
@@ -1601,7 +1646,7 @@ class MemoryStore:
             logger.error("Embedding model unavailable (%s) — falling back to "
                          "keyword search; semantic dedup is degraded.", e)
             return self.search(profile, query, limit=limit, max_tokens=max_tokens,
-                               min_confidence=min_confidence)
+                               min_confidence=min_confidence, as_of=as_of)
         q_len = len(q_vec)
 
         # Score by cosine similarity. Collect usable same-dimension vectors into
@@ -1610,22 +1655,17 @@ class MemoryStore:
         # skipped (dimension guard, #52) so a model change can't crash search.
         import numpy as np
         
-        cached = self._embedding_cache.get(profile)
+        cached = self._embedding_cache.get(profile) if as_of is None else None
         if cached is not None:
             ids, confidences, M = cached
             mismatched = 0
         else:
-            # Fetch embedding rows for profile, joined against memories to exclude
-            # archived ones (issue #181 P2-1): archived memories are unreachable
-            # via normal reads (archived=0 is hardcoded on every read path) but
-            # their embeddings were still being loaded and scored on every
-            # semantic search — pure wasted work once a memory is archived.
-            # Query confidence as well to do query-time filtering.
+            t_clause, t_params = self._temporal_filter(as_of, table_alias="m")
             rows = self._conn.execute(
-                "SELECT e.id, e.vector, m.confidence FROM memory_embeddings e "
-                "JOIN memories m ON m.id = e.id "
-                "WHERE e.profile=? AND m.archived=0",
-                (profile,)
+                f"SELECT e.id, e.vector, m.confidence FROM memory_embeddings e "
+                f"JOIN memories m ON m.id = e.id "
+                f"WHERE e.profile=? AND {t_clause}",
+                (profile, *t_params)
             ).fetchall()
 
             ids: list[str] = []
@@ -1643,7 +1683,8 @@ class MemoryStore:
             
             if mat:
                 M = np.asarray(mat, dtype=np.float32)
-                self._embedding_cache.set(profile, ids, confidences, M)
+                if as_of is None:
+                    self._embedding_cache.set(profile, ids, confidences, M)
             else:
                 M = np.array([])
 
@@ -1678,7 +1719,7 @@ class MemoryStore:
             # Every stored vector is unusable (e.g. model changed) — don't return
             # an empty result set; degrade to keyword/FTS search.
             return self.search(profile, query, limit=limit, max_tokens=max_tokens,
-                               min_confidence=min_confidence)
+                               min_confidence=min_confidence, as_of=as_of)
 
         # Sort descending by similarity
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -1687,11 +1728,12 @@ class MemoryStore:
         if not top_ids:
             return []
 
-        # Fetch full memory rows for top IDs (excluding archived)
+        # Fetch full memory rows for top IDs
+        t_clause_final, t_params_final = self._temporal_filter(as_of)
         placeholders = ",".join("?" * len(top_ids))
         mem_rows = self._conn.execute(
-            f"SELECT * FROM memories WHERE id IN ({placeholders}) AND archived=0",
-            top_ids
+            f"SELECT * FROM memories WHERE id IN ({placeholders}) AND {t_clause_final}",
+            (*top_ids, *t_params_final)
         ).fetchall()
 
         # Re-rank in similarity order
@@ -1715,7 +1757,8 @@ class MemoryStore:
                       limit: int = 5, max_tokens: int = 800,
                       recency_boost: bool = True,
                       include_related: bool = False,
-                      min_confidence: float = 0.0) -> list[dict]:
+                      min_confidence: float = 0.0,
+                      as_of: str | None = None) -> list[dict]:
         """
         Reciprocal Rank Fusion of FTS5 BM25 + semantic cosine results.
         RRF score = sum(1 / (60 + rank)) across both lists.
@@ -1725,6 +1768,7 @@ class MemoryStore:
         *include_related* — when True (default), expands results with
         entity-tag-related memories.
         *min_confidence* — filter out memories below confidence threshold.
+        *as_of* — optional ISO timestamp for historical epistemic time travel.
         """
         import concurrent.futures
         
@@ -1732,10 +1776,10 @@ class MemoryStore:
             kw_future = pool.submit(self.search, profile, query, category=category,
                                     limit=limit * 2, max_tokens=max_tokens * 2,
                                     min_confidence=min_confidence,
-                                    importance_boost=False)
+                                    importance_boost=False, as_of=as_of)
             sem_future = pool.submit(self.search_semantic, profile, query, limit=limit * 2,
                                      max_tokens=max_tokens * 2,
-                                     min_confidence=min_confidence)
+                                     min_confidence=min_confidence, as_of=as_of)
             
             keyword_results = kw_future.result()
             semantic_results = sem_future.result()
@@ -1874,12 +1918,14 @@ class MemoryStore:
         max_nodes: int = 10,
         include_archived: bool = False,
         directed: bool = False,
+        as_of: str | None = None,
     ) -> list[dict]:
         """Perform breadth-first multi-hop graph traversal starting from start_ids.
 
         Traverses memory_edges up to max_hops (clamped between 1 and 3).
         Guards against graph cycles with a visited set.
         Applies geometric score decay per hop (hop 1: 1.0, hop 2: 0.5, hop 3: 0.25).
+        Supports bi-temporal as_of historical time travel.
 
         Returns a list of discovered memory dicts enriched with:
             - 'hop_distance': int (1, 2, 3)
@@ -1908,22 +1954,20 @@ class MemoryStore:
             frontier_list = list(current_frontier)
             placeholders = ",".join("?" for _ in frontier_list)
             try:
+                edge_params: list[Any] = []
+                edge_sql = "SELECT source_id, target_id, relation FROM memory_edges WHERE "
                 if directed:
-                    edge_rows = self._conn.execute(
-                        f"""SELECT source_id, target_id, relation
-                            FROM memory_edges
-                            WHERE source_id IN ({placeholders})
-                            ORDER BY created_at DESC""",
-                        frontier_list,
-                    ).fetchall()
+                    edge_sql += f"source_id IN ({placeholders})"
+                    edge_params.extend(frontier_list)
                 else:
-                    edge_rows = self._conn.execute(
-                        f"""SELECT source_id, target_id, relation
-                            FROM memory_edges
-                            WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})
-                            ORDER BY created_at DESC""",
-                        (*frontier_list, *frontier_list),
-                    ).fetchall()
+                    edge_sql += f"(source_id IN ({placeholders}) OR target_id IN ({placeholders}))"
+                    edge_params.extend(frontier_list)
+                    edge_params.extend(frontier_list)
+                if as_of is not None:
+                    edge_sql += " AND created_at <= ?"
+                    edge_params.append(as_of.strip())
+                edge_sql += " ORDER BY created_at DESC"
+                edge_rows = self._conn.execute(edge_sql, edge_params).fetchall()
             except Exception as e:
                 logger.debug("Graph edge query failed: %s", e)
                 break
@@ -1957,13 +2001,18 @@ class MemoryStore:
             nf_list = list(next_frontier)
             nf_placeholders = ",".join("?" for _ in nf_list)
 
-            sql = f"SELECT * FROM memories WHERE id IN ({nf_placeholders})"
-            params: list[Any] = list(nf_list)
+            if as_of is not None:
+                t_clause, t_params = self._temporal_filter(as_of)
+                sql = f"SELECT * FROM memories WHERE id IN ({nf_placeholders}) AND {t_clause}"
+                params: list[Any] = list(nf_list) + t_params
+            else:
+                sql = f"SELECT * FROM memories WHERE id IN ({nf_placeholders})"
+                params = list(nf_list)
+                if not include_archived:
+                    sql += " AND archived = 0"
             if profile:
                 sql += " AND profile = ?"
                 params.append(profile)
-            if not include_archived:
-                sql += " AND archived = 0"
 
             try:
                 mem_rows = self._conn.execute(sql, params).fetchall()
@@ -2233,15 +2282,109 @@ class MemoryStore:
             logger.debug("Auto semantic linking failed: %s", e)
             return 0
 
+    def mine_relations(
+        self,
+        memory_id: str,
+        candidate_ids: list[str] | None = None,
+        profile: str | None = None,
+        auto_link: bool = True,
+    ) -> list[dict]:
+        """Mine explicit relation triples for memory_id using LLM synthesis or heuristics.
+
+        Discovered relations: 'depends_on', 'implements', 'contradicts', 'part_of', 'relates_to', 'supersedes'.
+        When candidate_ids is None, automatically discovers candidates from:
+          1. Shared entity tags
+          2. Semantic near neighbors or BM25 matches
+          3. Recent active memories in profile
+        Idempotently inserts valid discovered relations into memory_edges when auto_link is True.
+        """
+        row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+        if not row:
+            return []
+        source_mem = self._row_to_dict(row)
+        prof = profile or source_mem["profile"]
+
+        candidates: list[dict] = []
+        if candidate_ids is not None:
+            cids = [c for c in candidate_ids if c and c != memory_id]
+            if cids:
+                placeholders = ",".join("?" for _ in cids)
+                c_rows = self._conn.execute(
+                    f"SELECT * FROM memories WHERE id IN ({placeholders}) AND profile=? AND archived=0",
+                    (*cids, prof)
+                ).fetchall()
+                candidates = [self._row_to_dict(r) for r in c_rows]
+        else:
+            cand_dict: dict[str, dict] = {}
+            tags = source_mem.get("tags") or []
+            entity_tags = [t for t in tags if isinstance(t, str) and t.startswith("entity:")]
+            if entity_tags:
+                placeholders = ",".join("?" for _ in entity_tags)
+                try:
+                    e_rows = self._conn.execute(
+                        f"""SELECT m.*, COUNT(DISTINCT jt.value) AS shared
+                            FROM memories m, json_each(m.tags) AS jt
+                            WHERE m.profile = ? AND m.archived = 0 AND m.id != ?
+                              AND jt.value IN ({placeholders})
+                            GROUP BY m.id
+                            ORDER BY shared DESC LIMIT 5""",
+                        (prof, memory_id, *entity_tags)
+                    ).fetchall()
+                    for r in e_rows:
+                        cand_dict[r["id"]] = self._row_to_dict(r)
+                except Exception as e:
+                    logger.debug("Entity candidate search failed: %s", e)
+
+            try:
+                search_hits = self.search(prof, source_mem["content"][:200], limit=5, importance_boost=False)
+                for h in search_hits:
+                    if h["id"] != memory_id and h["id"] not in cand_dict:
+                        cand_dict[h["id"]] = h
+            except Exception as e:
+                logger.debug("Search candidate query failed: %s", e)
+
+            if len(cand_dict) < 5:
+                recent_rows = self._conn.execute(
+                    "SELECT * FROM memories WHERE profile=? AND id!=? AND archived=0 ORDER BY created_at DESC LIMIT 5",
+                    (prof, memory_id)
+                ).fetchall()
+                for r in recent_rows:
+                    if r["id"] not in cand_dict:
+                        cand_dict[r["id"]] = self._row_to_dict(r)
+
+            candidates = list(cand_dict.values())[:10]
+
+        if not candidates:
+            return []
+
+        from db.relations import RelationExtractor
+        extractor = RelationExtractor(llm_synthesize=self._llm_synthesize)
+        extracted = extractor.extract(
+            source_id=memory_id,
+            source_content=source_mem["content"],
+            candidates=candidates,
+        )
+
+        if auto_link and extracted:
+            for item in extracted:
+                try:
+                    eid = self.add_edge(item["source_id"], item["target_id"], item["relation"])
+                    item["edge_id"] = eid
+                except Exception as e:
+                    logger.debug("Failed to auto-insert mined edge: %s", e)
+
+        return extracted
+
     def backfill_graph_edges(self, profile: str | None = None) -> dict[str, int]:
         """Backfill knowledge graph edges across existing memories:
         - Supersession: links memories where superseded_by is set
         - Entity co-occurrence: links memories sharing >= 2 entity tags
         - Semantic similarity: links memories with cosine similarity >= 0.85
+        - Relation mining: extracts semantic relations across active memories
 
         Returns dict with counts of created edges.
         """
-        counts = {"supersedes": 0, "shares_entities": 0, "semantically_similar": 0}
+        counts = {"supersedes": 0, "shares_entities": 0, "semantically_similar": 0, "mined_relations": 0}
         now = datetime.now().isoformat()
 
         # 1. Supersedes backfill
@@ -2306,6 +2449,20 @@ class MemoryStore:
                     counts["semantically_similar"] += self._auto_link_semantic(er["id"], er["profile"], vec)
         except Exception as e:
             logger.debug("Backfill semantic edges failed: %s", e)
+
+        # 4. Relation and triple mining backfill
+        try:
+            sql = "SELECT id, profile FROM memories WHERE archived=0 ORDER BY created_at DESC LIMIT 20"
+            params = []
+            if profile:
+                sql = "SELECT id, profile FROM memories WHERE archived=0 AND profile=? ORDER BY created_at DESC LIMIT 20"
+                params.append(profile)
+            active_mems = self._conn.execute(sql, params).fetchall()
+            for am in active_mems:
+                mined = self.mine_relations(am["id"], profile=am["profile"], auto_link=True)
+                counts["mined_relations"] += len([m for m in mined if "edge_id" in m])
+        except Exception as e:
+            logger.debug("Backfill relation mining failed: %s", e)
 
         return counts
 

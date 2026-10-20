@@ -430,6 +430,21 @@ def cmd_edges(args: argparse.Namespace) -> int:
         print(f"  Supersession edges created: {counts.get('supersedes', 0)}")
         print(f"  Entity co-occurrence edges created: {counts.get('shares_entities', 0)}")
         print(f"  Semantic similarity edges created: {counts.get('semantically_similar', 0)}")
+        print(f"  Relation mining edges created: {counts.get('mined_relations', 0)}")
+
+    elif args.action == "mine":
+        cand_ids = [c.strip() for c in args.candidates.split(",") if c.strip()] if getattr(args, "candidates", None) else None
+        print(f"Mining relations for memory {args.memory_id} in profile '{args.profile}'...")
+        mined = store.mine_relations(args.memory_id, candidate_ids=cand_ids, profile=args.profile, auto_link=True)
+        if not mined:
+            print(f"No relations discovered for memory {args.memory_id}.")
+            return 0
+        print(f"Discovered {len(mined)} relation(s):")
+        for m in mined:
+            print(f"  {m['source_id']} --[{m['relation']}]--> {m['target_id']} (conf: {m.get('confidence', 1.0):.2f})")
+            print(f"    Reason: {m.get('reason', '')}")
+            if "edge_id" in m:
+                print(f"    Edge ID: {m['edge_id']}")
 
     return 0
 
@@ -462,6 +477,80 @@ def cmd_reverse_prune(args: argparse.Namespace) -> int:
             f"  Rule '{result['rule_name']}' penalized: >1 reversal in 30d, "
             f"confidence held below auto-execute until it re-earns it"
         )
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """Search memories with optional bi-temporal as-of time travel."""
+    data = config.data_dir()
+    db_path = data / "memory.db"
+    if not db_path.exists():
+        print(f"Database not found: {db_path} (run `mb init` first)")
+        return 1
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    from db.store import MemoryStore
+    store = MemoryStore(db_path)
+    profile = args.profile or config.profile()
+    store.ensure_profile(profile)
+    try:
+        results = store.search(
+            profile, args.query, category=args.category,
+            limit=args.limit, as_of=args.as_of
+        )
+    except ValueError as e:
+        print(f"Search error: {e}")
+        return 1
+    if not results:
+        msg = f"No memories found matching '{args.query}'"
+        if args.as_of:
+            msg += f" as of {args.as_of}"
+        print(msg)
+        return 0
+    hdr = f"Found {len(results)} memory(s)"
+    if args.as_of:
+        hdr += f" (as of {args.as_of})"
+    print(hdr + ":")
+    for m in results:
+        valid_range = f"[valid: {m.get('valid_from') or m.get('created_at')} -> {m.get('valid_until') or 'present'}]"
+        print(f"  [{m['id']}] ({m['category']}) {valid_range}")
+        print(f"    {m['content']}")
+    return 0
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    """Recall active memories with optional bi-temporal as-of time travel."""
+    data = config.data_dir()
+    db_path = data / "memory.db"
+    if not db_path.exists():
+        print(f"Database not found: {db_path} (run `mb init` first)")
+        return 1
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    from db.store import MemoryStore
+    store = MemoryStore(db_path)
+    profile = args.profile or config.profile()
+    store.ensure_profile(profile)
+    try:
+        results = store.get_memories(
+            profile, category=args.category,
+            as_of=args.as_of
+        )[:args.limit]
+    except ValueError as e:
+        print(f"Recall error: {e}")
+        return 1
+    if not results:
+        msg = "No memories found"
+        if args.as_of:
+            msg += f" as of {args.as_of}"
+        print(msg)
+        return 0
+    hdr = f"Recalled {len(results)} memory(s)"
+    if args.as_of:
+        hdr += f" (as of {args.as_of})"
+    print(hdr + ":")
+    for m in results:
+        valid_range = f"[valid: {m.get('valid_from') or m.get('created_at')} -> {m.get('valid_until') or 'present'}]"
+        print(f"  [{m['id']}] ({m['category']}) {valid_range}")
+        print(f"    {m['content']}")
     return 0
 
 
@@ -506,6 +595,21 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("--profile", default=config.profile(), help="target profile")
     rv.set_defaults(func=cmd_reverse_prune)
 
+    sc = sub.add_parser("search", help="search memories (BM25) with optional time travel")
+    sc.add_argument("query", help="search terms")
+    sc.add_argument("--profile", default=config.profile(), help="target profile")
+    sc.add_argument("--category", help="category filter")
+    sc.add_argument("--limit", type=int, default=5, help="result limit")
+    sc.add_argument("--as-of", help="epistemic time travel ISO timestamp (e.g. 2026-03-01T00:00:00)")
+    sc.set_defaults(func=cmd_search)
+
+    rc = sub.add_parser("recall", help="recall memories with optional time travel")
+    rc.add_argument("--profile", default=config.profile(), help="target profile")
+    rc.add_argument("--category", help="category filter")
+    rc.add_argument("--limit", type=int, default=10, help="result limit")
+    rc.add_argument("--as-of", help="epistemic time travel ISO timestamp (e.g. 2026-03-01T00:00:00)")
+    rc.set_defaults(func=cmd_recall)
+
     edg = sub.add_parser("edges", help="manage knowledge graph edges")
     edg_sub = edg.add_subparsers(dest="action", required=True)
     el = edg_sub.add_parser("list", help="list graph edges")
@@ -524,6 +628,10 @@ def build_parser() -> argparse.ArgumentParser:
     et.add_argument("--directed", action="store_true", help="only traverse outgoing edges (default: bidirectional)")
     eb = edg_sub.add_parser("auto-link", help="backfill autonomous graph edges across memories")
     eb.add_argument("--profile", default=config.profile(), help="target profile (optional)")
+    em = edg_sub.add_parser("mine", help="mine semantic relations/triples for a memory")
+    em.add_argument("memory_id", help="primary memory ID to evaluate")
+    em.add_argument("--candidates", help="comma-separated candidate memory IDs (optional)")
+    em.add_argument("--profile", default=config.profile(), help="target profile")
     edg.set_defaults(func=cmd_edges)
 
     return p
