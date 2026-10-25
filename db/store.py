@@ -1331,8 +1331,14 @@ class MemoryStore:
             # Autonomous background semantic near-neighbor edge linking
             self._auto_link_semantic(memory_id, profile, vec)
             # Autonomous relation & triple mining in background
+            # Guarded against multi-connection write bursts: only trigger background
+            # mining if entity tags are present on the memory.
             try:
-                self.mine_relations(memory_id, profile=profile, auto_link=True)
+                tag_row = self._conn.execute("SELECT tags FROM memories WHERE id=?", (memory_id,)).fetchone()
+                if tag_row and tag_row["tags"]:
+                    tags = json.loads(tag_row["tags"]) if isinstance(tag_row["tags"], str) else tag_row["tags"]
+                    if any(isinstance(t, str) and t.startswith("entity:") for t in tags):
+                        self.mine_relations(memory_id, profile=profile, auto_link=True)
             except Exception as e:
                 logger.debug("Background relation mining failed for %s: %s", memory_id, e)
             return True

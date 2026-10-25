@@ -238,6 +238,6 @@ class RelationExtractor:
                 data = json.loads(json_str)
                 if isinstance(data, list):
                     return [d for d in data if isinstance(d, dict)]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to parse JSON array from LLM response: %s", e)
         return []
