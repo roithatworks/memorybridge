@@ -336,7 +336,8 @@ def get_memory(
     category: Optional[str] = None,
     max_tokens: int = MAX_TOKENS_DEFAULT,
     compress: bool = True,
-    min_confidence: float = 0.0
+    min_confidence: float = 0.0,
+    as_of: Optional[str] = None
 ) -> str:
     """
     Retrieve relevant memory slice within token budget.
@@ -348,6 +349,7 @@ def get_memory(
         max_tokens: Maximum tokens to return (default 4000)
         compress: Whether to compress memories to fit budget (default True)
         min_confidence: Minimum confidence threshold (default 0.0)
+        as_of: Optional ISO timestamp for epistemic time travel (e.g. 2026-03-01T00:00:00)
     Returns:
         JSON with memories, token stats, and budget info
     """
@@ -365,19 +367,20 @@ def get_memory(
         hint_results = _store.search_hybrid(
             profile, context_hint, category=category,
             limit=20, max_tokens=MAX_TOKENS_DEFAULT,
-            min_confidence=min_confidence
+            min_confidence=min_confidence,
+            as_of=as_of
         )
         hint_ids = {m["id"] for m in hint_results}
 
         # Full list for budget fill — apply decay, exclude hint hits (added first)
-        all_memories = _store.get_memories(profile, category=category, min_confidence=min_confidence)
+        all_memories = _store.get_memories(profile, category=category, min_confidence=min_confidence, as_of=as_of)
         all_memories = apply_decay([m.copy() for m in all_memories], DECAY_CONFIG)
         remainder = [m for m in all_memories if m["id"] not in hint_ids]
         remainder.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
 
         memories = hint_results + remainder
     else:
-        memories = _store.get_memories(profile, category=category, min_confidence=min_confidence)
+        memories = _store.get_memories(profile, category=category, min_confidence=min_confidence, as_of=as_of)
         memories = apply_decay([m.copy() for m in memories], DECAY_CONFIG)
         memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
 
@@ -521,7 +524,9 @@ def add_memory(
     confidence: float = 1.0,
     expires_at: Optional[str] = None,
     status: str = "active",
-    why_it_matters: Optional[str] = None
+    why_it_matters: Optional[str] = None,
+    valid_from: Optional[str] = None,
+    valid_until: Optional[str] = None
 ) -> str:
     """
     Add a new memory with automatic token counting and content-hash dedup.
@@ -549,6 +554,8 @@ def add_memory(
         status: Status indicator (default 'active')
         why_it_matters: Optional instruction on how the model should act on this
             fact (e.g. "Format all responses as bullet lists")
+        valid_from: Optional ISO timestamp when fact became valid in reality (defaults to now)
+        valid_until: Optional ISO timestamp when fact ceases validity (defaults to expires_at)
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
@@ -579,7 +586,9 @@ def add_memory(
                                 client_name=_resolve_client_name(client_name),
                                 confidence=confidence, expires_at=expires_at, status=status,
                                 why_it_matters=why_it_matters,
-                                origin_type="manual")
+                                origin_type="manual",
+                                valid_from=valid_from,
+                                valid_until=valid_until)
     except GuardrailRejection as e:
         # Document-shaped content: return the structured error contract every
         # other validation path uses, instead of surfacing an unhandled MCP error.
@@ -791,6 +800,7 @@ def search_memory(
     include_related: bool = False,
     min_confidence: float = 0.0,
     search_mode: str = "hybrid",
+    as_of: Optional[str] = None,
 ) -> str:
     """
     Search memories using BM25, semantic, or hybrid (RRF) search.
@@ -804,6 +814,8 @@ def search_memory(
         recency_boost: Apply recency weighting (default: true when configured)
         include_related: Include related memories by entity tag overlap (default: false)
         min_confidence: Minimum confidence threshold (default 0.0)
+        search_mode: Mode to search with ('hybrid', 'keyword', or 'semantic')
+        as_of: Optional ISO timestamp for epistemic time travel (e.g. 2026-03-01T00:00:00)
     Returns:
         JSON with ranked results (internal fields stripped)
     """
@@ -821,19 +833,23 @@ def search_memory(
                                 limit=limit, max_tokens=max_tokens,
                                 recency_boost=recency_boost,
                                 include_related=include_related,
-                                min_confidence=min_confidence)
+                                min_confidence=min_confidence,
+                                as_of=as_of)
     elif search_mode == "semantic":
-        results = _store.search_semantic(profile, query, limit=limit, max_tokens=max_tokens)
+        results = _store.search_semantic(profile, query, limit=limit, max_tokens=max_tokens,
+                                         min_confidence=min_confidence, as_of=as_of)
     else:
         results = _store.search_hybrid(profile, query, category=category,
                                        limit=limit, max_tokens=max_tokens,
                                        recency_boost=recency_boost,
                                        include_related=include_related,
-                                       min_confidence=min_confidence)
+                                       min_confidence=min_confidence,
+                                       as_of=as_of)
 
-    # Boost relevance score for all returned memories in a single commit (issue #12)
-    _store.boost_batch(profile, [m["id"] for m in results],
-                       boost=DECAY_CONFIG.get("boost_on_access", 0.1))
+    # Boost relevance score for returned memories if not a historical query (issue #12)
+    if not as_of:
+        _store.boost_batch(profile, [m["id"] for m in results],
+                           boost=DECAY_CONFIG.get("boost_on_access", 0.1))
 
     response = {
         "query": query,
@@ -950,13 +966,26 @@ def consolidate_session(
         except GuardrailRejection as e:
             rejected.append({"content": candidate, "reason": str(e)})
 
-    _store.log_access("consolidate_session", profile, f"added={len(added)}, duplicates={len(duplicates)}, rejected={len(rejected)}")
+    edges_created = 0
+    if len(added) >= 2:
+        added_ids = [m["memory_id"] for m in added]
+        for item in added:
+            mid = item["memory_id"]
+            other_ids = [oid for oid in added_ids if oid != mid]
+            try:
+                mined = _store.mine_relations(mid, candidate_ids=other_ids, profile=profile, auto_link=True)
+                edges_created += len([m for m in mined if "edge_id" in m])
+            except Exception as e:
+                logger.debug("Failed relation mining in consolidate_session: %s", e)
+
+    _store.log_access("consolidate_session", profile, f"added={len(added)}, duplicates={len(duplicates)}, rejected={len(rejected)}, edges={edges_created}")
     return json.dumps({
         "status": "consolidated",
         "profile": profile,
         "added_count": len(added),
         "duplicate_count": len(duplicates),
         "rejected_count": len(rejected),
+        "edges_created": edges_created,
         "promoted_memories": added,
         "rejected": rejected
     }, indent=2)
@@ -1007,7 +1036,8 @@ def traverse_memory_graph(
     max_hops: int = 2,
     max_nodes: int = 10,
     profile: str = None,
-    directed: bool = False
+    directed: bool = False,
+    as_of: Optional[str] = None
 ) -> str:
     """
     Perform a multi-hop graph traversal starting from a specific memory.
@@ -1020,6 +1050,7 @@ def traverse_memory_graph(
         max_nodes: Maximum number of connected memories to return (default 10)
         profile: Memory profile name (defaults to active profile)
         directed: Whether to traverse only outgoing edges (default False: bidirectional)
+        as_of: Optional ISO timestamp for epistemic time travel (e.g. 2026-03-01T00:00:00)
     Returns:
         JSON object containing start node, discovered nodes with hops, paths, and scores.
     """
@@ -1041,7 +1072,8 @@ def traverse_memory_graph(
         max_hops=hops,
         max_nodes=limit,
         include_archived=False,
-        directed=directed
+        directed=directed,
+        as_of=as_of
     )
 
     cleaned_nodes = []
@@ -1063,6 +1095,39 @@ def traverse_memory_graph(
         "count": len(cleaned_nodes),
         "nodes": cleaned_nodes
     }, indent=2)
+
+
+@mcp.tool()
+def mine_memory_relations(
+    memory_id: str,
+    candidate_ids: Optional[list[str]] = None,
+    profile: Optional[str] = None
+) -> str:
+    """
+    Mine semantic relationships and triples for a memory against candidates or the knowledge graph.
+    Extracts relations ('depends_on', 'implements', 'contradicts', 'part_of', 'relates_to', 'supersedes')
+    using LLM reasoning or heuristic extraction, and links them into the knowledge graph.
+
+    Args:
+        memory_id: The primary memory ID to evaluate
+        candidate_ids: Optional list of target memory IDs to check relations against (defaults to auto-discovered candidates)
+        profile: Memory profile name (defaults to active profile)
+    Returns:
+        JSON list of discovered relations and created edges
+    """
+    prof = profile or _active_profile()
+    _validate_profile(prof)
+    try:
+        mined = _store.mine_relations(memory_id, candidate_ids=candidate_ids, profile=prof, auto_link=True)
+        return json.dumps({
+            "status": "success",
+            "memory_id": memory_id,
+            "profile": prof,
+            "relations_mined": len(mined),
+            "relations": mined
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
