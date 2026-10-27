@@ -12,13 +12,17 @@ Your memory database lives in SQLite on your machine — the store and stdio ser
 
 - **Persistent memory** across conversations — Claude knows your name, preferences, and projects without re-explaining
 - **Hybrid search** — BM25 full-text + semantic embeddings + Reciprocal Rank Fusion find the right memories even on paraphrased queries
+- **Autonomous Knowledge Graph & Multi-Hop Traversal** — discovers typed directed relations (`depends_on`, `implements`, `contradicts`, `part_of`, `relates_to`, `supersedes`) with BFS multi-hop discovery and graph-enriched recall
+- **Bi-Temporal Validity & Epistemic Time Travel** — facts track when they became true (`valid_from`) and expired (`valid_until`); query historical states of truth as of any point in time (`as_of`)
+- **Multi-Model HTTP Bridge** — expose memory securely to ChatGPT, Gemini, Perplexity, or custom agents via standard `Authorization: Bearer <token>` headers or capability URLs
+- **Workspace Sandbox** — sandboxed scratchpad tools (`ws_read`, `ws_write`, `ws_search`, `ws_list`) for remote models without local filesystem access
 - **Token-budget aware** — smart retrieval fills Claude's context window without going over; older memories are compressed or archived automatically
 - **Decay scoring** — memories fade naturally over time unless accessed frequently or marked important
 - **Multiple profiles** — separate memory contexts for work, personal, research, etc.
 - **Ingestion pipeline** — import conversation history from Claude, ChatGPT, or Gemini; DeepSeek R1 extracts facts, Claude resolves conflicts
 - **Inbox watcher** — drop an export file into `<data dir>/inbox/` and it's ingested automatically on the next scan; zero CLI required
 - **Cross-model export** — Memory Passport (plain text, any AI) or model-specific formats (ChatGPT, Gemini, Ollama)
-- **Streamlit UI** — review flagged memories, browse/delete, see analytics, run imports and exports
+- **Streamlit UI** — review flagged memories, browse/delete, inspect interactive multi-hop knowledge graph, see analytics, run imports and exports
 
 ---
 
@@ -277,9 +281,11 @@ Retired launchd job plists are archived in `~/memorybridge/launchd-retired/` for
 ## Architecture
 
 ```text
-server.py              — FastMCP server, 12 MCP tools
-db/store.py            — SQLite persistence, FTS5, embeddings, WAL mode
+server.py              — FastMCP server, 29 MCP tools (stdio & HTTP bridge)
+db/store.py            — SQLite persistence, FTS5, embeddings, WAL mode, bitemporal queries
+db/relations.py        — Entity relation graph, heuristic & LLM extraction
 db/schema.sql          — Schema with content-hash dedup index
+workspace.py           — Sandboxed workspace file tools (ws_read, ws_write, ws_search, ws_status, ws_list)
 ingestion/
   run.py               — CLI ingestion pipeline
   watcher.py           — Inbox scanner (called by launchd)
@@ -293,7 +299,7 @@ ingestion/
   passport.py          — Memory Passport builder
 ui/
   app.py               — Streamlit entry point
-  views/               — flagged_queue, memory_browser, analytics, portability
+  views/               — flagged_queue, memory_browser, analytics, portability, graph_view
 cli.py                 — the `mb` command (init / serve / ingest / ui)
 config.py              — central config loader (memorybridge.yaml)
 launchd/               — optional macOS service templates

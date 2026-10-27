@@ -27,6 +27,7 @@ flowchart LR
 
     style F1 fill:#2d5,stroke:#333
     style F4 fill:#2d5,stroke:#333
+    style F2 fill:#2d5,stroke:#333
     style F6 fill:#ddd,stroke:#333,stroke-dasharray: 4 4
 ```
 

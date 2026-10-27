@@ -207,7 +207,7 @@ def _make_mw(token, limit=5, window=60):
     return server._RateLimitAuthMiddleware(app, token, limit, window)
 
 
-def _status(mw, path, ip="1.2.3.4"):
+def _status(mw, path, ip="1.2.3.4", headers=None):
     got = {}
 
     async def recv():
@@ -217,8 +217,13 @@ def _status(mw, path, ip="1.2.3.4"):
         if msg["type"] == "http.response.start":
             got["status"] = msg["status"]
 
+    hdrs = [(b"cf-connecting-ip", ip.encode())]
+    if headers:
+        for k, v in headers.items():
+            hdrs.append((k.encode() if isinstance(k, str) else k, v.encode() if isinstance(v, str) else v))
+
     scope = {"type": "http", "path": path,
-             "headers": [(b"cf-connecting-ip", ip.encode())], "client": ("9.9.9.9", 1)}
+             "headers": hdrs, "client": ("9.9.9.9", 1)}
     asyncio.new_event_loop().run_until_complete(mw(scope, recv, send))
     return got["status"]
 
@@ -232,6 +237,61 @@ def test_middleware_valid_token_passes_through():
 
 def test_middleware_bad_token_returns_404():
     assert _status(_make_mw(TOKEN), "/deadbeef/mcp", "2.2.2.2") == 404
+
+
+def test_middleware_valid_bearer_token_passes_through():
+    mw = _make_mw(TOKEN)
+    assert _status(mw, "/mcp", "1.1.1.1", headers={"authorization": f"Bearer {TOKEN}"}) == 200
+
+
+def test_middleware_bearer_token_rewrites_mcp_path():
+    received_scope = {}
+
+    async def app(scope, receive, send):
+        received_scope.update(scope)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"OK"})
+
+    mw = server._RateLimitAuthMiddleware(app, TOKEN, 10, 60)
+    scope = {
+        "type": "http",
+        "path": "/mcp",
+        "headers": [(b"authorization", f"Bearer {TOKEN}".encode())],
+        "client": ("1.1.1.1", 1234),
+    }
+
+    async def recv():
+        return {"type": "http.request"}
+
+    async def send(msg):
+        pass
+
+    asyncio.new_event_loop().run_until_complete(mw(scope, recv, send))
+    assert received_scope.get("path") == f"/{TOKEN}/mcp"
+
+
+def test_middleware_bad_bearer_token_returns_404():
+    mw = _make_mw(TOKEN)
+    assert _status(mw, "/mcp", "2.2.2.2", headers={"authorization": "Bearer WRONG_TOKEN"}) == 404
+
+
+def test_middleware_non_ascii_bearer_token_returns_404():
+    mw = _make_mw(TOKEN)
+    assert _status(mw, "/mcp", "3.3.3.3", headers={"authorization": "Bearer ééé_invalid"}) == 404
+
+
+def test_middleware_bearer_and_path_token_coexist():
+    mw = _make_mw(TOKEN)
+    assert _status(mw, f"/{TOKEN}/mcp", "4.4.4.4", headers={"authorization": f"Bearer {TOKEN}"}) == 200
+
+
+def test_remote_allowed_tools_includes_graph_and_workspace_write():
+    assert "traverse_memory_graph" in server.REMOTE_ALLOWED_TOOLS
+    assert "get_memory_edges" in server.REMOTE_ALLOWED_TOOLS
+    assert "ws_write" in server.REMOTE_ALLOWED_TOOLS
+    assert "delete_memory" not in server.REMOTE_ALLOWED_TOOLS
+    assert "edit_memory" not in server.REMOTE_ALLOWED_TOOLS
+    assert "prune_memories" not in server.REMOTE_ALLOWED_TOOLS
 
 
 def test_middleware_rate_limit_returns_429_and_is_per_ip():
