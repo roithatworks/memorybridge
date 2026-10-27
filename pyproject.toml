@@ -46,7 +46,7 @@ Repository = "https://github.com/roithatworks/memorybridge"
 
 [tool.setuptools]
 # Flat layout: top-level modules + the package dirs.
-py-modules = ["server", "config", "exports", "cli"]
+py-modules = ["server", "config", "exports", "cli", "workspace"]
 
 [tool.setuptools.packages.find]
 include = ["db*", "ingestion*", "ui*"]

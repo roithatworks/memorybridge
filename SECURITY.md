@@ -19,13 +19,16 @@ Storage is a **SQLite database** (WAL mode) at `~/memorybridge/memory.db` (overr
 
 Because the bridge is designed to sit behind a public tunnel, it is hardened:
 
-- **Capability-URL auth.** The only credential is a secret embedded in the request path (`/{MEMORYBRIDGE_TOKEN}/mcp`). The server refuses to start HTTP without a token of at least 32 characters. Generate a strong one:
+- **Dual-mode authentication (Bearer header & Capability-URL).** Remote requests authenticate via a shared secret (minimum 32 characters) using either:
+  1. Standard `Authorization: Bearer {MEMORYBRIDGE_TOKEN}` header (recommended; keeps secrets out of URLs, browser history, and proxy logs).
+  2. Capability-URL path (`/{MEMORYBRIDGE_TOKEN}/mcp`) for connector clients that cannot send custom headers (e.g. ChatGPT / Perplexity).
+  The server refuses to start HTTP without a token of at least 32 characters. Generate a strong one:
   ```bash
   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
   ```
-  The token is compared in constant time (`secrets.compare_digest`) and is kept out of the access log.
-- **Per-IP rate limiting** (`MEMORYBRIDGE_RATE_LIMIT`/`MEMORYBRIDGE_RATE_WINDOW`, default 120/60s) blunts brute-force of the token; excess requests get `429`.
-- **Tool gating & write guardrails.** Remote clients are restricted to a read + add allowlist (`get_memory`, `search_memory`, `reflect`, `add_memory`, `list_projects`, `export_passport`). Destructive and subprocess-spawning tools (`edit_memory`, `delete_memory`, `prune_memories`, `ingest_from_inbox`, `switch_profile`, …) are removed before serving, and gating **fails closed** — the server aborts rather than serve them if the tool set can't be enumerated. Furthermore, remote `add_memory` calls **disarm supersession** (ignoring `supersedes` to prevent remote eviction of legitimate memories) and **strip `why_it_matters`** (preventing stored prompt injection into reasoning contexts). Profile creation is also restricted to known profiles.
+  Credentials are compared in constant time (`secrets.compare_digest`) and kept out of access logs.
+- **Per-IP rate limiting** (`MEMORYBRIDGE_RATE_LIMIT`/`MEMORYBRIDGE_RATE_WINDOW`, default 120/60s) blunts brute-force attempts; excess requests receive `429`.
+- **Tool gating & write guardrails.** Remote clients are restricted to a safe allowlist (`get_memory`, `search_memory`, `reflect`, `add_memory`, `list_projects`, `export_passport`, `export_for_model`, `list_profiles`, `traverse_memory_graph`, `get_memory_edges`, `ws_status`, `ws_list`, `ws_read`, `ws_search`, `ws_write`). Destructive and subprocess-spawning tools (`edit_memory`, `delete_memory`, `prune_memories`, `ingest_from_inbox`, `switch_profile`, …) are removed before serving, and gating **fails closed** — the server aborts rather than serve them if the tool set can't be enumerated. Furthermore, remote `add_memory` calls **disarm supersession** (ignoring `supersedes` to prevent remote eviction of legitimate memories) and **strip `why_it_matters`** (preventing stored prompt injection into reasoning contexts). Remote `ws_write` calls require `overwrite=True` and must match configured allowlist paths. Profile creation is also restricted to known profiles.
 - **No cross-session profile bleed.** Over the bridge, a profile-omitted call resolves to the default profile, not a shared mutable global.
 
 ## Other considerations

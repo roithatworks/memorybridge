@@ -1800,13 +1800,11 @@ REMOTE_ALLOWED_TOOLS = {
     # guess the name, with no way to learn what names exist. This is a
     # read-only enumeration of names only — no identity/content/memory data.
     "list_profiles",
-    # F1 workspace read tools — ws_write intentionally excluded here; it is
-    # added to this allowlist only once the F4 remote-write guard exists
-    # (it now does, in workspace.py, but per the F1/F4 doc the allowlist
-    # change and the guard must land in the same commit as a deliberate
-    # decision, not a byproduct of ws_write existing). See F4 acceptance
-    # criteria in docs/MULTI_MODEL_FEATURES.md.
-    "ws_status", "ws_list", "ws_read", "ws_search",
+    # F1/F4 workspace tools — ws_write is guarded by _REMOTE_MODE (requires overwrite=True
+    # and enforces workspace_write_allowed allowlist prefixes).
+    "ws_status", "ws_list", "ws_read", "ws_search", "ws_write",
+    # Knowledge Graph read-only exploration tools (v5.2):
+    "traverse_memory_graph", "get_memory_edges",
 }
 
 
@@ -1868,15 +1866,20 @@ async def _send_plain(send, status: int, text: str) -> None:
 
 
 class _RateLimitAuthMiddleware:
-    """ASGI middleware guarding the HTTP bridge (issue #69).
+    """ASGI middleware guarding the HTTP bridge (issues #69, #177, and Milestone F2).
 
-    - Per-client-IP fixed-window rate limiting -> 429 when exceeded, so the
-      path-embedded capability token cannot be brute-forced without backoff.
-    - Constant-time comparison of the leading path segment against the expected
-      token (`secrets.compare_digest`); a mismatch returns a uniform 404 with no
-      timing signal and never reaches the MCP app.
-    Behind the Cloudflare tunnel the real client IP arrives in CF-Connecting-IP /
-    X-Forwarded-For, so those are honored before the transport peer address.
+    - Per-client-IP fixed-window rate limiting -> 429 when exceeded, so tokens
+      cannot be brute-forced without backoff.
+    - Constant-time comparison of credentials (`secrets.compare_digest`); a mismatch
+      returns a uniform 404 with no timing signal and never reaches the MCP app.
+    - Dual auth support (Milestone F2):
+      1. Standard `Authorization: Bearer <token>` header (preferred, keeps secrets out
+         of URLs, browser history, and proxy logs). Transparently rewrites `/mcp` to
+         the registered FastMCP route.
+      2. Capability-URL path (`/{token}/mcp`) for clients that cannot send custom
+         headers (e.g. ChatGPT / Perplexity no-auth modes).
+    - Behind the Cloudflare tunnel the real client IP arrives in CF-Connecting-IP /
+      X-Forwarded-For, so those are honored before the transport peer address.
     """
 
     def __init__(self, app, expected_token: str, limit: int, window: int):
@@ -1888,7 +1891,7 @@ class _RateLimitAuthMiddleware:
         self._lock = threading.Lock()
 
     def _client_ip(self, scope) -> str:
-        headers = {k.decode().lower(): v.decode()
+        headers = {k.decode("latin1").lower(): v.decode("latin1")
                    for k, v in scope.get("headers", [])}
         for h in ("cf-connecting-ip", "x-forwarded-for"):
             val = headers.get(h, "").strip()
@@ -1923,16 +1926,33 @@ class _RateLimitAuthMiddleware:
                     self._hits.pop(next(iter(self._hits)), None)
             return count <= self.limit
 
-    def _token_ok(self, scope) -> bool:
+    def _authenticate(self, scope) -> tuple[bool, bool]:
+        """Authenticate request via Bearer header (F2) or capability URL path.
+
+        Returns (is_authenticated, was_bearer_token).
+        Uses constant-time secrets.compare_digest for all token checks.
+        """
+        # 1. Bearer header authentication (F2)
+        headers = {k.decode("latin1").lower(): v.decode("latin1", errors="replace")
+                   for k, v in scope.get("headers", [])}
+        auth_val = headers.get("authorization", "").strip()
+        if auth_val.lower().startswith("bearer "):
+            bearer_token = auth_val[7:].strip()
+            if bearer_token.isascii() and secrets.compare_digest(bearer_token, self.expected_token):
+                return True, True
+
+        # 2. Capability URL path fallback: /{token}/mcp
         segment = scope.get("path", "").lstrip("/").split("/", 1)[0]
         # secrets.compare_digest raises TypeError on a non-ASCII str rather
         # than returning False (issue #177) — uvicorn decodes a percent-encoded
-        # non-ASCII path segment to UTF-8 before scope reaches here, so an
-        # unauthenticated request could crash this pre-auth check with a 500
-        # instead of the uniform 404 every other bad token gets.
-        if not segment.isascii():
-            return False
-        return secrets.compare_digest(segment, self.expected_token)
+        # non-ASCII path segment to UTF-8 before scope reaches here.
+        if segment.isascii() and secrets.compare_digest(segment, self.expected_token):
+            return True, False
+
+        return False, False
+
+    def _token_ok(self, scope) -> bool:
+        return self._authenticate(scope)[0]
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -1945,7 +1965,7 @@ class _RateLimitAuthMiddleware:
         # amplification vector. Fail closed to 404, log the exception type only.
         try:
             rate_ok = self._rate_ok(self._client_ip(scope))
-            token_ok = self._token_ok(scope) if rate_ok else True
+            auth_ok, is_bearer = self._authenticate(scope) if rate_ok else (True, False)
         except Exception as e:
             print(f"[memorybridge] auth middleware error (denying request): "
                   f"{type(e).__name__}", file=sys.stderr)
@@ -1954,9 +1974,21 @@ class _RateLimitAuthMiddleware:
         if not rate_ok:
             await _send_plain(send, 429, "rate limit exceeded")
             return
-        if not token_ok:
+        if not auth_ok:
             await _send_plain(send, 404, "not found")
             return
+
+        # If authenticated via Bearer token at /mcp root, rewrite path to FastMCP's
+        # internal registered capability route so routing succeeds transparently.
+        if is_bearer:
+            path = scope.get("path", "")
+            if path == "/mcp" or path.startswith("/mcp/"):
+                new_path = f"/{self.expected_token}{path}"
+                scope = dict(scope)
+                scope["path"] = new_path
+                if "raw_path" in scope:
+                    scope["raw_path"] = new_path.encode("utf-8")
+
         await self.app(scope, receive, send)
 
 
