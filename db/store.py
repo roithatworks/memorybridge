@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 from db.constants import (  # noqa: E402
     VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score,
-    guardrail_check, _merge_tags, _max_importance, generate_tags
+    guardrail_check, _merge_tags, _max_importance, generate_tags, _normalize_entity
 )
 from db.entities import EntityExtractor
 
@@ -490,7 +490,10 @@ class MemoryStore:
         # Fuzzy dedup/merge: check for near-duplicate by entity tag overlap
         # + content similarity. Runs after entity extraction (tags available)
         # but before INSERT so we can redirect to UPDATE.
-        merged_id = self._maybe_merge(profile, content, enriched_tags or [])
+        # Superseding memories explicitly replace facts, so bypass fuzzy merge.
+        merged_id = None
+        if not supersedes:
+            merged_id = self._maybe_merge(profile, content, enriched_tags or [])
         if merged_id:
             self._embedding_cache.invalidate(profile)
             return merged_id
@@ -1904,6 +1907,155 @@ class MemoryStore:
             llm_synthesize=self._llm_synthesize,
         )
         return reflector.reflect(question)
+
+    def consolidate_memories(
+        self,
+        profile: str,
+        topic_or_entity: str,
+        *,
+        summary: str | None = None,
+        min_memories: int = 2,
+        max_memories: int = 15,
+        category: str = "insight",
+        importance: str = "high",
+    ) -> dict[str, Any]:
+        """Consolidate multiple episodic micro-memories into a single high-density summary card.
+
+        Constituent memories are atomically archived and linked via 'supersedes' graph edges
+        for full provenance and auditability.
+        """
+        topic = (topic_or_entity or "").strip()
+        if not topic:
+            return {"status": "error", "reason": "topic_or_entity cannot be empty"}
+
+        norm_entity = _normalize_entity(topic) or topic.lower()
+
+        # 1. Identify candidate active memories
+        search_tags: set[str] = {f"entity:{norm_entity}", f"entity:{topic.lower()}"}
+        try:
+            import config
+            search_tags.update(config.get_entity_alias_group(topic))
+        except Exception:
+            pass
+
+        placeholders = ",".join("?" for _ in search_tags)
+        candidate_ids: list[str] = []
+        try:
+            tag_rows = self._conn.execute(
+                f"""SELECT DISTINCT m.id
+                    FROM memories m, json_each(m.tags) AS jt
+                    WHERE m.profile = ?
+                      AND m.archived = 0
+                      AND jt.value IN ({placeholders})
+                    ORDER BY m.created_at DESC
+                    LIMIT ?""",
+                (profile, *search_tags, max_memories),
+            ).fetchall()
+            for r in tag_rows:
+                if r["id"] not in candidate_ids:
+                    candidate_ids.append(r["id"])
+        except Exception:
+            pass
+
+        # Also search hybrid for topic keywords to catch memories without explicit entity tags
+        try:
+            hybrid_results = self.search_hybrid(profile, topic, limit=max_memories, include_archived=False)
+            for m in hybrid_results:
+                mid = m.get("id")
+                if mid and mid not in candidate_ids and not m.get("archived", False):
+                    candidate_ids.append(mid)
+        except Exception:
+            pass
+
+        candidate_ids = candidate_ids[:max_memories]
+
+        if len(candidate_ids) < min_memories:
+            return {
+                "status": "no_op",
+                "profile": profile,
+                "topic": topic,
+                "candidates_found": len(candidate_ids),
+                "reason": f"Only found {len(candidate_ids)} active memories (minimum required: {min_memories}) for '{topic}'",
+            }
+
+        # 2. Fetch memory details
+        placeholders_cand = ",".join("?" for _ in candidate_ids)
+        rows = self._conn.execute(
+            f"""SELECT id, content, category, importance, created_at, tags
+                FROM memories
+                WHERE id IN ({placeholders_cand}) AND profile = ? AND archived = 0""",
+            (*candidate_ids, profile),
+        ).fetchall()
+        id_to_row = {r["id"]: r for r in rows}
+        valid_candidates = [cid for cid in candidate_ids if cid in id_to_row]
+
+        if len(valid_candidates) < min_memories:
+            return {
+                "status": "no_op",
+                "profile": profile,
+                "topic": topic,
+                "candidates_found": len(valid_candidates),
+                "reason": f"Only found {len(valid_candidates)} active memories after filtering",
+            }
+
+        # 3. Synthesize summary
+        final_summary = summary
+        if not final_summary:
+            if self._llm_synthesize:
+                bullet_list = "\n".join(f"- {id_to_row[cid]['content']}" for cid in valid_candidates)
+                prompt = (
+                    f"Synthesize the following facts and memories regarding '{topic}' into a single, high-density, "
+                    f"concise reference summary card without loss of key details or specifics:\n\n{bullet_list}\n\nSummary:"
+                )
+                try:
+                    res_text = self._llm_synthesize(prompt)
+                    if res_text and isinstance(res_text, str) and len(res_text.strip()) > 10:
+                        final_summary = res_text.strip()
+                except Exception as e:
+                    logger.debug("llm_synthesize failed during consolidate_memories: %s", e)
+
+            if not final_summary:
+                clean_lines = []
+                for cid in valid_candidates:
+                    c = id_to_row[cid]["content"].strip()
+                    if c.startswith("- "):
+                        c = c[2:].strip()
+                    clean_lines.append(f"- {c}")
+                final_summary = f"Consolidated summary for {topic}:\n" + "\n".join(clean_lines)
+
+        # 4. Commit via add_memory with supersedes
+        consolidated_tags = [
+            f"entity:{norm_entity}",
+            "consolidated",
+            "summary",
+            f"topic:{re.sub(r'[^a-zA-Z0-9_-]', '_', topic.lower())}",
+        ]
+        summary_mid = self.add_memory(
+            profile=profile,
+            content=final_summary,
+            category=category,
+            importance=importance,
+            tags=consolidated_tags,
+            supersedes=valid_candidates,
+            source="consolidate_memories",
+            confidence=0.95,
+        )
+
+        self.log_access(
+            "consolidate_memories",
+            profile,
+            f"topic={topic}, archived={len(valid_candidates)}, summary_id={summary_mid}",
+        )
+
+        return {
+            "status": "consolidated",
+            "profile": profile,
+            "topic": topic,
+            "summary_id": summary_mid,
+            "archived_count": len(valid_candidates),
+            "superseded_ids": valid_candidates,
+            "summary": final_summary,
+        }
 
     # -------------------------------------------------------------------------
     # Internal helpers
