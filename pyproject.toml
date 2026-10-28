@@ -49,7 +49,7 @@ Repository = "https://github.com/roithatworks/memorybridge"
 py-modules = ["server", "config", "exports", "cli", "workspace"]
 
 [tool.setuptools.packages.find]
-include = ["db*", "ingestion*", "ui*"]
+include = ["db*", "ingestion*", "ui*", "server*"]
 
 [tool.setuptools.package-data]
 db = ["*.sql"]
