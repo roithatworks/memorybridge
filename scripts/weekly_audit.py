@@ -145,7 +145,9 @@ def main():
             report_lines.append("- No missing rows. Prunes are archiving as expected.")
 
     report_content = "\n".join(report_lines)
-    report_path = os.path.expanduser("~/memorybridge/logs/weekly_audit_report.md")
+    logs_dir = os.path.join(data_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    report_path = os.path.join(logs_dir, "weekly_audit_report.md")
     with open(report_path, "w") as f:
         f.write(report_content)
 
