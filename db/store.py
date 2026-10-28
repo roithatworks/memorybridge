@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import uuid
 import os
+import re
 import functools
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -42,6 +43,7 @@ class DuplicateContentError(ValueError):
 
 
 SCHEMA_SQL = Path(__file__).parent / "schema.sql"
+MAX_EXACT_SEMANTIC_THRESHOLD = 1000  # Max vectors to score without SQL candidate pre-filtering
 
 
 class _LockedCursor:
@@ -535,13 +537,14 @@ class MemoryStore:
             # Embed-on-write (issue #5): background thread so model load
             # doesn't block the MCP response. Tracked in _pending_embeds
             # so shutdown drains it before os._exit(0).
-            t = threading.Thread(
-                target=self._embed_and_cleanup, args=(mid, profile, content),
-                daemon=True, name=f"embed-{mid}"
-            )
-            with self._pending_embed_lock:
-                self._pending_embeds.add(t)
-            t.start()
+            if not os.environ.get("MEMORYBRIDGE_NO_EMBED"):
+                t = threading.Thread(
+                    target=self._embed_and_cleanup, args=(mid, profile, content),
+                    daemon=True, name=f"embed-{mid}"
+                )
+                with self._pending_embed_lock:
+                    self._pending_embeds.add(t)
+                t.start()
             return mid
         except sqlite3.IntegrityError:
             self._conn.rollback()
@@ -1694,9 +1697,47 @@ class MemoryStore:
             else:
                 M = np.array([])
 
-        # Filter by min_confidence using the cached/queried confidences list
+        # Performance optimization (Issue #211):
+        # When profile vector count is large (> MAX_EXACT_SEMANTIC_THRESHOLD),
+        # pre-filter candidate IDs using indexed SQL constraints (FTS5 matches +
+        # top active relevance) to bound matmul size to O(K) instead of O(N).
+        candidate_id_set: set[str] | None = None
+
+        if len(ids) > MAX_EXACT_SEMANTIC_THRESHOLD:
+            cand_ids: set[str] = set()
+            # 1. Lexical hits from FTS5
+            words = [w for w in re.findall(r"\b\w+\b", query) if len(w) > 2]
+            if words:
+                fts_query = " OR ".join(f'"{w}"' for w in words[:10])
+                try:
+                    fts_rows = self._conn.execute(
+                        "SELECT m.id FROM memories_fts f JOIN memories m ON m.rowid = f.rowid "
+                        "WHERE memories_fts MATCH ? AND m.profile = ? AND m.archived = 0 "
+                        "LIMIT 500",
+                        (fts_query, profile),
+                    ).fetchall()
+                    cand_ids.update(r[0] for r in fts_rows)
+                except Exception:
+                    pass
+
+            # 2. High-relevance / recent active memories
+            top_active = self._conn.execute(
+                "SELECT id FROM memories WHERE profile=? AND archived=0 "
+                "ORDER BY relevance_score DESC, created_at DESC LIMIT 500",
+                (profile,),
+            ).fetchall()
+            cand_ids.update(r[0] for r in top_active)
+
+            if cand_ids:
+                candidate_id_set = cand_ids
+
+        # Filter by min_confidence (and candidate pre-filter when dataset is large)
         if len(ids) > 0 and len(M) > 0:
-            keep_idx = [i for i, conf in enumerate(confidences) if conf >= min_confidence]
+            if candidate_id_set is not None:
+                keep_idx = [i for i, mid in enumerate(ids)
+                            if mid in candidate_id_set and confidences[i] >= min_confidence]
+            else:
+                keep_idx = [i for i, conf in enumerate(confidences) if conf >= min_confidence]
             if not keep_idx:
                 return []
             ids_filtered = [ids[i] for i in keep_idx]
