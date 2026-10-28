@@ -2220,12 +2220,22 @@ class MemoryStore:
         return deleted
 
     def _auto_link_entities(self, memory_id: str, profile: str, tags: list[str], max_links: int = 5) -> int:
-        """Auto-link memories in the same profile that share >= 2 entity tags.
+        """Auto-link memories in the same profile that share >= 2 entity tags (with alias expansion).
         Returns the number of edges created."""
         entity_tags = [t for t in (tags or []) if isinstance(t, str) and t.startswith("entity:")]
-        if len(entity_tags) < 2:
+        if not entity_tags:
             return 0
-        placeholders = ",".join("?" for _ in entity_tags)
+        expanded_tags: set[str] = set(entity_tags)
+        try:
+            import config
+            for t in entity_tags:
+                expanded_tags.update(config.get_entity_alias_group(t))
+        except Exception:
+            pass
+        search_tags = list(expanded_tags)
+        if len(search_tags) < 2:
+            return 0
+        placeholders = ",".join("?" for _ in search_tags)
         try:
             rows = self._conn.execute(
                 f"""SELECT m.id, COUNT(DISTINCT jt.value) AS shared
@@ -2238,7 +2248,7 @@ class MemoryStore:
                     HAVING shared >= 2
                     ORDER BY shared DESC
                     LIMIT ?""",
-                (profile, memory_id, *entity_tags, max_links),
+                (profile, memory_id, *search_tags, max_links),
             ).fetchall()
             if not rows:
                 return 0
