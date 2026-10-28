@@ -992,6 +992,39 @@ def consolidate_session(
 
 
 @mcp.tool()
+def consolidate_memories(
+    topic_or_entity: str,
+    summary: Optional[str] = None,
+    profile: Optional[str] = None,
+    min_memories: int = 2,
+    max_memories: int = 15,
+) -> str:
+    """
+    Consolidate multiple episodic micro-memories about a topic or entity into a single high-density summary card.
+    Constituent memories are atomically archived and linked via 'supersedes' graph edges for provenance.
+
+    Args:
+        topic_or_entity: The entity or topic to consolidate (e.g. 'auth_architecture', 'cale', 'deployment')
+        summary: Optional custom synthesized summary. If omitted, synthesizes automatically.
+        profile: Target profile (default: current active profile)
+        min_memories: Minimum number of candidate memories required to perform consolidation (default: 2)
+        max_memories: Maximum number of candidate memories to roll up (default: 15)
+    Returns:
+        JSON response with summary_id, archived_count, and superseded_ids
+    """
+    profile = profile or _active_profile()
+    _store.ensure_profile(profile)
+    res = _store.consolidate_memories(
+        profile=profile,
+        topic_or_entity=topic_or_entity,
+        summary=summary,
+        min_memories=min_memories,
+        max_memories=max_memories,
+    )
+    return json.dumps(res, indent=2, default=str)
+
+
+@mcp.tool()
 def add_memory_edge(
     source_id: str,
     target_id: str,

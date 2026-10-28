@@ -554,6 +554,33 @@ def cmd_recall(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_consolidate(args: argparse.Namespace) -> int:
+    db_path = config.data_dir() / "memory.db"
+    if not db_path.exists():
+        print(f"Database not found: {db_path} (run `mb init` first)")
+        return 1
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    from db.store import MemoryStore
+    store = MemoryStore(db_path)
+    profile = args.profile or config.profile()
+    store.ensure_profile(profile)
+    res = store.consolidate_memories(
+        profile=profile,
+        topic_or_entity=args.topic_or_entity,
+        summary=args.summary,
+        min_memories=args.min_memories,
+        max_memories=args.max_memories,
+    )
+    if res.get("status") == "consolidated":
+        print(f"Consolidated {res['archived_count']} memories into {res['summary_id']}:")
+        print(f"  Topic: {res['topic']}")
+        print(f"  Summary:\n{res['summary']}")
+        return 0
+    else:
+        print(f"Consolidation skipped: {res.get('reason')}")
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mb", description="MemoryBridge — cross-model memory server")
     sub = p.add_subparsers(dest="command", required=True)
@@ -633,6 +660,14 @@ def build_parser() -> argparse.ArgumentParser:
     em.add_argument("--candidates", help="comma-separated candidate memory IDs (optional)")
     em.add_argument("--profile", default=config.profile(), help="target profile")
     edg.set_defaults(func=cmd_edges)
+
+    cs = sub.add_parser("consolidate", help="consolidate episodic micro-memories into a summary card")
+    cs.add_argument("topic_or_entity", help="topic or entity to consolidate")
+    cs.add_argument("--profile", default=config.profile(), help="target profile")
+    cs.add_argument("--summary", help="optional manual summary to use instead of auto-synthesis")
+    cs.add_argument("--min", dest="min_memories", type=int, default=2, help="minimum memories required (default: 2)")
+    cs.add_argument("--max", dest="max_memories", type=int, default=15, help="maximum memories to consolidate (default: 15)")
+    cs.set_defaults(func=cmd_consolidate)
 
     return p
 

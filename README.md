@@ -112,6 +112,7 @@ Claude calls these automatically — no special syntax required.
 | `add_memory` | Add a single memory with category, importance, `confidence`, and optional `expires_at` TTL |
 | `add_memories` | Batch-add multiple facts in one call (does not mutate existing rows) |
 | `consolidate_session` | **(v5.0)** Synthesize raw session events/logs into durable candidate facts & procedural rules |
+| `consolidate_memories` | **(v5.2)** Synthesize fragmented episodic facts about a topic/entity into a high-density summary card with supersession archiving |
 | `add_memory_edge` | **(v5.0)** Create a directed Knowledge Graph edge between two memories (`source_id`, `target_id`, `relation`) |
 | `get_memory_edges` | **(v5.0)** Retrieve Knowledge Graph edge relations connected to a memory |
 | `traverse_memory_graph` | **(v5.1)** Breadth-first multi-hop graph traversal (1..3 hops) with distance-decayed scoring and cycle guards |

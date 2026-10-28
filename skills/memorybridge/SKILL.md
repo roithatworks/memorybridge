@@ -41,6 +41,7 @@ Before completing the session or after resolving an issue:
 - `search_memory`: Hybrid BM25 + semantic search for specific keywords (`query`, `category`, `min_confidence`).
 - `add_memory`: Store a single memory with category, importance, `confidence`, and optional `expires_at` TTL.
 - `consolidate_session`: Extract and promote session notes into consolidated memories (`session_notes`).
+- `consolidate_memories`: Roll up episodic micro-memories about a topic/entity into a high-density reference card with audit supersession (`topic_or_entity`, `summary`).
 - `add_memory_edge`: Link two memories in the Knowledge Graph (`source_id`, `target_id`, `relation`).
 - `get_memory_edges`: Retrieve connected edges for a memory ID.
 - `traverse_memory_graph`: Multi-hop BFS traversal from a memory (`memory_id`, `max_hops`, `max_nodes`).
