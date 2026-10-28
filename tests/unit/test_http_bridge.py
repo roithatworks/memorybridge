@@ -200,11 +200,11 @@ def test_get_memory_serves_client_name_field(tmp_path, monkeypatch):
 # Rate-limit + constant-time auth middleware
 # --------------------------------------------------------------------------
 
-def _make_mw(token, limit=5, window=60):
+def _make_mw(token, limit=5, window=60, token_profiles=None):
     async def app(scope, receive, send):
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"OK"})
-    return server._RateLimitAuthMiddleware(app, token, limit, window)
+    return server._RateLimitAuthMiddleware(app, token, limit, window, token_profiles=token_profiles)
 
 
 def _status(mw, path, ip="1.2.3.4", headers=None):
@@ -318,3 +318,115 @@ def test_middleware_non_ascii_path_returns_404_not_500():
     # bad-token path gets. Live-reproduced against the running bridge:
     # GET /%C3%A9/mcp -> 500. Must behave exactly like any other wrong token.
     assert _status(_make_mw(TOKEN), "/é/mcp", "8.8.8.8") == 404
+
+
+def test_token_profiles_config_loading(monkeypatch, tmp_path):
+    import config
+    import yaml
+
+    custom_cfg = {
+        "token_profiles": {
+            "token_agent_a": "agent_a",
+            "token_agent_b": "agent_b",
+        }
+    }
+    cfg_file = tmp_path / "memorybridge.yaml"
+    cfg_file.write_text(yaml.safe_dump(custom_cfg))
+    monkeypatch.setattr(config, "data_dir", lambda: tmp_path)
+    config.load.cache_clear()
+
+    try:
+        token_map = config.token_profiles()
+        assert token_map == {
+            "token_agent_a": "agent_a",
+            "token_agent_b": "agent_b",
+        }
+    finally:
+        config.load.cache_clear()
+
+
+def test_middleware_token_profile_binding_bearer():
+    captured = {}
+
+    async def app(scope, receive, send):
+        captured["bound_profile"] = server._BOUND_PROFILE.get()
+        captured["path"] = scope.get("path")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"OK"})
+
+    token_profiles = {
+        "token_agent_alpha": "agent_alpha",
+        "token_agent_beta": "agent_beta",
+    }
+    mw = server._RateLimitAuthMiddleware(app, TOKEN, 5, 60, token_profiles=token_profiles)
+
+    # Scoped token via Bearer header
+    status = _status(mw, "/mcp", "10.0.0.1", headers={"authorization": "Bearer token_agent_alpha"})
+    assert status == 200
+    assert captured["bound_profile"] == "agent_alpha"
+    # Ensure ContextVar was reset after request completion
+    assert server._BOUND_PROFILE.get() is None
+
+
+def test_middleware_token_profile_binding_path_rewrite():
+    captured = {}
+
+    async def app(scope, receive, send):
+        captured["bound_profile"] = server._BOUND_PROFILE.get()
+        captured["path"] = scope.get("path")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"OK"})
+
+    token_profiles = {
+        "token_agent_beta": "agent_beta",
+    }
+    mw = server._RateLimitAuthMiddleware(app, TOKEN, 5, 60, token_profiles=token_profiles)
+
+    # Scoped token via capability path rewrite
+    status = _status(mw, "/token_agent_beta/mcp", "10.0.0.2")
+    assert status == 200
+    assert captured["bound_profile"] == "agent_beta"
+    assert captured["path"] == f"/{TOKEN}/mcp"
+    assert server._BOUND_PROFILE.get() is None
+
+
+def test_tools_scoped_profile_enforcement():
+    import json
+
+    # Clean test profile in store
+    server._store.ensure_profile("research")
+    server._store.ensure_profile("personal")
+
+    # Set bound profile
+    t = server._BOUND_PROFILE.set("research")
+    try:
+        # Pinned default resolution
+        assert server._active_profile() == "research"
+        assert server._resolve_profile() == "research"
+        assert server._resolve_profile("research") == "research"
+
+        # Unauthorized profile access is blocked
+        res_get = json.loads(server.get_memory(profile="personal"))
+        assert res_get.get("status") == "forbidden"
+        assert "Access denied" in res_get.get("error", "")
+
+        res_add = json.loads(server.add_memory("test memory", profile="personal"))
+        assert res_add.get("status") == "forbidden"
+        assert "Access denied" in res_add.get("error", "")
+
+        # Allowed profile access succeeds
+        res_valid = json.loads(server.get_memory(profile="research"))
+        assert "memories" in res_valid
+
+        # Profile list is scoped to only the bound profile
+        res_profiles = json.loads(server.list_profiles())
+        assert res_profiles["profiles"] == ["research"]
+        assert res_profiles["default_profile"] == "research"
+        assert res_profiles["read_only"] is True
+
+        # Switching profile is disabled
+        res_switch = json.loads(server.switch_profile("personal"))
+        assert "disabled" in res_switch.get("error", "")
+    finally:
+        server._BOUND_PROFILE.reset(t)
+

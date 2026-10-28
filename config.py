@@ -65,6 +65,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # `entity:` tags. Shape: {"variant": "canonical"} or {"canonical": ["var1", "var2"]}.
     "entity_aliases": {},
 
+    # Profile-to-token bindings: map bearer tokens or capability tokens to dedicated profiles.
+    # Shape: {"<token>": "<profile_name>"} or env MEMORYBRIDGE_TOKEN_PROFILES='{"token1": "profile1"}'
+    "token_profiles": {},
+
     # Sandboxed root for the ws_* workspace tools (F1). Empty allowlist below
     # means no writes permitted anywhere under it — deny by default; F1 ships
     # read tools live, writes stay locked until a prefix is configured here.
@@ -207,6 +211,20 @@ def get_entity_alias_group(entity: str) -> set[str]:
         if v == canonical or k == canonical:
             group.update({k, f"entity:{k}", v, f"entity:{v}"})
     return group
+
+
+def token_profiles() -> dict[str, str]:
+    """Map of bearer/capability token to profile name from config or env."""
+    env_val = os.environ.get("MEMORYBRIDGE_TOKEN_PROFILES", "").strip()
+    if env_val:
+        try:
+            parsed = json.loads(env_val)
+            if isinstance(parsed, dict):
+                return {str(k).strip(): str(v).strip() for k, v in parsed.items()}
+        except Exception:
+            pass
+    raw = load().get("token_profiles", {}) or {}
+    return {str(k).strip(): str(v).strip() for k, v in raw.items()}
 
 
 # Alias kept for the ws_* tools (workspace.py) — same cached merged config as

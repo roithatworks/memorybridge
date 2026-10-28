@@ -25,6 +25,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+from contextvars import ContextVar
 from fastmcp import FastMCP
 import workspace
 from db.pruner import run_auto_prune, record_outcome, get_pruner_report
@@ -70,11 +71,14 @@ _current_profile       = DEFAULT_PROFILE
 # auto-pruner's delete path so a remote-origin write can never destroy a
 # memory — candidates are routed to the review queue instead. See #37.
 _REMOTE_MODE           = False
+_BOUND_PROFILE: ContextVar[Optional[str]] = ContextVar("bound_profile", default=None)
 
 
 def _active_profile() -> str:
     """Resolve the profile for a call that omitted one.
 
+    If the current request is bound to a specific token profile via _BOUND_PROFILE,
+    that profile is always returned.
     Over the HTTP bridge (`_REMOTE_MODE`), NEVER resolve through the mutable
     process-global `_current_profile`: it is shared across all concurrent
     remote requests, so one client's `switch_profile` would silently retarget
@@ -82,7 +86,28 @@ def _active_profile() -> str:
     DEFAULT_PROFILE; a remote client that needs a specific profile passes it
     explicitly. Local stdio (single session) keeps the switchable global.
     """
+    bound = _BOUND_PROFILE.get()
+    if bound:
+        return bound
     return DEFAULT_PROFILE if _REMOTE_MODE else _current_profile
+
+
+def _resolve_profile(profile: Optional[str] = None) -> str:
+    """Resolve and enforce profile scoping for the current context.
+
+    If the current request is authenticated with a token bound to a specific profile,
+    any attempt to access a different profile raises PermissionError.
+    If no explicit profile is passed, defaults to the bound profile (or _active_profile()).
+    """
+    bound = _BOUND_PROFILE.get()
+    if bound:
+        if profile and profile.strip() != bound:
+            raise PermissionError(
+                f"Access denied: token is bound to profile '{bound}', "
+                f"cannot access profile '{profile}'"
+            )
+        return bound
+    return profile or _active_profile()
 
 
 def _caller_model() -> str:
@@ -143,6 +168,14 @@ _PROFILE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 
 def _validate_profile(p: Optional[str]) -> str:
     """Validate and normalize a profile name."""
+    bound = _BOUND_PROFILE.get()
+    if bound:
+        if p and p.strip().lower() != bound:
+            raise PermissionError(
+                f"Access denied: token is bound to profile '{bound}', "
+                f"cannot access profile '{p}'"
+            )
+        return bound
     if not p:
         return _active_profile()
     cleaned = p.strip().lower()
@@ -353,7 +386,10 @@ def get_memory(
     Returns:
         JSON with memories, token stats, and budget info
     """
-    profile = profile or _active_profile()
+    try:
+        profile = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     _store.ensure_profile(profile)
     profile_data = _store.get_profile(profile)
     if profile_data is None:
@@ -559,7 +595,10 @@ def add_memory(
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
-    profile = _validate_profile(profile)
+    try:
+        profile = _validate_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     if _REMOTE_MODE:
         existing = set(_store.list_profiles())
         if profile not in existing:
@@ -662,7 +701,10 @@ def add_memories(
     Returns:
         Summary with all added memory IDs and total tokens
     """
-    profile = profile or _active_profile()
+    try:
+        profile = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     if category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
     if importance not in IMPORTANCE_LEVELS:
@@ -755,7 +797,10 @@ def edit_memory(
     Returns:
         JSON confirmation, or {"error": ...} if memory_id not found / validation fails
     """
-    profile = profile or _active_profile()
+    try:
+        profile = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     if importance is not None and importance not in IMPORTANCE_LEVELS:
         return json.dumps({"error": f"Invalid importance. Valid: {IMPORTANCE_LEVELS}"})
     if category is not None and category not in VALID_CATEGORIES:
@@ -819,7 +864,10 @@ def search_memory(
     Returns:
         JSON with ranked results (internal fields stripped)
     """
-    profile = profile or _active_profile()
+    try:
+        profile = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     _store.ensure_profile(profile)
 
     if category and category not in VALID_CATEGORIES:
@@ -906,7 +954,10 @@ def reflect(
     Returns:
         JSON with structured synthesis
     """
-    profile = profile or _active_profile()
+    try:
+        profile = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     _store.ensure_profile(profile)
 
     result = _store.reflect(profile, question, limit=limit, max_tokens=max_tokens)
@@ -931,7 +982,10 @@ def consolidate_session(
     Returns:
         JSON summary of promoted, duplicate, or rejected candidate memories
     """
-    profile = profile or _active_profile()
+    try:
+        profile = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     _store.ensure_profile(profile)
 
     lines = [ln.strip() for ln in session_notes.splitlines() if ln.strip()]
@@ -1012,7 +1066,10 @@ def consolidate_memories(
     Returns:
         JSON response with summary_id, archived_count, and superseded_ids
     """
-    profile = profile or _active_profile()
+    try:
+        profile = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     _store.ensure_profile(profile)
     res = _store.consolidate_memories(
         profile=profile,
@@ -1087,7 +1144,10 @@ def traverse_memory_graph(
     Returns:
         JSON object containing start node, discovered nodes with hops, paths, and scores.
     """
-    prof = profile or _active_profile()
+    try:
+        prof = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     _validate_profile(prof)
     hops = min(max(1, int(max_hops)), 3)
     limit = min(max(1, int(max_nodes)), 50)
@@ -1148,7 +1208,10 @@ def mine_memory_relations(
     Returns:
         JSON list of discovered relations and created edges
     """
-    prof = profile or _active_profile()
+    try:
+        prof = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     _validate_profile(prof)
     try:
         mined = _store.mine_relations(memory_id, candidate_ids=candidate_ids, profile=prof, auto_link=True)
@@ -1189,7 +1252,10 @@ def delete_memory(
     profile: str = None
 ) -> str:
     """Delete a specific memory by ID."""
-    profile = profile or _active_profile()
+    try:
+        profile = _resolve_profile(profile)
+    except PermissionError as e:
+        return json.dumps({"error": str(e), "status": "forbidden"})
     tokens_freed = _store.delete_memory(profile, memory_id)
     if tokens_freed == 0:
         # Check if profile even exists
@@ -1378,6 +1444,13 @@ def list_profiles() -> str:
     Returns:
         JSON with the list of profile names and which one is the default.
     """
+    bound = _BOUND_PROFILE.get()
+    if bound:
+        return json.dumps({
+            "profiles": [bound],
+            "default_profile": bound,
+            "read_only": True,
+        }, indent=2)
     return json.dumps({
         "profiles": _store.list_profiles(),
         "default_profile": DEFAULT_PROFILE,
@@ -1387,6 +1460,8 @@ def list_profiles() -> str:
 @mcp.tool()
 def switch_profile(profile_name: str) -> str:
     """Switch active persona context."""
+    if _BOUND_PROFILE.get():
+        return json.dumps({"error": "Profile switching disabled for scoped token"})
     global _current_profile
     profile_data = _store.get_profile(profile_name)
     if profile_data is None:
@@ -1915,11 +1990,12 @@ class _RateLimitAuthMiddleware:
       X-Forwarded-For, so those are honored before the transport peer address.
     """
 
-    def __init__(self, app, expected_token: str, limit: int, window: int):
+    def __init__(self, app, expected_token: str, limit: int, window: int, token_profiles: dict[str, str] | None = None):
         self.app = app
         self.expected_token = expected_token
         self.limit = limit
         self.window = window
+        self.token_profiles = token_profiles or {}
         self._hits: dict[str, list] = {}
         self._lock = threading.Lock()
 
@@ -1959,30 +2035,41 @@ class _RateLimitAuthMiddleware:
                     self._hits.pop(next(iter(self._hits)), None)
             return count <= self.limit
 
-    def _authenticate(self, scope) -> tuple[bool, bool]:
+    def _authenticate(self, scope) -> tuple[bool, bool, Optional[str], Optional[str]]:
         """Authenticate request via Bearer header (F2) or capability URL path.
 
-        Returns (is_authenticated, was_bearer_token).
+        Returns (is_authenticated, was_bearer_token, matched_token, bound_profile).
         Uses constant-time secrets.compare_digest for all token checks.
         """
         # 1. Bearer header authentication (F2)
         headers = {k.decode("latin1").lower(): v.decode("latin1", errors="replace")
                    for k, v in scope.get("headers", [])}
         auth_val = headers.get("authorization", "").strip()
+        is_bearer = False
+        cand_token = ""
+
         if auth_val.lower().startswith("bearer "):
-            bearer_token = auth_val[7:].strip()
-            if bearer_token.isascii() and secrets.compare_digest(bearer_token, self.expected_token):
-                return True, True
+            is_bearer = True
+            cand_token = auth_val[7:].strip()
+        else:
+            # 2. Capability URL path fallback: /{token}/mcp
+            segment = scope.get("path", "").lstrip("/").split("/", 1)[0]
+            cand_token = segment
 
-        # 2. Capability URL path fallback: /{token}/mcp
-        segment = scope.get("path", "").lstrip("/").split("/", 1)[0]
-        # secrets.compare_digest raises TypeError on a non-ASCII str rather
-        # than returning False (issue #177) — uvicorn decodes a percent-encoded
-        # non-ASCII path segment to UTF-8 before scope reaches here.
-        if segment.isascii() and secrets.compare_digest(segment, self.expected_token):
-            return True, False
+        if not cand_token or not cand_token.isascii():
+            return False, False, None, None
 
-        return False, False
+        # Check primary expected token
+        if self.expected_token and secrets.compare_digest(cand_token, self.expected_token):
+            bound = self.token_profiles.get(self.expected_token)
+            return True, is_bearer, self.expected_token, bound
+
+        # Check scoped token_profiles mapping
+        for tok, prof in self.token_profiles.items():
+            if tok.isascii() and secrets.compare_digest(cand_token, tok):
+                return True, is_bearer, tok, prof
+
+        return False, False, None, None
 
     def _token_ok(self, scope) -> bool:
         return self._authenticate(scope)[0]
@@ -1998,7 +2085,9 @@ class _RateLimitAuthMiddleware:
         # amplification vector. Fail closed to 404, log the exception type only.
         try:
             rate_ok = self._rate_ok(self._client_ip(scope))
-            auth_ok, is_bearer = self._authenticate(scope) if rate_ok else (True, False)
+            auth_ok, is_bearer, matched_tok, bound_prof = (
+                self._authenticate(scope) if rate_ok else (True, False, None, None)
+            )
         except Exception as e:
             print(f"[memorybridge] auth middleware error (denying request): "
                   f"{type(e).__name__}", file=sys.stderr)
@@ -2021,8 +2110,21 @@ class _RateLimitAuthMiddleware:
                 scope["path"] = new_path
                 if "raw_path" in scope:
                     scope["raw_path"] = new_path.encode("utf-8")
+        elif matched_tok and matched_tok != self.expected_token:
+            path = scope.get("path", "")
+            prefix = f"/{matched_tok}"
+            if path.startswith(prefix):
+                new_path = f"/{self.expected_token}" + path[len(prefix):]
+                scope = dict(scope)
+                scope["path"] = new_path
+                if "raw_path" in scope:
+                    scope["raw_path"] = new_path.encode("utf-8")
 
-        await self.app(scope, receive, send)
+        token_reset = _BOUND_PROFILE.set(bound_prof)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _BOUND_PROFILE.reset(token_reset)
 
 
 def _run_http() -> None:
@@ -2061,6 +2163,7 @@ def _run_http() -> None:
 
     rate_limit = int(os.environ.get("MEMORYBRIDGE_RATE_LIMIT", "120"))
     rate_window = int(os.environ.get("MEMORYBRIDGE_RATE_WINDOW", "60"))
+    token_profiles = _config.token_profiles()
 
     # Wrap the FastMCP ASGI app with rate-limiting + constant-time token auth
     # (issue #69). Only take this path if we can build the app at the SAME
@@ -2078,7 +2181,7 @@ def _run_http() -> None:
 
     if app is not None:
         import uvicorn
-        wrapped = _RateLimitAuthMiddleware(app, token, rate_limit, rate_window)
+        wrapped = _RateLimitAuthMiddleware(app, token, rate_limit, rate_window, token_profiles=token_profiles)
         print(f"[memorybridge] HTTP bridge on 127.0.0.1:{port} "
               f"path=/<redacted>/mcp | tools gated: removed {len(removed)} "
               f"({', '.join(sorted(removed))}) | rate limit {rate_limit}/{rate_window}s per IP",
