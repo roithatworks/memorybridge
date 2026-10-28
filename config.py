@@ -61,6 +61,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # case-insensitively). Empty by default (unknown ids pass through unchanged).
     "project_aliases": {},
 
+    # Entity-name aliases: collapse variant spellings to one canonical id in
+    # `entity:` tags. Shape: {"variant": "canonical"} or {"canonical": ["var1", "var2"]}.
+    "entity_aliases": {},
+
     # Sandboxed root for the ws_* workspace tools (F1). Empty allowlist below
     # means no writes permitted anywhere under it — deny by default; F1 ships
     # read tools live, writes stay locked until a prefix is configured here.
@@ -172,6 +176,40 @@ def project_aliases() -> dict:
     return {str(k).strip().lower(): v for k, v in raw.items()}
 
 
+def entity_aliases() -> dict[str, str]:
+    """Return entity aliases normalized to lowercase.
+    Supports either {"variant": "canonical"} or {"canonical": ["var1", "var2"]}.
+    Returns a dict mapping lowercase variant -> lowercase canonical.
+    """
+    raw = load().get("entity_aliases", {}) or {}
+    mapping: dict[str, str] = {}
+    for k, v in raw.items():
+        k_str = str(k).strip().lower().removeprefix("entity:")
+        if isinstance(v, str):
+            v_str = v.strip().lower().removeprefix("entity:")
+            mapping[k_str] = v_str
+        elif isinstance(v, (list, tuple, set)):
+            for item in v:
+                v_item = str(item).strip().lower().removeprefix("entity:")
+                mapping[v_item] = k_str
+    return mapping
+
+
+def get_entity_alias_group(entity: str) -> set[str]:
+    """Return the set of all aliases (including canonical and input forms) for an entity."""
+    if not entity:
+        return set()
+    raw = entity.strip().lower().removeprefix("entity:")
+    aliases = entity_aliases()
+    canonical = aliases.get(raw, raw)
+    group = {raw, canonical, f"entity:{raw}", f"entity:{canonical}"}
+    for k, v in aliases.items():
+        if v == canonical or k == canonical:
+            group.update({k, f"entity:{k}", v, f"entity:{v}"})
+    return group
+
+
 # Alias kept for the ws_* tools (workspace.py) — same cached merged config as
 # load(), just named for what callers there are reading it for.
 load_config = load
+

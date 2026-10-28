@@ -136,17 +136,17 @@ def _count_tokens(text: str) -> int:
 
 
 def _merge_tags(*tag_lists: list[str]) -> list[str]:
-    """Merge and deduplicate tag lists.
+    """Merge and deduplicate tag lists, normalizing project and entity aliases.
 
-    Each tag is stripped and lowercased. Returns a flat deduplicated list
-    preserving the order of first appearance.
+    Each tag is stripped, lowercased, and mapped to its canonical alias.
+    Returns a flat deduplicated list preserving the order of first appearance.
     Useful for merging caller-supplied tags with auto-extracted entity tags.
     """
     seen: set[str] = set()
     result: list[str] = []
     for tags in tag_lists:
         for tag in (tags or []):
-            t = tag.strip().lower()
+            t = _normalize_tag(tag)
             if t and t not in seen:
                 seen.add(t)
                 result.append(t)
@@ -319,6 +319,41 @@ def _normalize_project(project_id: str | None) -> str | None:
     except Exception:
         pass
     return project_id
+
+
+def _normalize_entity(entity: str | None) -> str | None:
+    """Normalize an entity name to its canonical form using config.entity_aliases().
+
+    ``\"cale_corbett\"`` → ``\"cale\"``.
+    Unknown entity names pass through unchanged.
+    """
+    if not entity:
+        return entity
+    key = entity.strip().lower()
+    try:
+        import config
+        aliases = config.entity_aliases()
+        if key in aliases:
+            return aliases[key]
+    except Exception:
+        pass
+    return entity
+
+
+def _normalize_tag(tag: str) -> str:
+    """Normalize tags, including entity and project aliases."""
+    if not tag:
+        return tag
+    t = tag.strip().lower()
+    if t.startswith("entity:"):
+        raw = t[7:]
+        norm_entity = _normalize_entity(raw)
+        return f"entity:{norm_entity}" if norm_entity else t
+    elif t.startswith("project:"):
+        raw = t[8:]
+        norm_proj = _normalize_project(raw)
+        return f"project:{norm_proj}" if norm_proj else t
+    return t
 
 
 # --- Tag cap to prevent unbounded compounding --------------------------------
