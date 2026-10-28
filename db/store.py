@@ -537,13 +537,14 @@ class MemoryStore:
             # Embed-on-write (issue #5): background thread so model load
             # doesn't block the MCP response. Tracked in _pending_embeds
             # so shutdown drains it before os._exit(0).
-            t = threading.Thread(
-                target=self._embed_and_cleanup, args=(mid, profile, content),
-                daemon=True, name=f"embed-{mid}"
-            )
-            with self._pending_embed_lock:
-                self._pending_embeds.add(t)
-            t.start()
+            if not os.environ.get("MEMORYBRIDGE_NO_EMBED"):
+                t = threading.Thread(
+                    target=self._embed_and_cleanup, args=(mid, profile, content),
+                    daemon=True, name=f"embed-{mid}"
+                )
+                with self._pending_embed_lock:
+                    self._pending_embeds.add(t)
+                t.start()
             return mid
         except sqlite3.IntegrityError:
             self._conn.rollback()
